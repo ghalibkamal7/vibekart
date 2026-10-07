@@ -1,0 +1,67 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isSeller() {
+      return isSignedIn() &&
+        exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'seller';
+    }
+
+    // ---------------- otp_requests ----------------
+    // Written only by the sendOtp/verifyOtp Cloud Functions (Admin SDK,
+    // which bypasses these rules entirely). No client — customer or
+    // seller — should ever read or write this directly.
+    match /otp_requests/{phone} {
+      allow read, write: if false;
+    }
+
+    // ---------------- users ----------------
+    // Every signed-in user can read/manage their own profile. `role` can
+    // never be set to 'seller' by the client — that has to be done once,
+    // manually, from the Firebase console or Admin SDK, by whoever owns the
+    // storefront. This stops any customer from just writing role: 'seller'
+    // to their own document and unlocking the seller panel.
+    match /users/{uid} {
+      allow read: if isSignedIn() && request.auth.uid == uid;
+      allow create: if isSignedIn() && request.auth.uid == uid &&
+        request.resource.data.role == 'customer';
+      allow update: if isSignedIn() && request.auth.uid == uid &&
+        request.resource.data.role == resource.data.role;
+      allow delete: if false;
+    }
+
+    // ---------------- products (public fields) ----------------
+    // Anyone signed in (customer or seller) can read the public listing.
+    // Only a seller can create/update/delete products.
+    match /products/{productId} {
+      allow read: if isSignedIn();
+      allow create, update, delete: if isSeller();
+
+      // ---------------- products/{id}/private/data (cost fields) ----------------
+      // This is the actual enforcement of "customers never see cost": the
+      // rule denies read entirely to anyone who isn't a seller, regardless
+      // of what the client app tries to render.
+      match /private/{docId} {
+        allow read, write: if isSeller();
+      }
+    }
+
+    // ---------------- orders ----------------
+    match /orders/{orderId} {
+      allow create: if isSignedIn() &&
+        request.resource.data.customerUid == request.auth.uid;
+      allow read: if isSignedIn() &&
+        (resource.data.customerUid == request.auth.uid || isSeller());
+      // Only a seller can advance status / set a tracking ID; a customer
+      // cannot edit an order once it's placed in this model.
+      allow update: if isSeller();
+      allow delete: if false;
+    }
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "name": "vibekart-functions",
+  "private": true,
+  "description": "Server-side order cost reconciliation for VibeKart",
+  "main": "index.js",
+  "engines": {
+    "node": "20"
+  },
+  "dependencies": {
+    "cloudinary": "^2.5.1",
+    "firebase-admin": "^12.6.0",
+    "firebase-functions": "^6.0.1"
+  }
+}

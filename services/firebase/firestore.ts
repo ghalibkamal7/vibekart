@@ -1,0 +1,218 @@
+import {
+  addDoc,
+  collection,
+  deleteDoc,
+  doc,
+  DocumentData,
+  getDoc,
+  getDocs,
+  onSnapshot,
+  orderBy,
+  query,
+  serverTimestamp,
+  setDoc,
+  updateDoc,
+} from 'firebase/firestore';
+import {
+  computeDisplayPrice,
+  NewProductInput,
+  Order,
+  OrderStatus,
+  Product,
+} from '@/data/store';
+import { db } from './config';
+
+const PRODUCTS_COLLECTION = 'products';
+const ORDERS_COLLECTION = 'orders';
+const PRIVATE_SUBCOLLECTION = 'private';
+const PRIVATE_DOC_ID = 'data';
+
+function requireDb() {
+  if (!db) throw new Error('Firebase is not configured. See .env.example.');
+  return db;
+}
+
+const PRIVATE_FIELDS = ['baseCost', 'markupType', 'markupValue', 'sourceUrl', 'sourceCode'] as const;
+type PrivateFields = Pick<Product, 'baseCost' | 'markupType' | 'markupValue' | 'sourceUrl' | 'sourceCode'>;
+
+function splitProductInput(input: Partial<NewProductInput>) {
+  const priv: Record<string, unknown> = {};
+  const pub: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(input)) {
+    if (value === undefined) continue;
+    if ((PRIVATE_FIELDS as readonly string[]).includes(key)) priv[key] = value;
+    else pub[key] = value;
+  }
+  return { pub, priv };
+}
+
+/**
+ * Two-document model per product, enforced by firestore.rules (not just the
+ * client): Firestore security rules can only allow/deny a READ at the whole
+ * -document level, not per field — so hiding `baseCost` from customers while
+ * showing it to sellers on the SAME document isn't actually possible with
+ * rules alone. Splitting into a public doc + a seller-only private
+ * sub-document is what makes "customer never sees cost" a real, enforced
+ * guarantee instead of a client-side convention.
+ *
+ *   products/{id}                    -> public, readable by anyone signed in
+ *   products/{id}/private/data       -> baseCost, markup fields, sourceUrl,
+ *                                        sourceCode — readable & writable
+ *                                        only by sellers
+ */
+
+// ---------------- Customer-facing reads (public fields only) ----------------
+
+export function subscribeToProducts(onChange: (products: Product[]) => void, onError?: (error: Error) => void) {
+  const database = requireDb();
+  const q = query(collection(database, PRODUCTS_COLLECTION), orderBy('createdAt', 'desc'));
+  return onSnapshot(
+    q,
+    (snapshot) => {
+      const products = snapshot.docs.map((d) => toPublicProduct(d.id, d.data()));
+      onChange(products);
+    },
+    (error) => onError?.(error as Error),
+  );
+}
+
+function toPublicProduct(id: string, data: DocumentData): Product {
+  // baseCost/markup*/sourceUrl/sourceCode are simply absent here — they live
+  // in the private sub-document a customer's rules never permit reading.
+  return {
+    id,
+    baseCost: 0,
+    markupType: 'fixed',
+    markupValue: 0,
+    ...data,
+  } as Product;
+}
+
+// ---------------- Seller-facing reads (public + private merged) ----------------
+
+export async function fetchSellerProducts(): Promise<Product[]> {
+  const database = requireDb();
+  const snapshot = await getDocs(query(collection(database, PRODUCTS_COLLECTION), orderBy('createdAt', 'desc')));
+  const products = await Promise.all(
+    snapshot.docs.map(async (d) => {
+      const privateSnap = await getDoc(doc(database, PRODUCTS_COLLECTION, d.id, PRIVATE_SUBCOLLECTION, PRIVATE_DOC_ID));
+      const priv = (privateSnap.exists() ? privateSnap.data() : {}) as Partial<PrivateFields>;
+      return { id: d.id, ...d.data(), ...priv } as Product;
+    }),
+  );
+  return products;
+}
+
+// ---------------- Writes (seller only, enforced by firestore.rules) ----------------
+
+export async function createProduct(input: NewProductInput): Promise<string> {
+  const database = requireDb();
+  const price = computeDisplayPrice(input.baseCost, input.markupType, input.markupValue);
+  const { pub, priv } = splitProductInput(input);
+  const docRef = await addDoc(collection(database, PRODUCTS_COLLECTION), {
+    ...pub,
+    price,
+    inStock: true,
+    rating: 4.5,
+    reviews: 0,
+    createdAt: serverTimestamp(),
+  });
+  await setDoc(doc(database, PRODUCTS_COLLECTION, docRef.id, PRIVATE_SUBCOLLECTION, PRIVATE_DOC_ID), priv);
+  return docRef.id;
+}
+
+export async function editProduct(id: string, patch: Partial<NewProductInput>): Promise<void> {
+  const database = requireDb();
+  const { pub, priv } = splitProductInput(patch);
+  if (Object.keys(pub).length) {
+    await updateDoc(doc(database, PRODUCTS_COLLECTION, id), pub);
+  }
+  if (Object.keys(priv).length) {
+    await setDoc(doc(database, PRODUCTS_COLLECTION, id, PRIVATE_SUBCOLLECTION, PRIVATE_DOC_ID), priv, { merge: true });
+    // Price always depends on cost + markup, so recompute it on the public
+    // doc whenever either changes — customers only ever read this field.
+    const privateSnap = await getDoc(doc(database, PRODUCTS_COLLECTION, id, PRIVATE_SUBCOLLECTION, PRIVATE_DOC_ID));
+    const merged = privateSnap.data() as PrivateFields;
+    if (merged?.baseCost !== undefined) {
+      const price = computeDisplayPrice(merged.baseCost, merged.markupType, merged.markupValue);
+      await updateDoc(doc(database, PRODUCTS_COLLECTION, id), { price });
+    }
+  }
+}
+
+export async function removeProduct(id: string): Promise<void> {
+  const database = requireDb();
+  await deleteDoc(doc(database, PRODUCTS_COLLECTION, id, PRIVATE_SUBCOLLECTION, PRIVATE_DOC_ID));
+  await deleteDoc(doc(database, PRODUCTS_COLLECTION, id));
+}
+
+export async function setProductStock(id: string, inStock: boolean): Promise<void> {
+  const database = requireDb();
+  await updateDoc(doc(database, PRODUCTS_COLLECTION, id), { inStock });
+}
+
+// ---------------- Orders ----------------
+// A customer can create an order and read only their own (uid == request
+// customerUid); only role == 'seller' can read every order, update status,
+// or set trackingId. costTotal/profitTotal/item.unitCost stay out of every
+// screen customers see, but — unlike products — they live on the same
+// order doc the customer owns, so a customer inspecting raw network traffic
+// could technically see them. That residual gap is called out in the
+// migration report; closing it fully would need the same doc-split treatment
+// applied to orders.
+
+export type NewOrderInput = {
+  customerUid: string;
+  items: Order['items'];
+  total: number;
+  costTotal: number;
+  profitTotal: number;
+  customerName: string;
+  customerPhone: string;
+  customerAddress: string;
+  paymentMethod: 'UPI' | 'COD';
+};
+
+export function subscribeToOrders(
+  onChange: (orders: Order[]) => void,
+  onError?: (error: Error) => void,
+  uidFilter?: string,
+) {
+  const database = requireDb();
+  const q = query(collection(database, ORDERS_COLLECTION), orderBy('createdAt', 'desc'));
+  return onSnapshot(
+    q,
+    (snapshot) => {
+      let orders = snapshot.docs.map((d) => ({ id: d.id, ...d.data() }) as Order & { customerUid?: string });
+      if (uidFilter) orders = orders.filter((order) => order.customerUid === uidFilter);
+      onChange(orders);
+    },
+    (error) => onError?.(error as Error),
+  );
+}
+
+export async function createOrder(input: NewOrderInput): Promise<string> {
+  const database = requireDb();
+  const docRef = await addDoc(collection(database, ORDERS_COLLECTION), {
+    ...input,
+    status: 'Placed' as OrderStatus,
+    // The client (customer) never has real cost data to offer here — see
+    // firestore.rules. costTotal/profitTotal below are placeholders only;
+    // the reconcileOrderCost Cloud Function (functions/index.js) overwrites
+    // them with server-computed, trustworthy values within moments and
+    // flips costReconciled to true.
+    costReconciled: false,
+    createdAt: serverTimestamp(),
+  });
+  return docRef.id;
+}
+
+export async function updateOrderStatusRemote(id: string, status: OrderStatus): Promise<void> {
+  const database = requireDb();
+  await updateDoc(doc(database, ORDERS_COLLECTION, id), { status });
+}
+
+export async function setOrderTrackingId(id: string, trackingId: string): Promise<void> {
+  const database = requireDb();
+  await updateDoc(doc(database, ORDERS_COLLECTION, id), { trackingId });
+}

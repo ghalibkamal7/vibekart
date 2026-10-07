@@ -1,0 +1,22 @@
+name = "vibekart-otp"
+main = "src/index.ts"
+compatibility_date = "2024-11-01"
+
+# Created by `wrangler kv namespace create OTP_KV` — paste the printed id
+# below. This id is not a secret (it's just an identifier), but it is
+# specific to your Cloudflare account, so there's no default value here.
+[[kv_namespaces]]
+binding = "OTP_KV"
+id = "REPLACE_WITH_YOUR_KV_NAMESPACE_ID"
+
+# MSG91's OTP API requires a DLT-approved template id — this is NOT a
+# secret (it's just an identifier for a pre-approved SMS template), so it
+# lives here as a plain var rather than a `wrangler secret`. Create the
+# template in the MSG91 dashboard first — see workers/otp/README.md — then
+# paste its id below.
+[vars]
+MSG91_TEMPLATE_ID = "REPLACE_WITH_YOUR_MSG91_TEMPLATE_ID"
+
+# MSG91_AUTH_KEY and FIREBASE_SERVICE_ACCOUNT_JSON are set as Worker
+# secrets (`wrangler secret put ...`), never written here — see
+# workers/otp/README.md.
