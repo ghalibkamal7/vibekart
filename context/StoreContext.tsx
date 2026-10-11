@@ -7,7 +7,8 @@ import {
   confirmPhoneOtp,
   fetchUserProfile,
   requestPhoneOtp,
-  signIn as firebaseSignIn,
+    signIn as firebaseSignIn,
+  signInWithGoogle as firebaseSignInWithGoogle,
   signOutUser,
   signUp as firebaseSignUp,
   subscribeToAuthState,
@@ -89,6 +90,7 @@ type StoreContextValue = {
   signInEmail: (email: string, password: string) => Promise<void>;
   sendPhoneOtp: (phone: string) => Promise<void>;
   verifyPhoneOtp: (phone: string, otp: string) => Promise<void>;
+  signInWithGoogle: () => Promise<void>;
   continueAsGuest: () => void;
   logout: () => Promise<void>;
 };
@@ -175,7 +177,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
             isGuest: false,
             uid: firebaseUser.uid,
             email: profile?.email ?? firebaseUser.email ?? '',
-            name: profile?.name ?? '',
+           name: profile?.name ?? firebaseUser.displayName ?? '',
             phone: profile?.phone,
             role: profile?.role ?? 'customer',
           });
@@ -246,6 +248,14 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       setAuthError(error instanceof Error ? error.message : 'OTP galat hai');
       throw error;
     }
+  };
+
+    // Unlike the email/OTP handlers this deliberately does not write to
+  // authError: the login screen shows Google errors right under the Google
+  // button (it catches the thrown, already-friendly error itself) instead
+  // of under the unrelated email form fields.
+  const signInWithGoogle: StoreContextValue['signInWithGoogle'] = async () => {
+    await firebaseSignInWithGoogle();
   };
 
   const continueAsGuest = () => setAuthUser({ isGuest: true });
@@ -524,6 +534,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       signInEmail,
       sendPhoneOtp,
       verifyPhoneOtp,
+      signInWithGoogle,
       continueAsGuest,
       logout,
     }),

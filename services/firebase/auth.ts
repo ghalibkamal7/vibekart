@@ -8,6 +8,7 @@ import {
 } from 'firebase/auth';
 import { doc, getDoc, serverTimestamp, setDoc } from 'firebase/firestore';
 import { auth, db } from './config';
+import { performGoogleSignIn, signOutOfGoogle } from './googleSignIn';
 
 export type UserRole = 'customer' | 'seller';
 
@@ -33,8 +34,9 @@ export type UserProfile = {
  * Cloudflare Worker instead (see workers/otp/) — Cloudflare's free tier —
  * which holds the MSG91 and Firebase service-account credentials, verifies
  * the OTP, and returns a Firebase custom token the same way the old Cloud
- * Function did. Email/password (signUp/signIn above) is also available as
- * an alternative sign-in method and needs none of this.
+ * Function did. The OTP option is currently hidden from the login screen,
+ * but all of this is intentionally kept. Email/password (signUp/signIn
+ * above) and Google sign-in are the visible methods.
  */
 
 function requireAuth() {
@@ -66,7 +68,31 @@ const FRIENDLY_AUTH_MESSAGES: Record<string, string> = {
   'auth/weak-password': 'Choose a stronger password (at least 6 characters).',
   'auth/too-many-requests': 'Too many attempts. Please wait a moment and try again.',
   'auth/network-request-failed': 'Network error. Check your connection and try again.',
+  // Google sign-in (web popup + native module)
+  'auth/popup-closed-by-user': 'Google sign-in was cancelled.',
+  'auth/cancelled-popup-request': 'Google sign-in was cancelled.',
+  'auth/popup-blocked': 'Your browser blocked the sign-in window. Allow pop-ups for this site and try again.',
+  'auth/account-exists-with-different-credential':
+    'An account with this email already exists using a different sign-in method. Sign in with your email and password instead.',
+  'auth/operation-not-allowed': 'Google sign-in is not enabled for this project yet.',
+  'auth/unauthorized-domain': "This website's domain isn't authorised for Google sign-in yet.",
+  'google/cancelled': 'Google sign-in was cancelled.',
+  'google/in-progress': 'A Google sign-in is already in progress.',
+  'google/not-configured': 'Google sign-in is not configured yet.',
+  'google/needs-dev-build': 'Google sign-in on phones needs a development build of the app (it cannot run in Expo Go).',
+  'google/play-services-unavailable': 'Google Play Services is unavailable or out of date on this device.',
+  'google/no-id-token': "Google sign-in couldn't be completed. Please try again.",
 };
+
+/** Safe-to-log summary of an error: only the code and message — never the
+ * error object itself, which for some failures can carry request details
+ * (tokens, credentials). */
+function describeAuthError(error: unknown): { code: string; message: string } {
+  return {
+    code: (error as { code?: string })?.code ?? 'unknown',
+    message: error instanceof Error ? error.message : String(error ?? ''),
+  };
+}
 
 function friendlyAuthMessage(error: unknown, fallback: string): string {
   const code = ((error as { code?: string })?.code ?? '').toLowerCase();
@@ -75,7 +101,11 @@ function friendlyAuthMessage(error: unknown, fallback: string): string {
   const message = error instanceof Error ? error.message : String(error ?? '');
   const looksGeneric =
     !message || message.toLowerCase() === 'internal' || code.endsWith('/internal') || message.startsWith('Firebase:');
-  return looksGeneric ? fallback : message;
+  if (!looksGeneric) return message;
+  // In development builds, show the real error code next to the generic
+  // text so "We couldn't sign you in" is never a dead end while debugging.
+  // Production builds show only the friendly sentence.
+  return __DEV__ && code ? `${fallback} (${code})` : fallback;
 }
 
 export function subscribeToAuthState(callback: (user: User | null) => void) {
@@ -104,8 +134,12 @@ export async function signUp(params: {
       phone: params.phone,
       role: params.role ?? 'customer',
     };
+    // Firestore rejects `undefined` field values, so phone is only written
+    // when one was actually provided.
+    const { phone, ...profileWithoutPhone } = profile;
     await setDoc(doc(database, 'users', credential.user.uid), {
-      ...profile,
+      ...profileWithoutPhone,
+      ...(phone ? { phone } : {}),
       createdAt: serverTimestamp(),
     });
     return profile;
@@ -127,6 +161,10 @@ export async function signIn(email: string, password: string): Promise<User> {
 }
 
 export async function signOutUser(): Promise<void> {
+  // Clear the native Google session first (no-op on web / if never used),
+  // so the next Google sign-in shows the account chooser rather than
+  // silently reusing the previous account.
+  await signOutOfGoogle();
   if (!auth) return;
   await firebaseSignOut(auth);
 }
@@ -135,6 +173,46 @@ export async function fetchUserProfile(uid: string): Promise<UserProfile | null>
   if (!db) return null;
   const snapshot = await getDoc(doc(db, 'users', uid));
   return snapshot.exists() ? (snapshot.data() as UserProfile) : null;
+}
+
+// ---------------- Google Sign-In ----------------
+// Web uses Firebase's popup flow, iOS/Android use the native Google SDK —
+// see googleSignIn.web.ts / googleSignIn.native.ts. Either way the result is
+// a normal Firebase user, so the existing onAuthStateChanged listener picks
+// it up exactly like an email sign-in.
+
+/** Creates users/{uid} only if it doesn't exist yet — an existing user's
+ * profile (role, name, phone, ...) is never overwritten, and there's never
+ * more than one document per uid. Best-effort: the person is already
+ * authenticated at this point, so a failed profile write (e.g. rules not
+ * deployed yet) is logged and retried on their next sign-in rather than
+ * blocking login. */
+async function ensureGoogleUserProfile(user: User): Promise<void> {
+  try {
+    const database = requireDb();
+    const ref = doc(database, 'users', user.uid);
+    const existing = await getDoc(ref);
+    if (existing.exists()) return;
+    await setDoc(ref, {
+      uid: user.uid,
+      email: user.email ?? '',
+      name: user.displayName ?? '',
+      role: 'customer' as UserRole,
+      createdAt: serverTimestamp(),
+    });
+  } catch (error) {
+    console.warn('[auth] could not create the Google user profile (will retry next sign-in)', error);
+  }
+}
+
+export async function signInWithGoogle(): Promise<void> {
+  try {
+    const user = await performGoogleSignIn(requireAuth());
+    await ensureGoogleUserProfile(user);
+  } catch (error) {
+    console.warn('[auth] Google sign-in failed', describeAuthError(error));
+    throw new Error(friendlyAuthMessage(error, "We couldn't sign you in with Google. Please try again."));
+  }
 }
 
 // ---------------- Phone OTP (custom, via a Cloudflare Worker) ----------------
