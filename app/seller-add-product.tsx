@@ -16,12 +16,10 @@ import {
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { MAX_PRODUCT_IMAGES } from '@/constants/config';
-import { Category, computeDisplayPrice, formatPrice, MarkupType, NewProductInput } from '@/data/store';
+import { computeDisplayPrice, formatPrice, MarkupType, NewProductInput } from '@/data/store';
 import { isCloudinaryConfigured, uploadImageToCloudinary } from '@/services/cloudinary/upload';
 import { useColors } from '@/hooks/useColors';
 import { useStore } from '@/context/StoreContext';
-
-const categoryOptions: Exclude<Category, 'All'>[] = ['Home', 'Style', 'Beauty', 'Wellness'];
 
 type ImageSlot = {
   id: string;
@@ -39,7 +37,7 @@ export default function SellerAddProductScreen() {
   const colors = useColors();
   const insets = useSafeAreaInsets();
   const { id } = useLocalSearchParams<{ id?: string }>();
-  const { products, addProduct, updateProduct, isCloudMode } = useStore();
+  const { products, categories, addProduct, updateProduct, isCloudMode } = useStore();
   const editing = useMemo(() => products.find((p) => p.id === id), [id, products]);
 
   const [images, setImages] = useState<ImageSlot[]>(() => {
@@ -62,7 +60,10 @@ export default function SellerAddProductScreen() {
   const [name, setName] = useState(editing?.name ?? '');
   const [subtitle, setSubtitle] = useState(editing?.subtitle ?? '');
   const [description, setDescription] = useState(editing?.description ?? '');
-  const [category, setCategory] = useState<Exclude<Category, 'All'>>(editing?.category ?? 'Home');
+  // Category stored as a string — matches product.category which is now `string`
+  const availableCategories = categories.filter((c) => c.enabled || editing?.category === c.id || editing?.category === c.name || editing?.category === c.slug);
+  const defaultCategory = availableCategories[0]?.id ?? 'home';
+  const [category, setCategory] = useState<string>(editing?.category ?? defaultCategory);
   const [baseCost, setBaseCost] = useState(editing ? String(editing.baseCost) : '');
   const [markupType, setMarkupType] = useState<MarkupType>(editing?.markupType ?? 'percent');
   const [markupValue, setMarkupValue] = useState(editing ? String(editing.markupValue) : '25');
@@ -357,16 +358,22 @@ export default function SellerAddProductScreen() {
 
           <Text style={[styles.label, { color: colors.foreground }]}>Category</Text>
           <View style={styles.chipRow}>
-            {categoryOptions.map((option) => (
-              <Pressable
-                key={option}
-                onPress={() => setCategory(option)}
-                style={[styles.chip, { backgroundColor: category === option ? colors.moss : colors.card, borderColor: category === option ? colors.moss : colors.border }]}
-              >
-                <Text style={[styles.chipText, { color: category === option ? '#FFFFFF' : colors.foreground }]}>{option}</Text>
-              </Pressable>
-            ))}
+            {availableCategories.map((cat) => {
+              const isSelected = category === cat.id || category === cat.name || category === cat.slug;
+              return (
+                <Pressable
+                  key={cat.id}
+                  onPress={() => setCategory(cat.id)}
+                  style={[styles.chip, { backgroundColor: isSelected ? colors.moss : colors.card, borderColor: isSelected ? colors.moss : colors.border }]}
+                >
+                  <Text style={[styles.chipText, { color: isSelected ? '#FFFFFF' : colors.foreground }]}>{cat.name}</Text>
+                </Pressable>
+              );
+            })}
           </View>
+          <Pressable onPress={() => router.push('/seller-categories' as any)} hitSlop={8} style={{ marginTop: 6 }}>
+            <Text style={{ fontSize: 11, color: colors.moss, fontFamily: 'Inter_500Medium' }}>+ Manage categories</Text>
+          </Pressable>
 
           <Text style={[styles.label, { color: colors.foreground }]}>Colours / variants (comma separated)</Text>
           <TextInput value={colorsInput} onChangeText={setColorsInput} placeholder="Clay, Sand" placeholderTextColor={colors.mutedForeground} style={[styles.input, { backgroundColor: colors.card, borderColor: colors.border, color: colors.foreground }]} />

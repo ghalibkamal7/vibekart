@@ -1,21 +1,58 @@
 import { Feather } from '@expo/vector-icons';
 import React from 'react';
-import { ScrollView, StyleSheet, Text, View } from 'react-native';
+import { Alert, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
-import { formatPrice } from '@/data/store';
+import { canCancelOrder, formatPrice, OrderStatus } from '@/data/store';
 import { useColors } from '@/hooks/useColors';
 import { useStore } from '@/context/StoreContext';
 
-const statusColor = (status: string, colors: ReturnType<typeof useColors>) => {
-  if (status === 'Delivered') return { bg: colors.mossSoft, fg: colors.moss };
-  if (status === 'Shipped') return { bg: colors.mossSoft, fg: colors.moss };
-  return { bg: colors.coralSoft, fg: colors.coral };
-};
+function statusStyle(
+  status: OrderStatus,
+  colors: ReturnType<typeof useColors>,
+): { bg: string; fg: string } {
+  switch (status) {
+    case 'Delivered':
+      return { bg: colors.mossSoft, fg: colors.moss };
+    case 'Shipped':
+      return { bg: colors.mossSoft, fg: colors.moss };
+    case 'Confirmed':
+      return { bg: '#EEF4FF', fg: '#4A6CF7' };
+    case 'Processing':
+      return { bg: '#FFF8E1', fg: '#F59E0B' };
+    case 'Cancelled':
+      return { bg: '#F5F5F5', fg: '#9E9E9E' };
+    default: // Placed
+      return { bg: colors.coralSoft, fg: colors.coral };
+  }
+}
 
 export default function OrdersScreen() {
   const colors = useColors();
   const insets = useSafeAreaInsets();
-  const { orders } = useStore();
+  const { orders, cancelOrder } = useStore();
+
+  const handleCancel = (orderId: string) => {
+    Alert.alert(
+      'Cancel order?',
+      'This action cannot be undone. Are you sure you want to cancel this order?',
+      [
+        { text: 'Keep order', style: 'cancel' },
+        {
+          text: 'Yes, cancel',
+          style: 'destructive',
+          onPress: async () => {
+            try {
+              await cancelOrder(orderId);
+            } catch (err) {
+              const msg = err instanceof Error ? err.message : 'Failed to cancel order.';
+              Alert.alert('Cannot cancel', msg);
+            }
+          },
+        },
+      ],
+    );
+  };
+
   return (
     <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={[styles.container, { paddingTop: insets.top + 20, paddingBottom: 120 }]}>
       <Text style={[styles.kicker, { color: colors.coral }]}>YOUR VIBES, ON THE WAY</Text>
@@ -31,7 +68,8 @@ export default function OrdersScreen() {
         </View>
       ) : (
         orders.map((order) => {
-          const sc = statusColor(order.status, colors);
+          const sc = statusStyle(order.status, colors);
+          const cancellable = canCancelOrder(order.status);
           return (
             <View key={order.id} style={[styles.orderCard, { backgroundColor: colors.card, borderColor: colors.border }]}>
               <View style={styles.orderTop}>
@@ -50,10 +88,19 @@ export default function OrdersScreen() {
                   <Text style={[styles.trackingText, { color: colors.moss }]}>Tracking ID: {order.trackingId}</Text>
                 </View>
               ) : null}
-              <View style={styles.orderBottom}>
+              <View style={[styles.orderBottom, { borderTopColor: colors.border }]}>
                 <Text style={[styles.orderTotal, { color: colors.foreground }]}>{formatPrice(order.total)}</Text>
                 <Text style={[styles.paymentTag, { color: colors.mutedForeground }]}>{order.paymentMethod}</Text>
               </View>
+              {cancellable ? (
+                <Pressable
+                  onPress={() => handleCancel(order.id)}
+                  style={[styles.cancelButton, { borderColor: colors.coral }]}
+                >
+                  <Feather name="x-circle" size={14} color={colors.coral} />
+                  <Text style={[styles.cancelText, { color: colors.coral }]}>Cancel order</Text>
+                </Pressable>
+              ) : null}
             </View>
           );
         })
@@ -80,7 +127,9 @@ const styles = StyleSheet.create({
   orderProduct: { fontSize: 13, fontFamily: 'Inter_500Medium', marginTop: 22 },
   trackingRow: { flexDirection: 'row', alignItems: 'center', gap: 6, marginTop: 10 },
   trackingText: { fontSize: 11, fontFamily: 'Inter_600SemiBold' },
-  orderBottom: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginTop: 18, paddingTop: 14, borderTopWidth: 1, borderTopColor: '#E8DDD0' },
+  orderBottom: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginTop: 18, paddingTop: 14, borderTopWidth: 1 },
   orderTotal: { fontSize: 15, fontFamily: 'Inter_700Bold' },
   paymentTag: { fontSize: 11, fontFamily: 'Inter_600SemiBold' },
+  cancelButton: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 6, marginTop: 12, paddingVertical: 9, borderRadius: 12, borderWidth: 1 },
+  cancelText: { fontSize: 12, fontFamily: 'Inter_600SemiBold' },
 });

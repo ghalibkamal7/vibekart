@@ -163,3 +163,26 @@ export async function createFirebaseCustomToken(sa: ServiceAccount, uid: string)
     sa.private_key,
   );
 }
+
+/**
+ * Validates a client-submitted Firebase ID token using Identity Toolkit REST API.
+ * Guarantees that the caller is genuine, not expired, and returns the verified uid.
+ */
+export async function verifyFirebaseIdToken(
+  sa: ServiceAccount,
+  accessToken: string,
+  idToken: string,
+): Promise<{ uid: string; email?: string } | null> {
+  const response = await fetch(
+    `https://identitytoolkit.googleapis.com/v1/projects/${sa.project_id}/accounts:lookup`,
+    {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ idToken }),
+    },
+  );
+  if (!response.ok) return null;
+  const data = (await response.json()) as { users?: Array<{ localId: string; email?: string }> };
+  if (!data.users || !data.users.length) return null;
+  return { uid: data.users[0].localId, email: data.users[0].email };
+}

@@ -36,6 +36,14 @@ service cloud.firestore {
       allow delete: if false;
     }
 
+    // ---------------- categories ----------------
+    // Anyone signed in (customer or seller) can read active categories.
+    // Only a seller can create, update, or delete categories.
+    match /categories/{categoryId} {
+      allow read: if isSignedIn();
+      allow create, update, delete: if isSeller();
+    }
+
     // ---------------- products (public fields) ----------------
     // Anyone signed in (customer or seller) can read the public listing.
     // Only a seller can create/update/delete products.
@@ -58,10 +66,22 @@ service cloud.firestore {
         request.resource.data.customerUid == request.auth.uid;
       allow read: if isSignedIn() &&
         (resource.data.customerUid == request.auth.uid || isSeller());
-      // Only a seller can advance status / set a tracking ID; a customer
-      // cannot edit an order once it's placed in this model.
-      allow update: if isSeller();
+      // Sellers can advance order status or set tracking; customers can only
+      // cancel their own placed/confirmed order without changing any other fields.
+      allow update: if isSeller() || (
+        isSignedIn() &&
+        resource.data.customerUid == request.auth.uid &&
+        (resource.data.status == 'Placed' || resource.data.status == 'Confirmed') &&
+        request.resource.data.status == 'Cancelled' &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status'])
+      );
       allow delete: if false;
+
+      // ---------------- orders/{orderId}/private/data (cost & profit fields) ----------------
+      // Customers can NEVER read or write supplier costs/profit data.
+      match /private/{docId} {
+        allow read, write: if isSeller();
+      }
     }
   }
 }

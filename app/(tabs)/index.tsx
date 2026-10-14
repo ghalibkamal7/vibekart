@@ -1,5 +1,5 @@
 import { Feather } from '@expo/vector-icons';
-import { router } from 'expo-router';
+import { router, useLocalSearchParams } from 'expo-router';
 import React, { useMemo, useState } from 'react';
 import {
   FlatList,
@@ -12,7 +12,7 @@ import {
   View,
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
-import { categories, Category, formatPrice, getProductImages, Product } from '@/data/store';
+import { formatPrice, getProductImages, productMatchesCategory, Product } from '@/data/store';
 import { ProductImagePlaceholder } from '@/components/ProductImagePlaceholder';
 import { useColors } from '@/hooks/useColors';
 import { useStore } from '@/context/StoreContext';
@@ -97,21 +97,45 @@ function ProductCard({ product }: { product: Product }) {
 export default function HomeScreen() {
   const colors = useColors();
   const insets = useSafeAreaInsets();
-  const { cartCount, products } = useStore();
-  const [category, setCategory] = useState<Category>('All');
+  const { cartCount, products, categories } = useStore();
+  const params = useLocalSearchParams<{ category?: string }>();
+
+  // selectedId is a category id/slug or 'all'. Default to 'all'.
+  const [selectedId, setSelectedId] = useState<string>(params.category ?? 'all');
   const [query, setQuery] = useState('');
-  const filteredProducts = useMemo(
-    () =>
-      products.filter((product) => {
-        if (product.enabled === false) return false;
-        const matchesCategory = category === 'All' || product.category === category;
-        const matchesQuery =
-          !query.trim() ||
-          `${product.name} ${product.subtitle}`.toLowerCase().includes(query.toLowerCase());
-        return matchesCategory && matchesQuery;
-      }),
-    [category, query, products],
-  );
+  const [sortBy, setSortBy] = useState<'default' | 'price_asc' | 'price_desc' | 'rating'>('default');
+  const [showSort, setShowSort] = useState(false);
+
+  // Sync if navigated from Explore with a category param
+  React.useEffect(() => {
+    if (params.category) {
+      setSelectedId(params.category);
+    }
+  }, [params.category]);
+
+  const enabledCategories = useMemo(() => categories.filter((c) => c.enabled), [categories]);
+
+  const filteredProducts = useMemo(() => {
+    const base = products.filter((product) => {
+      if (product.enabled === false) return false;
+      const isAll = selectedId === 'all' || selectedId === 'All';
+      const matchesCategory = isAll || (() => {
+        const cat = enabledCategories.find(
+          (c) => c.id === selectedId || c.slug === selectedId || c.name.toLowerCase() === selectedId.toLowerCase(),
+        );
+        return cat ? productMatchesCategory(product.category, cat) : product.category?.toLowerCase() === selectedId.toLowerCase();
+      })();
+      const matchesQuery =
+        !query.trim() ||
+        `${product.name} ${product.subtitle}`.toLowerCase().includes(query.toLowerCase());
+      return matchesCategory && matchesQuery;
+    });
+
+    if (sortBy === 'price_asc') return [...base].sort((a, b) => a.price - b.price);
+    if (sortBy === 'price_desc') return [...base].sort((a, b) => b.price - a.price);
+    if (sortBy === 'rating') return [...base].sort((a, b) => b.rating - a.rating);
+    return base;
+  }, [selectedId, query, sortBy, products, enabledCategories]);
 
   return (
     <View style={[styles.screen, { backgroundColor: colors.background }]}>
@@ -148,7 +172,7 @@ export default function HomeScreen() {
                 <Text style={styles.heroKicker}>THE WEEKEND EDIT</Text>
                 <Text style={styles.heroTitle}>Find your next{"\n"}little favourite.</Text>
                 <Text style={styles.heroBody}>Thoughtful picks. Honest prices. Delivered to your door.</Text>
-                <Pressable onPress={() => setCategory('All')} style={styles.heroButton}>
+                <Pressable onPress={() => setSelectedId('all')} style={styles.heroButton}>
                   <Text style={[styles.heroButtonText, { color: colors.moss }]}>Shop the edit</Text>
                   <Feather name="arrow-up-right" size={16} color={colors.moss} />
                 </Pressable>
@@ -174,25 +198,45 @@ export default function HomeScreen() {
               ) : null}
             </View>
             <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.categoryRow}>
-              {categories.map((item) => (
-                <Pressable
-                  key={item.label}
-                  onPress={() => setCategory(item.label)}
-                  style={[
-                    styles.categoryPill,
-                    {
-                      backgroundColor: category === item.label ? colors.coral : colors.card,
-                      borderColor: category === item.label ? colors.coral : colors.border,
-                    },
-                  ]}
-                  testID={`category-${item.label}`}
-                >
-                  <Feather name={item.icon as keyof typeof Feather.glyphMap} size={15} color={category === item.label ? colors.primaryForeground : colors.moss} />
-                  <Text style={[styles.categoryText, { color: category === item.label ? colors.primaryForeground : colors.moss }]}>
-                    {item.label}
-                  </Text>
-                </Pressable>
-              ))}
+              <Pressable
+                key="all"
+                onPress={() => setSelectedId('all')}
+                style={[
+                  styles.categoryPill,
+                  {
+                    backgroundColor: selectedId === 'all' || selectedId === 'All' ? colors.coral : colors.card,
+                    borderColor: selectedId === 'all' || selectedId === 'All' ? colors.coral : colors.border,
+                  },
+                ]}
+                testID="category-All"
+              >
+                <Feather name="grid" size={15} color={selectedId === 'all' || selectedId === 'All' ? colors.primaryForeground : colors.moss} />
+                <Text style={[styles.categoryText, { color: selectedId === 'all' || selectedId === 'All' ? colors.primaryForeground : colors.moss }]}>
+                  All
+                </Text>
+              </Pressable>
+              {enabledCategories.map((cat) => {
+                const isSelected = selectedId === cat.id || selectedId === cat.slug || selectedId.toLowerCase() === cat.name.toLowerCase();
+                return (
+                  <Pressable
+                    key={cat.id}
+                    onPress={() => setSelectedId(cat.id)}
+                    style={[
+                      styles.categoryPill,
+                      {
+                        backgroundColor: isSelected ? colors.coral : colors.card,
+                        borderColor: isSelected ? colors.coral : colors.border,
+                      },
+                    ]}
+                    testID={`category-${cat.name}`}
+                  >
+                    <Feather name={(cat.icon ?? 'tag') as keyof typeof Feather.glyphMap} size={15} color={isSelected ? colors.primaryForeground : colors.moss} />
+                    <Text style={[styles.categoryText, { color: isSelected ? colors.primaryForeground : colors.moss }]}>
+                      {cat.name}
+                    </Text>
+                  </Pressable>
+                );
+              })}
             </ScrollView>
             <View style={styles.sectionHeader}>
               <View>
@@ -203,8 +247,27 @@ export default function HomeScreen() {
                   {filteredProducts.length} things worth bringing home
                 </Text>
               </View>
-              <Feather name="sliders" size={19} color={colors.moss} />
+              <Pressable onPress={() => setShowSort((v) => !v)} hitSlop={10}>
+                <Feather name="sliders" size={19} color={showSort ? colors.coral : colors.moss} />
+              </Pressable>
             </View>
+            {showSort ? (
+              <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ gap: 8, paddingBottom: 10 }}>
+                {(['default', 'price_asc', 'price_desc', 'rating'] as const).map((s) => {
+                  const label = s === 'default' ? 'Default' : s === 'price_asc' ? 'Price ↑' : s === 'price_desc' ? 'Price ↓' : 'Top rated';
+                  const active = sortBy === s;
+                  return (
+                    <Pressable
+                      key={s}
+                      onPress={() => setSortBy(s)}
+                      style={[styles.sortChip, { backgroundColor: active ? colors.coral : colors.card, borderColor: active ? colors.coral : colors.border }]}
+                    >
+                      <Text style={[styles.sortChipText, { color: active ? '#FFFFFF' : colors.foreground }]}>{label}</Text>
+                    </Pressable>
+                  );
+                })}
+              </ScrollView>
+            ) : null}
           </>
         }
         ListEmptyComponent={
@@ -260,4 +323,6 @@ const styles = StyleSheet.create({
   empty: { paddingVertical: 60, alignItems: 'center' },
   emptyTitle: { fontSize: 16, fontFamily: 'Inter_700Bold', marginTop: 14 },
   emptyBody: { fontSize: 13, fontFamily: 'Inter_400Regular', marginTop: 5 },
+  sortChip: { paddingHorizontal: 14, paddingVertical: 7, borderRadius: 20, borderWidth: 1 },
+  sortChipText: { fontSize: 12, fontFamily: 'Inter_600SemiBold' },
 });

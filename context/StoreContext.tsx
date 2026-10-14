@@ -1,13 +1,27 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as Haptics from 'expo-haptics';
 import React, { createContext, useContext, useEffect, useMemo, useState } from 'react';
-import { computeDisplayPrice, defaultProducts, NewProductInput, Order, OrderStatus, Product } from '@/data/store';
+import {
+  canCancelOrder,
+  canTransitionOrderStatus,
+  CategoryItem,
+  computeDisplayPrice,
+  defaultCategoryItems,
+  defaultProducts,
+  getAssignedProductCount,
+  NewProductInput,
+  normalizeSlug,
+  Order,
+  OrderStatus,
+  Product,
+  validateCategoryName,
+} from '@/data/store';
 
 import {
   confirmPhoneOtp,
   fetchUserProfile,
   requestPhoneOtp,
-    signIn as firebaseSignIn,
+  signIn as firebaseSignIn,
   signInWithGoogle as firebaseSignInWithGoogle,
   signOutUser,
   signUp as firebaseSignUp,
@@ -16,17 +30,22 @@ import {
 } from '@/services/firebase/auth';
 import { isFirebaseConfigured } from '@/services/firebase/config';
 import {
+  createCategoryRemote,
   createOrder,
+  createOrderViaWorker,
   createProduct,
   editProduct,
   fetchSellerProducts,
+  removeCategoryRemote,
   removeProduct,
   setOrderTrackingId as setOrderTrackingIdRemote,
   setProductEnabled as setProductEnabledRemote,
   setProductFeatured as setProductFeaturedRemote,
   setProductStock as setProductStockRemote,
+  subscribeToCategories,
   subscribeToOrders,
   subscribeToProducts,
+  updateCategoryRemote,
   updateOrderStatusRemote,
 } from '@/services/firebase/firestore';
 
@@ -56,6 +75,13 @@ type StoreContextValue = {
   toggleEnabled: (id: string) => Promise<void>;
   toggleFeatured: (id: string) => Promise<void>;
 
+  // categories
+  categories: CategoryItem[];
+  addCategory: (input: { name: string; icon?: string }) => Promise<string>;
+  updateCategory: (id: string, patch: Partial<Pick<CategoryItem, 'name' | 'icon' | 'enabled'>>) => Promise<void>;
+  deleteCategory: (id: string) => Promise<void>;
+  toggleCategoryEnabled: (id: string) => Promise<void>;
+
   // cart / orders (customer side) — cart/favorites always stay on-device
   cart: CartLine[];
   orders: Order[];
@@ -76,14 +102,20 @@ type StoreContextValue = {
   // order fulfilment (seller side)
   updateOrderStatus: (orderId: string, status: OrderStatus) => Promise<void>;
   setTrackingId: (orderId: string, trackingId: string) => Promise<void>;
+  cancelOrder: (orderId: string) => Promise<void>;
 
   // analytics (seller side)
   analytics: {
-    totalRevenue: number;
-    totalCost: number;
-    totalProfit: number;
-    ordersCount: number;
+    totalRevenue: number;        // from non-cancelled orders only
+    totalCost: number;           // estimated cost from non-cancelled orders
+    totalProfit: number;         // totalRevenue - totalCost
+    marginPercent: number;       // profit / revenue * 100 (0 if no revenue)
+    ordersCount: number;         // all orders
+    activeOrdersCount: number;   // Placed + Confirmed + Processing + Shipped
     deliveredCount: number;
+    cancelledCount: number;
+    lowStockCount: number;       // products with inStock = false
+    disabledCount: number;       // products with enabled = false
   };
 
   // auth
@@ -106,11 +138,13 @@ const STORAGE_KEYS = {
   orders: 'vibekart-orders',
   favorites: 'vibekart-favorites',
   products: 'vibekart-products',
+  categories: 'vibekart-categories',
   auth: 'vibekart-auth',
 };
 
 export function StoreProvider({ children }: { children: React.ReactNode }) {
   const [products, setProducts] = useState<Product[]>(defaultProducts);
+  const [categories, setCategories] = useState<CategoryItem[]>(defaultCategoryItems);
   const [cart, setCart] = useState<CartLine[]>([]);
   const [orders, setOrders] = useState<Order[]>([]);
   const [favorites, setFavorites] = useState<string[]>([]);
@@ -319,6 +353,71 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     if (!isCloudMode) AsyncStorage.setItem(STORAGE_KEYS.products, JSON.stringify(products));
   }, [products, isCloudMode]);
 
+  // ---------------- categories ----------------
+  useEffect(() => {
+    if (isCloudMode) {
+      const unsubscribe = subscribeToCategories(
+        (remoteCategories) => {
+          if (remoteCategories.length > 0) {
+            setCategories(remoteCategories);
+          } else if (authUser && !authUser.isGuest && authUser.role === 'seller') {
+            (async () => {
+              try {
+                for (const cat of defaultCategoryItems) {
+                  await createCategoryRemote({
+                    id: cat.id,
+                    name: cat.name,
+                    slug: cat.slug,
+                    icon: cat.icon,
+                    enabled: cat.enabled,
+                  });
+                }
+              } catch (seedErr) {
+                console.warn('[categories] failed to seed default categories', seedErr);
+              }
+            })();
+          } else {
+            setCategories(defaultCategoryItems);
+          }
+        },
+        (error) => {
+          console.warn('[categories] listener error', error.message);
+          setCategories(defaultCategoryItems);
+        },
+      );
+      return unsubscribe;
+    }
+
+    AsyncStorage.getItem(STORAGE_KEYS.categories).then((saved) => {
+      if (saved) {
+        try {
+          const parsed = JSON.parse(saved) as CategoryItem[];
+          if (Array.isArray(parsed) && parsed.length > 0) {
+            setCategories(
+              parsed.map((c) => ({
+                id: c.id,
+                name: c.name,
+                slug: c.slug || normalizeSlug(c.name),
+                icon: c.icon || 'tag',
+                enabled: c.enabled !== false,
+                createdAt: c.createdAt,
+                updatedAt: c.updatedAt,
+              })),
+            );
+            return;
+          }
+        } catch {
+          // fallback below
+        }
+      }
+      setCategories(defaultCategoryItems);
+    });
+  }, [isCloudMode, authUser && !authUser.isGuest ? authUser.role : null]);
+
+  useEffect(() => {
+    if (!isCloudMode) AsyncStorage.setItem(STORAGE_KEYS.categories, JSON.stringify(categories));
+  }, [categories, isCloudMode]);
+
   const addProduct: StoreContextValue['addProduct'] = async (input) => {
     if (isCloudMode) {
       const id = await createProduct(input);
@@ -423,6 +522,81 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     );
   };
 
+  // ---------------- category management ----------------
+
+  const addCategory: StoreContextValue['addCategory'] = async ({ name, icon }) => {
+    const validation = validateCategoryName(name, categories);
+    if (!validation.valid) throw new Error(validation.error);
+    const slug = normalizeSlug(name);
+    const newItem: CategoryItem = {
+      id: slug,
+      name: name.trim(),
+      slug,
+      icon: icon || 'tag',
+      enabled: true,
+    };
+    if (isCloudMode) {
+      const id = await createCategoryRemote({ id: slug, name: name.trim(), slug, icon: icon || 'tag', enabled: true });
+      return id;
+    }
+    setCategories((current) => {
+      if (current.some((c) => c.id === newItem.id)) {
+        const unique = `${slug}-${Date.now().toString().slice(-4)}`;
+        return [...current, { ...newItem, id: unique }];
+      }
+      return [...current, newItem];
+    });
+    return newItem.id;
+  };
+
+  const updateCategory: StoreContextValue['updateCategory'] = async (id, patch) => {
+    if (patch.name !== undefined) {
+      const validation = validateCategoryName(patch.name, categories, id);
+      if (!validation.valid) throw new Error(validation.error);
+    }
+    const updatedPatch: Partial<CategoryItem> = { ...patch };
+    if (patch.name !== undefined) {
+      updatedPatch.name = patch.name.trim();
+      updatedPatch.slug = normalizeSlug(patch.name);
+    }
+    if (isCloudMode) {
+      await updateCategoryRemote(id, updatedPatch);
+      return;
+    }
+    setCategories((current) =>
+      current.map((c) => (c.id === id ? { ...c, ...updatedPatch, updatedAt: new Date().toISOString() } : c)),
+    );
+  };
+
+  const deleteCategory: StoreContextValue['deleteCategory'] = async (id) => {
+    const target = categories.find((c) => c.id === id);
+    if (!target) return;
+    const count = getAssignedProductCount(target, products);
+    if (count > 0) {
+      throw new Error(
+        `"${target.name}" has ${count} product${count > 1 ? 's' : ''} assigned to it. Reassign or delete those products first.`,
+      );
+    }
+    if (isCloudMode) {
+      await removeCategoryRemote(id);
+      return;
+    }
+    setCategories((current) => current.filter((c) => c.id !== id));
+  };
+
+  const toggleCategoryEnabled: StoreContextValue['toggleCategoryEnabled'] = async (id) => {
+    const target = categories.find((c) => c.id === id);
+    if (!target) return;
+    const newEnabled = !(target.enabled ?? true);
+    if (isCloudMode) {
+      await updateCategoryRemote(id, { enabled: newEnabled });
+      return;
+    }
+    setCategories((current) =>
+      current.map((c) => (c.id === id ? { ...c, enabled: newEnabled, updatedAt: new Date().toISOString() } : c)),
+    );
+  };
+
   // ---------------- cart ----------------
 
   const addToCart = (product: Product, option?: string) => {
@@ -484,29 +658,54 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     const costTotal = items.reduce((sum, item) => sum + item.unitCost * item.quantity, 0);
 
     if (isCloudMode && authUser && !authUser.isGuest) {
+      const idempotencyKey = `idemp-${authUser.uid}-${Date.now().toString()}`;
+      const workerUrl = process.env.EXPO_PUBLIC_OTP_WORKER_URL?.replace(/\/+$/, '');
+
+      if (workerUrl) {
+        // Secure, server-authoritative flow via Cloudflare Worker
+        const order = await createOrderViaWorker({
+          items: cart.map((line) => ({
+            productId: line.product.id,
+            quantity: line.quantity,
+            option: line.option,
+          })),
+          customerName: details.customerName,
+          customerPhone: details.customerPhone,
+          customerAddress: details.customerAddress,
+          paymentMethod: details.paymentMethod,
+          idempotencyKey,
+        });
+        setCart([]);
+        await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+        return order;
+      }
+
+      // Safe client creation without leaking supplier costs
+      const customerSafeItems = items.map((it) => ({
+        productId: it.productId,
+        name: it.name,
+        option: it.option,
+        quantity: it.quantity,
+        unitPrice: it.unitPrice,
+      }));
       const id = await createOrder({
         customerUid: authUser.uid,
-        items,
+        items: customerSafeItems,
         total,
-        // Placeholders only — the customer client cannot read real cost data
-        // (see firestore.rules). The reconcileOrderCost Cloud Function
-        // overwrites these with authoritative values right after creation.
-        costTotal: 0,
-        profitTotal: 0,
         customerName: details.customerName,
         customerPhone: details.customerPhone,
         customerAddress: details.customerAddress,
         paymentMethod: details.paymentMethod,
+        idempotencyKey,
       });
       setCart([]);
       await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
       return {
         id,
-        items,
+        items: customerSafeItems,
         total,
-        costTotal: 0,
-        profitTotal: 0,
         status: 'Placed',
+        paymentStatus: 'Selected',
         date: new Date().toLocaleDateString('en-IN', { day: '2-digit', month: 'short' }),
         ...details,
       } as Order;
@@ -532,11 +731,29 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   };
 
   const updateOrderStatus: StoreContextValue['updateOrderStatus'] = async (orderId, status) => {
+    const order = orders.find((o) => o.id === orderId);
+    if (!order) throw new Error('Order not found.');
+    if (!canTransitionOrderStatus(order.status, status)) {
+      throw new Error(`Cannot transition from "${order.status}" to "${status}".`);
+    }
     if (isCloudMode) {
       await updateOrderStatusRemote(orderId, status);
       return;
     }
-    setOrders((current) => current.map((order) => (order.id === orderId ? { ...order, status } : order)));
+    setOrders((current) => current.map((o) => (o.id === orderId ? { ...o, status } : o)));
+  };
+
+  const cancelOrder: StoreContextValue['cancelOrder'] = async (orderId) => {
+    const order = orders.find((o) => o.id === orderId);
+    if (!order) throw new Error('Order not found.');
+    if (!canCancelOrder(order.status)) {
+      throw new Error(`Orders in "${order.status}" status cannot be cancelled. Contact support if needed.`);
+    }
+    if (isCloudMode) {
+      await updateOrderStatusRemote(orderId, 'Cancelled');
+      return;
+    }
+    setOrders((current) => current.map((o) => (o.id === orderId ? { ...o, status: 'Cancelled' } : o)));
   };
 
   const setTrackingId: StoreContextValue['setTrackingId'] = async (orderId, trackingId) => {
@@ -550,16 +767,25 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   // ---------------- analytics ----------------
 
   const analytics = useMemo(() => {
-    const totalRevenue = orders.reduce((sum, order) => sum + order.total, 0);
-    const totalCost = orders.reduce((sum, order) => sum + order.costTotal, 0);
+    // Exclude cancelled orders from financial metrics
+    const activeOrders = orders.filter((o) => o.status !== 'Cancelled');
+    const totalRevenue = activeOrders.reduce((sum, o) => sum + o.total, 0);
+    const totalCost = activeOrders.reduce((sum, o) => sum + (o.costTotal ?? 0), 0);
+    const totalProfit = totalRevenue - totalCost;
+    const marginPercent = totalRevenue > 0 ? Math.round((totalProfit / totalRevenue) * 1000) / 10 : 0;
     return {
       totalRevenue,
       totalCost,
-      totalProfit: totalRevenue - totalCost,
+      totalProfit,
+      marginPercent,
       ordersCount: orders.length,
-      deliveredCount: orders.filter((order) => order.status === 'Delivered').length,
+      activeOrdersCount: orders.filter((o) => !['Delivered', 'Cancelled'].includes(o.status)).length,
+      deliveredCount: orders.filter((o) => o.status === 'Delivered').length,
+      cancelledCount: orders.filter((o) => o.status === 'Cancelled').length,
+      lowStockCount: products.filter((p) => !p.inStock).length,
+      disabledCount: products.filter((p) => p.enabled === false).length,
     };
-  }, [orders]);
+  }, [orders, products]);
 
   const value = useMemo<StoreContextValue>(
     () => ({
@@ -571,6 +797,11 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       toggleStock,
       toggleEnabled,
       toggleFeatured,
+      categories,
+      addCategory,
+      updateCategory,
+      deleteCategory,
+      toggleCategoryEnabled,
       cart,
       orders,
       favorites,
@@ -583,6 +814,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       placeOrder,
       updateOrderStatus,
       setTrackingId,
+      cancelOrder,
       analytics,
       authUser,
       authLoaded,
@@ -595,7 +827,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       continueAsGuest,
       logout,
     }),
-    [isCloudMode, products, cart, orders, favorites, analytics, authUser, authLoaded, authError],
+    [isCloudMode, products, categories, cart, orders, favorites, analytics, authUser, authLoaded, authError],
   );
 
   return <StoreContext.Provider value={value}>{children}</StoreContext.Provider>;

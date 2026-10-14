@@ -14,15 +14,17 @@ import {
   updateDoc,
 } from 'firebase/firestore';
 import {
+  CategoryItem,
   computeDisplayPrice,
   NewProductInput,
   Order,
   OrderStatus,
   Product,
 } from '@/data/store';
-import { db } from './config';
+import { auth, db } from './config';
 
 const PRODUCTS_COLLECTION = 'products';
+const CATEGORIES_COLLECTION = 'categories';
 const ORDERS_COLLECTION = 'orders';
 const PRIVATE_SUBCOLLECTION = 'private';
 const PRIVATE_DOC_ID = 'data';
@@ -204,13 +206,63 @@ export type NewOrderInput = {
   customerUid: string;
   items: Order['items'];
   total: number;
-  costTotal: number;
-  profitTotal: number;
+  costTotal?: number;
+  profitTotal?: number;
   customerName: string;
   customerPhone: string;
   customerAddress: string;
   paymentMethod: 'UPI' | 'COD';
+  idempotencyKey?: string;
 };
+
+export async function createOrderViaWorker(input: {
+  items: Array<{ productId: string; quantity: number; option?: string }>;
+  customerName: string;
+  customerPhone: string;
+  customerAddress: string;
+  paymentMethod: 'UPI' | 'COD';
+  idempotencyKey?: string;
+}): Promise<Order> {
+  const workerUrl = process.env.EXPO_PUBLIC_OTP_WORKER_URL?.replace(/\/+$/, '');
+  if (!workerUrl) {
+    throw new Error(
+      'EXPO_PUBLIC_OTP_WORKER_URL is not configured. Cloud order creation requires the secure pricing worker.',
+    );
+  }
+  const currentUser = auth?.currentUser;
+  if (!currentUser) {
+    throw new Error('You must be signed in to place an order.');
+  }
+  const idToken = await currentUser.getIdToken();
+  const response = await fetch(`${workerUrl}/create-order`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${idToken}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(input),
+  });
+
+  const resJson = (await response.json().catch(() => null)) as { success?: boolean; order?: Order; error?: string } | null;
+  if (!response.ok || !resJson?.success || !resJson.order) {
+    throw new Error(resJson?.error || `Order creation failed with status ${response.status}`);
+  }
+  return resJson.order;
+}
+
+export async function fetchSellerOrderPrivateData(orderId: string): Promise<{
+  costTotal?: number;
+  profitTotal?: number;
+  items?: Array<{ productId: string; unitCost?: number; sourceUrl?: string; sourceCode?: string }>;
+} | null> {
+  const database = requireDb();
+  try {
+    const snap = await getDoc(doc(database, ORDERS_COLLECTION, orderId, PRIVATE_SUBCOLLECTION, PRIVATE_DOC_ID));
+    return snap.exists() ? (snap.data() as any) : null;
+  } catch {
+    return null;
+  }
+}
 
 export function subscribeToOrders(
   onChange: (orders: Order[]) => void,
@@ -233,14 +285,23 @@ export function subscribeToOrders(
 export async function createOrder(input: NewOrderInput): Promise<string> {
   const database = requireDb();
   const docRef = await addDoc(collection(database, ORDERS_COLLECTION), {
-    ...input,
+    customerUid: input.customerUid,
+    customerName: input.customerName,
+    customerPhone: input.customerPhone,
+    customerAddress: input.customerAddress,
+    paymentMethod: input.paymentMethod,
+    paymentStatus: 'Selected',
     status: 'Placed' as OrderStatus,
-    // The client (customer) never has real cost data to offer here — see
-    // firestore.rules. costTotal/profitTotal below are placeholders only;
-    // the reconcileOrderCost Cloud Function (functions/index.js) overwrites
-    // them with server-computed, trustworthy values within moments and
-    // flips costReconciled to true.
-    costReconciled: false,
+    items: input.items.map((it) => ({
+      productId: it.productId,
+      name: it.name,
+      option: it.option,
+      quantity: it.quantity,
+      unitPrice: it.unitPrice,
+      itemTotal: it.unitPrice * it.quantity,
+    })),
+    total: input.total,
+    costReconciled: true,
     createdAt: serverTimestamp(),
   });
   return docRef.id;
@@ -254,4 +315,94 @@ export async function updateOrderStatusRemote(id: string, status: OrderStatus): 
 export async function setOrderTrackingId(id: string, trackingId: string): Promise<void> {
   const database = requireDb();
   await updateDoc(doc(database, ORDERS_COLLECTION, id), { trackingId });
+}
+
+// ---------------- Categories ----------------
+
+export function subscribeToCategories(
+  onChange: (categories: CategoryItem[]) => void,
+  onError?: (error: Error) => void,
+) {
+  const database = requireDb();
+  const q = query(collection(database, CATEGORIES_COLLECTION));
+  return onSnapshot(
+    q,
+    (snapshot) => {
+      const items = snapshot.docs.map((d) => {
+        const data = d.data();
+        return {
+          id: d.id,
+          name: data.name ?? '',
+          slug: data.slug ?? '',
+          icon: data.icon,
+          enabled: data.enabled ?? true,
+          createdAt: data.createdAt?.toDate?.()?.toISOString?.() ?? (typeof data.createdAt === 'string' ? data.createdAt : undefined),
+          updatedAt: data.updatedAt?.toDate?.()?.toISOString?.() ?? (typeof data.updatedAt === 'string' ? data.updatedAt : undefined),
+        } as CategoryItem;
+      });
+      onChange(items);
+    },
+    (error) => onError?.(error as Error),
+  );
+}
+
+export async function fetchCategoriesRemote(): Promise<CategoryItem[]> {
+  const database = requireDb();
+  const snapshot = await getDocs(query(collection(database, CATEGORIES_COLLECTION)));
+  return snapshot.docs.map((d) => {
+    const data = d.data();
+    return {
+      id: d.id,
+      name: data.name ?? '',
+      slug: data.slug ?? '',
+      icon: data.icon,
+      enabled: data.enabled ?? true,
+      createdAt: data.createdAt?.toDate?.()?.toISOString?.() ?? (typeof data.createdAt === 'string' ? data.createdAt : undefined),
+      updatedAt: data.updatedAt?.toDate?.()?.toISOString?.() ?? (typeof data.updatedAt === 'string' ? data.updatedAt : undefined),
+    } as CategoryItem;
+  });
+}
+
+export async function createCategoryRemote(input: {
+  id?: string;
+  name: string;
+  slug: string;
+  icon?: string;
+  enabled?: boolean;
+}): Promise<string> {
+  const database = requireDb();
+  const payload = {
+    name: input.name.trim(),
+    slug: input.slug,
+    icon: input.icon || 'tag',
+    enabled: input.enabled ?? true,
+    createdAt: serverTimestamp(),
+    updatedAt: serverTimestamp(),
+  };
+  if (input.id) {
+    await setDoc(doc(database, CATEGORIES_COLLECTION, input.id), payload);
+    return input.id;
+  }
+  const ref = await addDoc(collection(database, CATEGORIES_COLLECTION), payload);
+  return ref.id;
+}
+
+export async function updateCategoryRemote(
+  id: string,
+  patch: Partial<Omit<CategoryItem, 'id'>>,
+): Promise<void> {
+  const database = requireDb();
+  const payload: Record<string, unknown> = {
+    ...patch,
+    updatedAt: serverTimestamp(),
+  };
+  if (patch.name !== undefined) {
+    payload.name = patch.name.trim();
+  }
+  await updateDoc(doc(database, CATEGORIES_COLLECTION, id), payload);
+}
+
+export async function removeCategoryRemote(id: string): Promise<void> {
+  const database = requireDb();
+  await deleteDoc(doc(database, CATEGORIES_COLLECTION, id));
 }

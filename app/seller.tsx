@@ -1,16 +1,58 @@
 import { Feather } from '@expo/vector-icons';
 import { router } from 'expo-router';
-import React from 'react';
+import React, { useMemo, useState } from 'react';
 import { Alert, Pressable, ScrollView, StyleSheet, Switch, Text, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { formatPrice } from '@/data/store';
 import { useColors } from '@/hooks/useColors';
 import { useStore } from '@/context/StoreContext';
 
+type DateFilter = 'Today' | 'Last 7 Days' | 'All Time';
+const DATE_FILTERS: DateFilter[] = ['Today', 'Last 7 Days', 'All Time'];
+
+function isWithinDays(dateStr: string, days: number): boolean {
+  // dateStr is formatted like "14 Oct" — parse by comparing with recent dates
+  const now = new Date();
+  for (let d = 0; d < days; d++) {
+    const candidate = new Date(now);
+    candidate.setDate(now.getDate() - d);
+    const label = candidate.toLocaleDateString('en-IN', { day: '2-digit', month: 'short' });
+    if (dateStr === label) return true;
+  }
+  return false;
+}
+
 export default function SellerScreen() {
   const colors = useColors();
   const insets = useSafeAreaInsets();
-  const { products, analytics, toggleStock, toggleEnabled, deleteProduct } = useStore();
+  const { products, orders, analytics, toggleStock, toggleEnabled, deleteProduct, authUser, isCloudMode } = useStore();
+  const [dateFilter, setDateFilter] = useState<DateFilter>('All Time');
+
+  // Client-side route guard — computed before any early return so hooks
+  // are always called in the same order (React rules of hooks).
+  const isSeller = !isCloudMode || (authUser && !authUser.isGuest && authUser.role === 'seller');
+
+  const filteredOrders = useMemo(() => {
+    if (dateFilter === 'All Time') return orders;
+    const days = dateFilter === 'Today' ? 1 : 7;
+    return orders.filter((o) => isWithinDays(o.date, days));
+  }, [orders, dateFilter]);
+
+  const filteredAnalytics = useMemo(() => {
+    const active = filteredOrders.filter((o) => o.status !== 'Cancelled');
+    const revenue = active.reduce((s, o) => s + o.total, 0);
+    const cost = active.reduce((s, o) => s + (o.costTotal ?? 0), 0);
+    const profit = revenue - cost;
+    return {
+      revenue,
+      cost,
+      profit,
+      marginPercent: revenue > 0 ? Math.round((profit / revenue) * 1000) / 10 : 0,
+      ordersCount: filteredOrders.length,
+      activeCount: filteredOrders.filter((o) => !['Delivered', 'Cancelled'].includes(o.status)).length,
+      deliveredCount: filteredOrders.filter((o) => o.status === 'Delivered').length,
+    };
+  }, [filteredOrders]);
 
   const confirmDelete = (id: string, name: string) => {
     Alert.alert('Delete product?', `"${name}" will be permanently removed from your catalogue.`, [
@@ -18,6 +60,24 @@ export default function SellerScreen() {
       { text: 'Delete', style: 'destructive', onPress: () => deleteProduct(id) },
     ]);
   };
+
+  // Access-denied screen — rendered after all hooks so hook order stays stable.
+  if (!isSeller) {
+    return (
+      <View style={[{ flex: 1, justifyContent: 'center', alignItems: 'center', padding: 24 }, { backgroundColor: colors.background }]}>
+        <Feather name="lock" size={40} color={colors.mutedForeground} />
+        <Text style={{ fontSize: 17, fontFamily: 'Inter_700Bold', color: colors.foreground, marginTop: 16 }}>Seller area</Text>
+        <Text style={{ fontSize: 13, fontFamily: 'Inter_400Regular', color: colors.mutedForeground, textAlign: 'center', marginTop: 8 }}>
+          This section is only accessible to authorised sellers.
+        </Text>
+        <Pressable onPress={() => router.replace('/(tabs)')} style={{ marginTop: 20, backgroundColor: colors.moss, paddingHorizontal: 20, paddingVertical: 11, borderRadius: 14 }}>
+          <Text style={{ color: '#FFFFFF', fontFamily: 'Inter_700Bold', fontSize: 13 }}>Go back</Text>
+        </Pressable>
+      </View>
+    );
+  }
+
+
 
   return (
     <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={[styles.container, { paddingTop: insets.top + 14, paddingBottom: 100 }]}>
@@ -30,22 +90,70 @@ export default function SellerScreen() {
           <Feather name="clipboard" size={20} color={colors.foreground} />
         </Pressable>
       </View>
+
       <Text style={[styles.kicker, { color: colors.coral }]}>RESELLER SNAPSHOT</Text>
       <Text style={[styles.title, { color: colors.foreground }]}>Make every pick{"\n"}work harder.</Text>
 
+      {/* Date filter chips */}
+      <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.filterRow}>
+        {DATE_FILTERS.map((f) => (
+          <Pressable
+            key={f}
+            onPress={() => setDateFilter(f)}
+            style={[
+              styles.filterChip,
+              {
+                backgroundColor: dateFilter === f ? colors.moss : colors.card,
+                borderColor: dateFilter === f ? colors.moss : colors.border,
+              },
+            ]}
+          >
+            <Text style={[styles.filterChipText, { color: dateFilter === f ? '#FFFFFF' : colors.mutedForeground }]}>{f}</Text>
+          </Pressable>
+        ))}
+      </ScrollView>
+
+      {/* Metrics cards */}
       <View style={styles.metrics}>
         <View style={[styles.metric, { backgroundColor: colors.moss }]}>
           <Text style={styles.metricLabel}>NET PROFIT</Text>
-          <Text style={styles.metricValue}>{formatPrice(analytics.totalProfit)}</Text>
-          <Text style={styles.metricFoot}>{analytics.ordersCount} order{analytics.ordersCount === 1 ? '' : 's'} total</Text>
+          <Text style={styles.metricValue}>{formatPrice(filteredAnalytics.profit)}</Text>
+          <Text style={styles.metricFoot}>
+            {filteredAnalytics.marginPercent}% margin · {filteredAnalytics.ordersCount} order{filteredAnalytics.ordersCount === 1 ? '' : 's'}
+          </Text>
         </View>
         <View style={[styles.metric, { backgroundColor: colors.butter }]}>
           <Text style={[styles.metricLabel, { color: colors.moss }]}>REVENUE</Text>
-          <Text style={[styles.metricValue, { color: colors.moss }]}>{formatPrice(analytics.totalRevenue)}</Text>
-          <Text style={[styles.metricFoot, { color: colors.moss }]}>Cost: {formatPrice(analytics.totalCost)}</Text>
+          <Text style={[styles.metricValue, { color: colors.moss }]}>{formatPrice(filteredAnalytics.revenue)}</Text>
+          <Text style={[styles.metricFoot, { color: colors.moss }]}>Cost: {formatPrice(filteredAnalytics.cost)}</Text>
         </View>
       </View>
 
+      {/* Order status pills */}
+      <View style={styles.statRow}>
+        <View style={[styles.statPill, { backgroundColor: colors.coralSoft }]}>
+          <Feather name="clock" size={12} color={colors.coral} />
+          <Text style={[styles.statText, { color: colors.coral }]}>{filteredAnalytics.activeCount} active</Text>
+        </View>
+        <View style={[styles.statPill, { backgroundColor: colors.mossSoft }]}>
+          <Feather name="check-circle" size={12} color={colors.moss} />
+          <Text style={[styles.statText, { color: colors.moss }]}>{filteredAnalytics.deliveredCount} delivered</Text>
+        </View>
+        {analytics.lowStockCount > 0 ? (
+          <View style={[styles.statPill, { backgroundColor: '#FFF8E1' }]}>
+            <Feather name="alert-triangle" size={12} color="#F59E0B" />
+            <Text style={[styles.statText, { color: '#F59E0B' }]}>{analytics.lowStockCount} out of stock</Text>
+          </View>
+        ) : null}
+        {analytics.disabledCount > 0 ? (
+          <View style={[styles.statPill, { backgroundColor: '#F5F5F5' }]}>
+            <Feather name="eye-off" size={12} color="#9E9E9E" />
+            <Text style={[styles.statText, { color: '#9E9E9E' }]}>{analytics.disabledCount} hidden</Text>
+          </View>
+        ) : null}
+      </View>
+
+      {/* Quick actions */}
       <View style={styles.quickRow}>
         <Pressable onPress={() => router.push('/seller-add-product')} style={[styles.quickAction, { backgroundColor: colors.coral }]} testID="add-product">
           <Feather name="plus" size={16} color="#FFFFFF" />
@@ -54,6 +162,10 @@ export default function SellerScreen() {
         <Pressable onPress={() => router.push('/seller-orders')} style={[styles.quickAction, { backgroundColor: colors.card, borderWidth: 1, borderColor: colors.border }]} testID="view-orders">
           <Feather name="package" size={16} color={colors.moss} />
           <Text style={[styles.quickActionText, { color: colors.moss }]}>Fulfil orders</Text>
+        </Pressable>
+        <Pressable onPress={() => router.push('/seller-categories' as any)} style={[styles.quickAction, { backgroundColor: colors.card, borderWidth: 1, borderColor: colors.border }]} testID="manage-categories">
+          <Feather name="tag" size={16} color={colors.moss} />
+          <Text style={[styles.quickActionText, { color: colors.moss }]}>Categories</Text>
         </Pressable>
       </View>
 
@@ -70,10 +182,11 @@ export default function SellerScreen() {
       {products.map((product) => {
         const margin = product.price - product.baseCost;
         const isLoss = margin < 0;
+        const isLowStock = !product.inStock;
         return (
           <View key={product.id} style={[styles.productRow, { backgroundColor: colors.card, borderColor: colors.border }]}>
-            <View style={[styles.productDot, { backgroundColor: product.inStock ? colors.mossSoft : colors.coralSoft }]}>
-              <Feather name="package" size={16} color={product.inStock ? colors.moss : colors.coral} />
+            <View style={[styles.productDot, { backgroundColor: isLowStock ? colors.coralSoft : colors.mossSoft }]}>
+              <Feather name="package" size={16} color={isLowStock ? colors.coral : colors.moss} />
             </View>
             <View style={{ flex: 1 }}>
               <Text style={[styles.productName, { color: colors.foreground }]} numberOfLines={1}>{product.name}</Text>
@@ -91,6 +204,11 @@ export default function SellerScreen() {
                 {product.isNew ? (
                   <View style={{ backgroundColor: colors.mossSoft, paddingHorizontal: 6, paddingVertical: 1, borderRadius: 5 }}>
                     <Text style={{ color: colors.moss, fontSize: 8, fontFamily: 'Inter_700Bold' }}>NEW</Text>
+                  </View>
+                ) : null}
+                {isLowStock ? (
+                  <View style={{ backgroundColor: '#FFF8E1', paddingHorizontal: 6, paddingVertical: 1, borderRadius: 5 }}>
+                    <Text style={{ color: '#F59E0B', fontSize: 8, fontFamily: 'Inter_700Bold' }}>OUT OF STOCK</Text>
                   </View>
                 ) : null}
               </View>
@@ -152,11 +270,17 @@ const styles = StyleSheet.create({
   headerTitle: { fontSize: 18, fontFamily: 'Inter_700Bold' },
   kicker: { fontSize: 10, fontFamily: 'Inter_700Bold', letterSpacing: 1.7, marginTop: 30 },
   title: { fontSize: 30, lineHeight: 33, fontFamily: 'Inter_700Bold', letterSpacing: -1, marginTop: 8 },
-  metrics: { flexDirection: 'row', gap: 11, marginTop: 22 },
+  filterRow: { paddingTop: 14, paddingBottom: 2, gap: 8 },
+  filterChip: { paddingHorizontal: 14, paddingVertical: 7, borderRadius: 20, borderWidth: 1 },
+  filterChipText: { fontSize: 12, fontFamily: 'Inter_600SemiBold' },
+  metrics: { flexDirection: 'row', gap: 11, marginTop: 14 },
   metric: { flex: 1, minHeight: 131, borderRadius: 20, padding: 15, justifyContent: 'space-between' },
   metricLabel: { color: '#DCEBE5', fontSize: 9, letterSpacing: 1.1, fontFamily: 'Inter_700Bold' },
   metricValue: { color: '#FFFFFF', fontSize: 22, fontFamily: 'Inter_700Bold' },
   metricFoot: { color: '#DCEBE5', fontSize: 10, fontFamily: 'Inter_400Regular' },
+  statRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginTop: 12 },
+  statPill: { flexDirection: 'row', alignItems: 'center', gap: 5, paddingHorizontal: 10, paddingVertical: 6, borderRadius: 20 },
+  statText: { fontSize: 11, fontFamily: 'Inter_600SemiBold' },
   quickRow: { flexDirection: 'row', gap: 10, marginTop: 16 },
   quickAction: { flex: 1, height: 48, borderRadius: 15, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8 },
   quickActionText: { color: '#FFFFFF', fontSize: 12, fontFamily: 'Inter_700Bold' },

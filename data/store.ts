@@ -1,6 +1,99 @@
 import { ImageSourcePropType } from 'react-native';
 
-export type Category = 'All' | 'Home' | 'Style' | 'Beauty' | 'Wellness';
+export type Category = 'All' | 'Home' | 'Style' | 'Beauty' | 'Wellness' | (string & {});
+
+export type CategoryItem = {
+  id: string;
+  name: string;
+  slug: string;
+  icon?: string;
+  enabled: boolean;
+  createdAt?: string;
+  updatedAt?: string;
+};
+
+export const defaultCategoryItems: CategoryItem[] = [
+  { id: 'home', name: 'Home', slug: 'home', icon: 'home', enabled: true },
+  { id: 'style', name: 'Style', slug: 'style', icon: 'shopping-bag', enabled: true },
+  { id: 'beauty', name: 'Beauty', slug: 'beauty', icon: 'sun', enabled: true },
+  { id: 'wellness', name: 'Wellness', slug: 'wellness', icon: 'heart', enabled: true },
+];
+
+export function normalizeSlug(name: string): string {
+  return name
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+}
+
+export function isDuplicateCategoryName(
+  name: string,
+  categoryList: CategoryItem[],
+  excludeId?: string,
+): boolean {
+  const trimmed = name.trim().toLowerCase();
+  const slug = normalizeSlug(name);
+  return categoryList.some((c) => {
+    if (excludeId && c.id === excludeId) return false;
+    return c.name.trim().toLowerCase() === trimmed || c.slug === slug;
+  });
+}
+
+export function validateCategoryName(
+  name: string,
+  categoryList: CategoryItem[],
+  excludeId?: string,
+): { valid: boolean; error?: string } {
+  const trimmed = name.trim();
+  if (!trimmed) {
+    return { valid: false, error: 'Category name cannot be empty.' };
+  }
+  if (trimmed.length > 30) {
+    return { valid: false, error: 'Category name cannot exceed 30 characters.' };
+  }
+  if (trimmed.toLowerCase() === 'all') {
+    return { valid: false, error: '"All" is reserved for viewing all products.' };
+  }
+  if (isDuplicateCategoryName(trimmed, categoryList, excludeId)) {
+    return { valid: false, error: 'A category with this name already exists.' };
+  }
+  return { valid: true };
+}
+
+export function productMatchesCategory(
+  productCategory: string | undefined,
+  category: CategoryItem | string,
+): boolean {
+  if (!productCategory) return false;
+  const prodCat = productCategory.trim().toLowerCase();
+  if (typeof category === 'string') {
+    if (category.toLowerCase() === 'all') return true;
+    const target = category.trim().toLowerCase();
+    return prodCat === target;
+  }
+  return (
+    prodCat === category.id.toLowerCase() ||
+    prodCat === category.slug.toLowerCase() ||
+    prodCat === category.name.trim().toLowerCase()
+  );
+}
+
+export function getCategoryDisplayName(
+  productCategory: string | undefined,
+  categoryList: CategoryItem[],
+): string {
+  if (!productCategory) return 'General';
+  const found = categoryList.find((c) => productMatchesCategory(productCategory, c));
+  return found ? found.name : productCategory;
+}
+
+export function getAssignedProductCount(
+  category: CategoryItem,
+  productList: Pick<Product, 'category'>[],
+): number {
+  return productList.filter((p) => productMatchesCategory(p.category, category)).length;
+}
 
 export type MarkupType = 'fixed' | 'percent' | 'manual';
 
@@ -15,7 +108,7 @@ export type Product = {
   name: string;
   subtitle: string;
   description: string;
-  category: Exclude<Category, 'All'>;
+  category: string;
   image: ImageSourcePropType; // legacy single-image field (local demo mode, older products)
   imageUrls?: string[]; // Cloudinary URLs, ordered — imageUrls[0] is the primary image
   imagePublicIds?: string[]; // parallel array of Cloudinary public IDs, for deletion
@@ -41,7 +134,24 @@ export type Product = {
   originalPrice?: number; // optional strike-through price, admin sets manually
 };
 
-export type OrderStatus = 'Placed' | 'Processing' | 'Shipped' | 'Delivered';
+export type OrderStatus = 'Placed' | 'Confirmed' | 'Processing' | 'Shipped' | 'Delivered' | 'Cancelled';
+
+export const ALLOWED_STATUS_TRANSITIONS: Record<OrderStatus, OrderStatus[]> = {
+  Placed: ['Confirmed', 'Processing', 'Cancelled'],
+  Confirmed: ['Processing', 'Cancelled'],
+  Processing: ['Shipped', 'Cancelled'],
+  Shipped: ['Delivered'],
+  Delivered: [],
+  Cancelled: [],
+};
+
+export function canTransitionOrderStatus(current: OrderStatus, next: OrderStatus): boolean {
+  return ALLOWED_STATUS_TRANSITIONS[current]?.includes(next) ?? false;
+}
+
+export function canCancelOrder(status: OrderStatus): boolean {
+  return status === 'Placed' || status === 'Confirmed';
+}
 
 export type OrderItem = {
   productId: string;
@@ -49,7 +159,7 @@ export type OrderItem = {
   option?: string;
   quantity: number;
   unitPrice: number; // customer paid this, per unit
-  unitCost: number; // admin-only, supplier cost per unit at order time
+  unitCost?: number; // admin-only, supplier cost per unit at order time (stored in orders/{id}/private/data)
   sourceUrl?: string; // admin-only, for manual "place this on Meesho" step
 };
 
@@ -57,16 +167,17 @@ export type Order = {
   id: string;
   items: OrderItem[];
   total: number; // revenue collected from customer
-  costTotal: number; // admin-only: total supplier cost
-  profitTotal: number; // admin-only: total - costTotal
+  costTotal?: number; // admin-only: total supplier cost (stored in orders/{id}/private/data)
+  profitTotal?: number; // admin-only: total - costTotal
   status: OrderStatus;
   date: string;
   customerName: string;
   customerPhone: string;
   customerAddress: string;
   paymentMethod: 'UPI' | 'COD';
+  paymentStatus?: 'Selected' | 'Pending' | 'Paid';
   trackingId?: string;
-  costReconciled?: boolean; // cloud mode only — see functions/index.js
+  costReconciled?: boolean;
 };
 
 /** Seller ka pricing-engine: cost + margin/markup = customer ko dikhne wala price. */
@@ -250,7 +361,7 @@ export type NewProductInput = {
   name: string;
   subtitle: string;
   description: string;
-  category: Exclude<Category, 'All'>;
+  category: string;
   baseCost: number;
   markupType: MarkupType;
   markupValue: number;

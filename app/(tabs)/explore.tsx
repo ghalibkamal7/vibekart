@@ -3,7 +3,7 @@ import { router } from 'expo-router';
 import React, { useMemo } from 'react';
 import { Image, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
-import { categories, formatPrice, getProductImages } from '@/data/store';
+import { formatPrice, getProductImages, productMatchesCategory } from '@/data/store';
 import { ProductImagePlaceholder } from '@/components/ProductImagePlaceholder';
 import { useColors } from '@/hooks/useColors';
 import { useStore } from '@/context/StoreContext';
@@ -11,7 +11,9 @@ import { useStore } from '@/context/StoreContext';
 export default function ExploreScreen() {
   const colors = useColors();
   const insets = useSafeAreaInsets();
-  const { products } = useStore();
+  const { products, categories } = useStore();
+
+  const enabledCategories = useMemo(() => categories.filter((c) => c.enabled), [categories]);
 
   const trendingProducts = useMemo(() => {
     const active = products.filter((p) => p.enabled !== false);
@@ -31,22 +33,27 @@ export default function ExploreScreen() {
         Collections for the way you want today to feel.
       </Text>
       <View style={styles.collectionGrid}>
-        {categories.slice(1).map((category, index) => (
-          <Pressable
-            key={category.label}
-            onPress={() => router.push({ pathname: '/', params: { category: category.label } })}
-            style={[styles.collection, { backgroundColor: index % 2 ? colors.mossSoft : colors.coralSoft }]}
-          >
-            <View>
-              <Feather name={category.icon as keyof typeof Feather.glyphMap} size={21} color={index % 2 ? colors.moss : colors.coral} />
-              <Text style={[styles.collectionTitle, { color: colors.foreground }]}>{category.label}</Text>
-              <Text style={[styles.collectionCount, { color: colors.mutedForeground }]}>
-                {products.filter((product) => product.category === category.label && product.enabled !== false).length} curated picks
-              </Text>
-            </View>
-            <Feather name="arrow-up-right" size={18} color={colors.foreground} />
-          </Pressable>
-        ))}
+        {enabledCategories.map((category, index) => {
+          const count = products.filter(
+            (p) => p.enabled !== false && productMatchesCategory(p.category, category),
+          ).length;
+          return (
+            <Pressable
+              key={category.id}
+              onPress={() => router.push({ pathname: '/', params: { category: category.id } })}
+              style={[styles.collection, { backgroundColor: index % 2 ? colors.mossSoft : colors.coralSoft }]}
+            >
+              <View>
+                <Feather name={(category.icon ?? 'tag') as keyof typeof Feather.glyphMap} size={21} color={index % 2 ? colors.moss : colors.coral} />
+                <Text style={[styles.collectionTitle, { color: colors.foreground }]}>{category.name}</Text>
+                <Text style={[styles.collectionCount, { color: colors.mutedForeground }]}>
+                  {count} curated picks
+                </Text>
+              </View>
+              <Feather name="arrow-up-right" size={18} color={colors.foreground} />
+            </Pressable>
+          );
+        })}
       </View>
       <View style={[styles.callout, { backgroundColor: colors.butter }]}>
         <View style={{ flex: 1 }}>
