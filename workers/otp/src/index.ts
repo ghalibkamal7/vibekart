@@ -169,7 +169,12 @@ async function handleCreateOrder(request: Request, env: Env, origin: string | nu
   const customerName = String(body.customerName || '').trim();
   const customerPhone = String(body.customerPhone || '').trim();
   const customerAddress = String(body.customerAddress || '').trim();
-  const paymentMethod = body.paymentMethod === 'COD' ? 'COD' : 'UPI';
+  const paymentMethod = String(body.paymentMethod || '').trim();
+
+  // COD is no longer accepted — online payment only
+  if (paymentMethod !== 'UPI') {
+    return jsonResponse({ error: 'Only online payment (UPI) is accepted. Cash on delivery is no longer available.' }, 400, origin);
+  }
 
   if (!customerName || !customerPhone || !customerAddress) {
     return jsonResponse({ error: 'Customer name, phone, and delivery address are required.' }, 400, origin);

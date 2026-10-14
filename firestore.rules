@@ -99,7 +99,7 @@ service cloud.firestore {
       // - Private cost/profit fields MUST NOT be written to the public document
       // - Total must be non-negative number
       // - Items list must be non-empty (1 to 50 items)
-      // - Payment method must be UPI or COD
+      // - Payment method must be UPI only (COD removed)
       allow create: if isSignedIn() &&
         request.resource.data.customerUid == request.auth.uid &&
         request.resource.data.status == 'Placed' &&
@@ -108,7 +108,7 @@ service cloud.firestore {
         !('profitTotal' in request.resource.data) &&
         request.resource.data.total is number &&
         request.resource.data.total >= 0 &&
-        request.resource.data.paymentMethod in ['UPI', 'COD'] &&
+        request.resource.data.paymentMethod == 'UPI' &&
         request.resource.data.items is list &&
         request.resource.data.items.size() > 0 &&
         request.resource.data.items.size() <= 50;

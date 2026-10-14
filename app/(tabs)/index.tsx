@@ -14,6 +14,7 @@ import {
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { formatPrice, getProductImages, productMatchesCategory, Product } from '@/data/store';
 import { ProductImagePlaceholder } from '@/components/ProductImagePlaceholder';
+import { PwaInstallBanner } from '@/components/PwaInstallBanner';
 import { useColors } from '@/hooks/useColors';
 import { useStore } from '@/context/StoreContext';
 
@@ -175,6 +176,7 @@ export default function HomeScreen() {
                 ) : null}
               </Pressable>
             </View>
+            <PwaInstallBanner />
             <View style={[styles.hero, { backgroundColor: colors.moss }]}>
               <View style={styles.heroCopy}>
                 <Text style={styles.heroKicker}>THE WEEKEND EDIT</Text>

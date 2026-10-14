@@ -12,7 +12,9 @@
     },
     "android": {},
     "web": {
-      "favicon": "./assets/images/icon.png"
+      "favicon": "./assets/images/icon.png",
+      "bundler": "metro",
+      "output": "static"
     },
     "plugins": ["expo-router"],
     "experiments": {

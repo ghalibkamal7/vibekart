@@ -674,6 +674,10 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   }, [orders, isCloudMode]);
 
   const placeOrder: StoreContextValue['placeOrder'] = async (details) => {
+    // Enforce online-only payment — COD is no longer accepted
+    if (details.paymentMethod !== 'UPI') {
+      throw new Error('Only online payment (UPI) is accepted. Cash on delivery is no longer available.');
+    }
     if (!cart.length) return null;
     const items = cart.map((line) => ({
       productId: line.product.id,

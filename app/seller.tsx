@@ -1,9 +1,9 @@
 import { Feather } from '@expo/vector-icons';
 import { router } from 'expo-router';
 import React, { useMemo, useState } from 'react';
-import { Alert, Pressable, ScrollView, StyleSheet, Switch, Text, View } from 'react-native';
+import { Alert, Image, Pressable, ScrollView, StyleSheet, Switch, Text, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
-import { formatPrice } from '@/data/store';
+import { formatPrice, getProductImages } from '@/data/store';
 import { useColors } from '@/hooks/useColors';
 import { useStore } from '@/context/StoreContext';
 
@@ -183,11 +183,16 @@ export default function SellerScreen() {
         const margin = product.price - product.baseCost;
         const isLoss = margin < 0;
         const isLowStock = !product.inStock;
+        const prodImages = getProductImages(product);
         return (
           <View key={product.id} style={[styles.productRow, { backgroundColor: colors.card, borderColor: colors.border }]}>
-            <View style={[styles.productDot, { backgroundColor: isLowStock ? colors.coralSoft : colors.mossSoft }]}>
-              <Feather name="package" size={16} color={isLowStock ? colors.coral : colors.moss} />
-            </View>
+            {prodImages.length ? (
+              <Image source={prodImages[0]} style={styles.productThumbnail} />
+            ) : (
+              <View style={[styles.productDot, { backgroundColor: isLowStock ? colors.coralSoft : colors.mossSoft }]}>
+                <Feather name="package" size={16} color={isLowStock ? colors.coral : colors.moss} />
+              </View>
+            )}
             <View style={{ flex: 1 }}>
               <Text style={[styles.productName, { color: colors.foreground }]} numberOfLines={1}>{product.name}</Text>
               <View style={{ flexDirection: 'row', alignItems: 'center', gap: 5, flexWrap: 'wrap', marginVertical: 3 }}>
@@ -289,6 +294,7 @@ const styles = StyleSheet.create({
   sectionRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginTop: 28, marginBottom: 10 },
   sectionTitle: { fontSize: 19, fontFamily: 'Inter_700Bold' },
   productRow: { flexDirection: 'row', alignItems: 'flex-start', gap: 11, borderRadius: 17, borderWidth: 1, padding: 12, marginBottom: 9 },
+  productThumbnail: { width: 44, height: 44, borderRadius: 12, backgroundColor: '#E5E7EB' },
   productDot: { width: 39, height: 39, borderRadius: 13, alignItems: 'center', justifyContent: 'center' },
   productName: { fontSize: 12, fontFamily: 'Inter_700Bold' },
   productMeta: { fontSize: 10, fontFamily: 'Inter_400Regular', marginTop: 4 },

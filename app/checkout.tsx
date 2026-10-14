@@ -1,17 +1,35 @@
 import { Feather } from '@expo/vector-icons';
 import { router } from 'expo-router';
 import React, { useState } from 'react';
-import { ActivityIndicator, Alert, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
+import { ActivityIndicator, Alert, Linking, Platform, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { formatPrice } from '@/data/store';
 import { useColors } from '@/hooks/useColors';
 import { useStore } from '@/context/StoreContext';
 
+/**
+ * PAYMENT CONFIGURATION
+ *
+ * GPay / online payment integration requires a registered merchant account.
+ * Until the merchant completes registration and provides credentials, the
+ * checkout shows a clear "payment setup pending" state. No fake payment
+ * success is ever returned.
+ *
+ * When the merchant account is ready, set these in your environment:
+ *   EXPO_PUBLIC_PAYMENT_GATEWAY_CONFIGURED=true
+ *   EXPO_PUBLIC_MERCHANT_VPA=merchant@bank     (for UPI collect/intent)
+ *   EXPO_PUBLIC_MERCHANT_NAME=VibeKart
+ *
+ * COD has been deliberately removed per business requirement. All orders
+ * require online payment.
+ */
+const PAYMENT_CONFIGURED = process.env.EXPO_PUBLIC_PAYMENT_GATEWAY_CONFIGURED === 'true';
+const MERCHANT_NAME = process.env.EXPO_PUBLIC_MERCHANT_NAME || 'VibeKart';
+
 export default function CheckoutScreen() {
   const colors = useColors();
   const insets = useSafeAreaInsets();
-  const { cart, cartTotal, placeOrder } = useStore();
-  const [payment, setPayment] = useState<'UPI' | 'COD'>('UPI');
+  const { cart, cartTotal, placeOrder, authUser } = useStore();
   const [name, setName] = useState('');
   const [address, setAddress] = useState('');
   const [phone, setPhone] = useState('');
@@ -20,9 +38,19 @@ export default function CheckoutScreen() {
   const hasItems = cart.length > 0;
   const allInStock = cart.every((line) => line.product.inStock && (line.product.enabled ?? true));
   const fieldsOk = name.trim() && address.trim() && phone.trim();
-  const canPlace = !placing && hasItems && allInStock && !!fieldsOk;
+
+  // Payment is only UPI (online). COD is removed.
+  const paymentReady = PAYMENT_CONFIGURED;
+  const canPlace = !placing && hasItems && allInStock && !!fieldsOk && paymentReady;
 
   const handlePlaceOrder = async () => {
+    if (!paymentReady) {
+      Alert.alert(
+        'Payment not available',
+        'Online payment setup is pending. The store owner needs to complete merchant registration before orders can be placed.',
+      );
+      return;
+    }
     if (!hasItems) {
       Alert.alert('Empty cart', 'Your cart is empty. Add items before placing an order.');
       return;
@@ -40,7 +68,7 @@ export default function CheckoutScreen() {
         customerName: name.trim(),
         customerPhone: phone.trim(),
         customerAddress: address.trim(),
-        paymentMethod: payment,
+        paymentMethod: 'UPI',
       });
       if (order) {
         router.replace('/(tabs)/orders');
@@ -89,23 +117,31 @@ export default function CheckoutScreen() {
           <TextInput value={phone} onChangeText={setPhone} keyboardType="phone-pad" placeholder="+91 98765 43210" placeholderTextColor={colors.mutedForeground} style={[styles.input, { backgroundColor: colors.card, borderColor: colors.border, color: colors.foreground }]} />
           <Text style={[styles.label, { color: colors.foreground }]}>Delivery address</Text>
           <TextInput value={address} onChangeText={setAddress} multiline placeholder="Flat, building, street, city, pincode" placeholderTextColor={colors.mutedForeground} style={[styles.input, styles.addressInput, { backgroundColor: colors.card, borderColor: colors.border, color: colors.foreground }]} />
-          <Text style={[styles.label, { color: colors.foreground, marginTop: 23 }]}>Payment method</Text>
-          <View style={styles.paymentRow}>
-            {(['UPI', 'COD'] as const).map((method) => (
-              <Pressable key={method} onPress={() => setPayment(method)} style={[styles.paymentOption, { backgroundColor: payment === method ? colors.mossSoft : colors.card, borderColor: payment === method ? colors.moss : colors.border }]}>
-                <Feather name={method === 'UPI' ? 'smartphone' : 'package'} size={17} color={payment === method ? colors.moss : colors.mutedForeground} />
-                <Text style={[styles.paymentText, { color: payment === method ? colors.moss : colors.foreground }]}>{method === 'UPI' ? 'UPI / Cards' : 'Cash on delivery'}</Text>
-                {payment === method ? <Feather name="check-circle" size={16} color={colors.moss} /> : null}
-              </Pressable>
-            ))}
+
+          <Text style={[styles.label, { color: colors.foreground, marginTop: 23 }]}>Payment</Text>
+
+          {/* Online payment only — COD removed */}
+          <View style={[styles.paymentOption, { backgroundColor: colors.mossSoft, borderColor: colors.moss }]}>
+            <Feather name="smartphone" size={17} color={colors.moss} />
+            <Text style={[styles.paymentText, { color: colors.moss }]}>Online Payment (UPI / GPay)</Text>
+            <Feather name="check-circle" size={16} color={colors.moss} />
           </View>
-          {payment === 'UPI' ? (
-            <Text style={[styles.paymentNote, { color: colors.mutedForeground }]}>
-              UPI payment is selected — payment link will be shared after order confirmation.
-            </Text>
+
+          {!paymentReady ? (
+            <View style={[styles.paymentPendingBox, { backgroundColor: '#FFF8E1', borderColor: '#F59E0B' }]}>
+              <Feather name="clock" size={15} color="#F59E0B" />
+              <View style={{ flex: 1 }}>
+                <Text style={[styles.paymentPendingTitle, { color: '#92400E' }]}>
+                  Payment setup pending
+                </Text>
+                <Text style={[styles.paymentPendingText, { color: '#92400E' }]}>
+                  Online payment (GPay/UPI) is being set up by the store owner. Orders cannot be placed until merchant registration is complete. Check back soon!
+                </Text>
+              </View>
+            </View>
           ) : (
             <Text style={[styles.paymentNote, { color: colors.mutedForeground }]}>
-              Pay in cash when your order arrives.
+              You will be redirected to complete payment via UPI / GPay after placing your order.
             </Text>
           )}
         </View>
@@ -122,8 +158,10 @@ export default function CheckoutScreen() {
             <ActivityIndicator color="#FFFFFF" size="small" />
           ) : (
             <>
-              <Text style={[styles.placeText, { color: canPlace ? '#FFFFFF' : colors.mutedForeground }]}>Place order</Text>
-              <Feather name="arrow-right" size={18} color={canPlace ? '#FFFFFF' : colors.mutedForeground} />
+              <Text style={[styles.placeText, { color: canPlace ? '#FFFFFF' : colors.mutedForeground }]}>
+                {paymentReady ? 'Place order & pay' : 'Payment setup pending'}
+              </Text>
+              {paymentReady ? <Feather name="arrow-right" size={18} color={canPlace ? '#FFFFFF' : colors.mutedForeground} /> : null}
             </>
           )}
         </Pressable>
@@ -145,10 +183,12 @@ const styles = StyleSheet.create({
   label: { fontSize: 12, fontFamily: 'Inter_700Bold', marginBottom: 8, marginTop: 15 },
   input: { minHeight: 49, borderWidth: 1, borderRadius: 15, paddingHorizontal: 14, fontSize: 13, fontFamily: 'Inter_400Regular' },
   addressInput: { minHeight: 86, paddingTop: 14, textAlignVertical: 'top' },
-  paymentRow: { gap: 9 },
   paymentOption: { minHeight: 52, borderWidth: 1, borderRadius: 15, flexDirection: 'row', alignItems: 'center', paddingHorizontal: 14, gap: 10 },
   paymentText: { flex: 1, fontSize: 12, fontFamily: 'Inter_600SemiBold' },
   paymentNote: { fontSize: 11, fontFamily: 'Inter_400Regular', marginTop: 10, lineHeight: 16 },
+  paymentPendingBox: { flexDirection: 'row', alignItems: 'flex-start', gap: 10, padding: 14, borderRadius: 14, borderWidth: 1, marginTop: 12 },
+  paymentPendingTitle: { fontSize: 12, fontFamily: 'Inter_700Bold', marginBottom: 4 },
+  paymentPendingText: { fontSize: 11, fontFamily: 'Inter_400Regular', lineHeight: 16 },
   bottomBar: { position: 'absolute', bottom: 0, left: 0, right: 0, paddingHorizontal: 18, paddingTop: 13, borderTopWidth: 1 },
   totalRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 11 },
   totalLabel: { fontSize: 12, fontFamily: 'Inter_400Regular' },

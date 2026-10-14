@@ -1,3 +1,4 @@
+import { Platform } from 'react-native';
 import * as ImageManipulator from 'expo-image-manipulator';
 
 /**
@@ -27,8 +28,8 @@ import * as ImageManipulator from 'expo-image-manipulator';
  * an oversight — see README.md's "Known limitations" section.
  */
 
-const CLOUDINARY_CLOUD_NAME = process.env.EXPO_PUBLIC_CLOUDINARY_CLOUD_NAME ?? '';
-const CLOUDINARY_UPLOAD_PRESET = process.env.EXPO_PUBLIC_CLOUDINARY_UPLOAD_PRESET ?? '';
+const CLOUDINARY_CLOUD_NAME = (process.env.EXPO_PUBLIC_CLOUDINARY_CLOUD_NAME ?? '').trim();
+const CLOUDINARY_UPLOAD_PRESET = (process.env.EXPO_PUBLIC_CLOUDINARY_UPLOAD_PRESET ?? '').trim();
 
 export const isCloudinaryConfigured = Boolean(CLOUDINARY_CLOUD_NAME && CLOUDINARY_UPLOAD_PRESET);
 
@@ -55,24 +56,43 @@ async function prepareForUpload(localUri: string): Promise<string> {
  * Uploads one local image (from expo-image-picker's `uri`) to Cloudinary
  * under the given folder (e.g. `vibekart/products/{productId}`) and returns
  * its secure URL + public ID. `onProgress` (0-100) is driven by real upload
- * bytes via XMLHttpRequest, since fetch() doesn't expose upload progress in
- * React Native. No signature, API key, or secret is involved — the upload
- * preset (configured as "Unsigned" in the Cloudinary console) is what
- * authorises this.
+ * bytes via XMLHttpRequest.
+ *
+ * Supports both React Native native (via URI object) and React Native Web
+ * (via Blob conversion so browser FormData does not serialize to [object Object]).
  */
 export async function uploadImageToCloudinary(
   localUri: string,
   folder: string,
   onProgress?: (percent: number) => void,
 ): Promise<CloudinaryUploadResult> {
-  if (!isCloudinaryConfigured) throw new Error('Cloudinary is not configured. See .env.example.');
+  if (!CLOUDINARY_CLOUD_NAME) {
+    throw new Error('Cloudinary cloud name is not configured (EXPO_PUBLIC_CLOUDINARY_CLOUD_NAME).');
+  }
+  if (!CLOUDINARY_UPLOAD_PRESET) {
+    throw new Error('Cloudinary unsigned upload preset is not configured (EXPO_PUBLIC_CLOUDINARY_UPLOAD_PRESET).');
+  }
 
   const optimizedUri = await prepareForUpload(localUri);
+  const fileName = `vk-${Date.now()}.jpg`;
 
   const formData = new FormData();
-  // React Native's fetch/XHR polyfill recognises this {uri,type,name} shape
-  // as a file part, not a plain string field.
-  formData.append('file', { uri: optimizedUri, type: 'image/jpeg', name: `${Date.now()}.jpg` } as unknown as Blob);
+  if (Platform.OS === 'web') {
+    // In browser JS, passing {uri,type,name} to FormData stringifies to "[object Object]"
+    // which Cloudinary rejects. Convert to real Blob for web uploads.
+    try {
+      const response = await fetch(optimizedUri);
+      const blob = await response.blob();
+      formData.append('file', blob, fileName);
+    } catch {
+      // Fallback if fetch fails on local file object
+      formData.append('file', optimizedUri);
+    }
+  } else {
+    // React Native's fetch/XHR polyfill recognizes {uri,type,name}
+    formData.append('file', { uri: optimizedUri, type: 'image/jpeg', name: fileName } as unknown as Blob);
+  }
+
   formData.append('upload_preset', CLOUDINARY_UPLOAD_PRESET);
   formData.append('folder', folder);
 
@@ -80,7 +100,9 @@ export async function uploadImageToCloudinary(
     const xhr = new XMLHttpRequest();
     xhr.open('POST', `https://api.cloudinary.com/v1_1/${CLOUDINARY_CLOUD_NAME}/image/upload`);
     xhr.upload.onprogress = (event) => {
-      if (event.lengthComputable && onProgress) onProgress(Math.round((event.loaded / event.total) * 100));
+      if (event.lengthComputable && onProgress) {
+        onProgress(Math.round((event.loaded / event.total) * 100));
+      }
     };
     xhr.onload = () => {
       try {
@@ -88,13 +110,18 @@ export async function uploadImageToCloudinary(
         if (xhr.status >= 200 && xhr.status < 300 && data.secure_url) {
           resolve({ url: data.secure_url as string, publicId: data.public_id as string });
         } else {
-          reject(new Error(data?.error?.message ?? `Cloudinary upload failed (${xhr.status})`));
+          const rawMessage = data?.error?.message ?? `Upload failed (HTTP ${xhr.status})`;
+          if (rawMessage.toLowerCase().includes('upload preset')) {
+            reject(new Error(`Cloudinary preset error: "${CLOUDINARY_UPLOAD_PRESET}" must exist and be set to Unsigned in Cloudinary Settings -> Upload.`));
+          } else {
+            reject(new Error(rawMessage));
+          }
         }
       } catch {
-        reject(new Error('Cloudinary returned an unexpected response'));
+        reject(new Error(`Cloudinary returned an invalid response (HTTP ${xhr.status})`));
       }
     };
-    xhr.onerror = () => reject(new Error('Network error during image upload'));
+    xhr.onerror = () => reject(new Error('Network error during image upload. Check internet connection.'));
     xhr.send(formData);
   });
 }

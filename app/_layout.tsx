@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { ActivityIndicator, Image, StyleSheet, View } from 'react-native';
+import { ActivityIndicator, Image, Platform, StyleSheet, View } from 'react-native';
 import { GestureHandlerRootView } from 'react-native-gesture-handler';
 import { KeyboardProvider } from 'react-native-keyboard-controller';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
@@ -81,20 +81,34 @@ export default function RootLayout() {
     Inter_700Bold,
   });
 
-  // Belt-and-suspenders: useFonts should settle almost instantly (these are
-  // bundled assets, not a network fetch), but this file's whole job is to
-  // make sure nothing can gate the app open-endedly. A cold Metro dev-server
-  // bundle (the "Bundler cache is empty, rebuilding" case) can genuinely
-  // take a few seconds to serve font assets for the first time, so this is
-  // generous rather than tight — if fonts truly never settle for some other
-  // reason, proceed anyway rather than sit on a blank screen forever.
+  // Prevent gating the app on font loading: on web, 2.5s is generous since Inter
+  // is preconnected via +html.tsx; on native, 4s allows cold bundle loading.
   const [fontsTimedOut, setFontsTimedOut] = useState(false);
   useEffect(() => {
+    const timeoutMs = Platform.OS === 'web' ? 2500 : 4000;
     const timer = setTimeout(() => {
       console.warn('[fonts] timed out waiting for custom fonts — proceeding with system fallback');
       setFontsTimedOut(true);
-    }, 8000);
+    }, timeoutMs);
     return () => clearTimeout(timer);
+  }, []);
+
+  // Fix React Native Web accessibility warning: "aria-hidden was set on an element with a focused descendant".
+  // When React Navigation hides background screens/modals, blur any focused element inside the newly hidden tree.
+  useEffect(() => {
+    if (Platform.OS !== 'web' || typeof window === 'undefined' || typeof MutationObserver === 'undefined') return;
+    const observer = new MutationObserver((mutations) => {
+      for (const mutation of mutations) {
+        if (mutation.type === 'attributes' && mutation.attributeName === 'aria-hidden') {
+          const target = mutation.target as HTMLElement;
+          if (target && target.getAttribute('aria-hidden') === 'true' && document.activeElement && target.contains(document.activeElement)) {
+            (document.activeElement as HTMLElement)?.blur?.();
+          }
+        }
+      }
+    });
+    observer.observe(document.body, { attributes: true, subtree: true, attributeFilter: ['aria-hidden'] });
+    return () => observer.disconnect();
   }, []);
 
   const fontsSettled = fontsLoaded || Boolean(fontError) || fontsTimedOut;

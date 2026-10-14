@@ -151,39 +151,41 @@ export default function SellerAddProductScreen() {
     });
   };
 
-  const retryImage = async (slot: ImageSlot, productId: string) => {
+  const [isUploadingAll, setIsUploadingAll] = useState(false);
+
+  const retryImage = async (slot: ImageSlot, targetId?: string) => {
+    const folderId = targetId || editing?.id || 'new';
     setImages((current) => current.map((s) => (s.id === slot.id ? { ...s, status: 'uploading', progress: 0, error: undefined } : s)));
     try {
-      const { url, publicId } = await uploadImageToCloudinary(slot.uri, `vibekart/products/${productId}`, (progress) =>
+      const { url, publicId } = await uploadImageToCloudinary(slot.uri, `vibekart/products/${folderId}`, (progress) =>
         setImages((current) => current.map((s) => (s.id === slot.id ? { ...s, progress } : s))),
       );
       setImages((current) => current.map((s) => (s.id === slot.id ? { ...s, uri: url, publicId, status: 'done', progress: 100 } : s)));
     } catch (error) {
+      const msg = error instanceof Error ? error.message : 'Upload failed';
       setImages((current) =>
-        current.map((s) => (s.id === slot.id ? { ...s, status: 'error', error: error instanceof Error ? error.message : 'Upload failed' } : s)),
+        current.map((s) => (s.id === slot.id ? { ...s, status: 'error', error: msg } : s)),
       );
+      Alert.alert('Upload failed', msg);
     }
   };
 
-  /** Uploads every slot that isn't already a `done` Cloudinary URL. Slots
-   * that fail stay in the list as `error` (retryable) rather than being
-   * dropped, so a seller never loses a photo they picked just because one
-   * of several uploads failed — see the migration report for why this
-   * matters. */
-  const uploadPendingImages = async (productId: string): Promise<ImageSlot[]> => {
+  /** Uploads every slot that isn't already a `done` Cloudinary URL. */
+  const uploadPendingImages = async (folderId: string): Promise<ImageSlot[]> => {
     let current = images;
     for (const slot of images) {
       if (slot.status === 'done') continue;
       setImages((prev) => prev.map((s) => (s.id === slot.id ? { ...s, status: 'uploading', progress: 0 } : s)));
       try {
-        const { url, publicId } = await uploadImageToCloudinary(slot.uri, `vibekart/products/${productId}`, (progress) =>
+        const { url, publicId } = await uploadImageToCloudinary(slot.uri, `vibekart/products/${folderId}`, (progress) =>
           setImages((prev) => prev.map((s) => (s.id === slot.id ? { ...s, progress } : s))),
         );
         current = current.map((s) => (s.id === slot.id ? { ...s, uri: url, publicId, status: 'done' as const, progress: 100 } : s));
         setImages(current);
       } catch (error) {
+        const msg = error instanceof Error ? error.message : 'Upload failed';
         current = current.map((s) =>
-          s.id === slot.id ? { ...s, status: 'error' as const, error: error instanceof Error ? error.message : 'Upload failed' } : s,
+          s.id === slot.id ? { ...s, status: 'error' as const, error: msg } : s,
         );
         setImages(current);
       }
@@ -191,11 +193,39 @@ export default function SellerAddProductScreen() {
     return current;
   };
 
+  const handleManualUploadAll = async () => {
+    if (!isCloudinaryConfigured) {
+      Alert.alert(
+        'Cloudinary not configured',
+        'Please configure EXPO_PUBLIC_CLOUDINARY_CLOUD_NAME and EXPO_PUBLIC_CLOUDINARY_UPLOAD_PRESET to upload images.',
+      );
+      return;
+    }
+    const pendingSlots = images.filter((s) => s.status !== 'done');
+    if (!pendingSlots.length) {
+      Alert.alert('All uploaded', 'All selected images are already uploaded to Cloudinary.');
+      return;
+    }
+    setIsUploadingAll(true);
+    try {
+      const folderId = editing?.id || 'new';
+      const result = await uploadPendingImages(folderId);
+      const failed = result.filter((s) => s.status === 'error').length;
+      if (failed === 0) {
+        Alert.alert('Upload successful', 'All photos were uploaded to Cloudinary successfully.');
+      } else {
+        Alert.alert('Partial upload', `${failed} photo(s) failed to upload. Check connection and tap Retry on the failed photos.`);
+      }
+    } finally {
+      setIsUploadingAll(false);
+    }
+  };
+
   const handleSave = async () => {
     if (isCloudMode && !isCloudinaryConfigured && images.some((s) => s.status !== 'done')) {
       Alert.alert(
         'Cloudinary is not configured',
-        "New photos can't be uploaded because the Cloudinary env vars aren't set (see .env.example). Remove the new photos and save without them, or configure Cloudinary first.",
+        "New photos can't be uploaded because Cloudinary environment variables are missing (EXPO_PUBLIC_CLOUDINARY_CLOUD_NAME and EXPO_PUBLIC_CLOUDINARY_UPLOAD_PRESET). Remove new photos to save without them, or configure Cloudinary first.",
       );
       return;
     }
@@ -314,6 +344,15 @@ export default function SellerAddProductScreen() {
             The first photo becomes the main/primary image — use the arrows to reorder.
           </Text>
 
+          {!isCloudinaryConfigured && isCloudMode ? (
+            <View style={[styles.configWarningBox, { backgroundColor: colors.coralSoft, borderColor: colors.coral }]}>
+              <Feather name="alert-triangle" size={15} color={colors.coral} />
+              <Text style={[styles.configWarningText, { color: colors.coral }]}>
+                Cloudinary is not configured. Add EXPO_PUBLIC_CLOUDINARY_CLOUD_NAME and EXPO_PUBLIC_CLOUDINARY_UPLOAD_PRESET to your environment to enable cloud photo uploads.
+              </Text>
+            </View>
+          ) : null}
+
           <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.photoRow}>
             {images.map((slot, index) => (
               <View key={slot.id} style={[styles.photoSlot, { borderColor: colors.border }]}>
@@ -323,6 +362,15 @@ export default function SellerAddProductScreen() {
                     <Text style={styles.primaryBadgeText}>PRIMARY</Text>
                   </View>
                 ) : null}
+                {slot.status === 'done' ? (
+                  <View style={[styles.statusBadge, { backgroundColor: colors.moss }]}>
+                    <Feather name="check" size={10} color="#FFFFFF" />
+                  </View>
+                ) : slot.status === 'new' ? (
+                  <View style={[styles.statusBadge, { backgroundColor: colors.mutedForeground }]}>
+                    <Text style={styles.statusBadgeText}>LOCAL</Text>
+                  </View>
+                ) : null}
                 {slot.status === 'uploading' ? (
                   <View style={styles.photoOverlay}>
                     <ActivityIndicator color="#FFFFFF" />
@@ -330,7 +378,7 @@ export default function SellerAddProductScreen() {
                   </View>
                 ) : null}
                 {slot.status === 'error' ? (
-                  <Pressable style={[styles.photoOverlay, { backgroundColor: 'rgba(217,85,85,0.85)' }]} onPress={() => editing && retryImage(slot, editing.id)}>
+                  <Pressable style={[styles.photoOverlay, { backgroundColor: 'rgba(217,85,85,0.85)' }]} onPress={() => retryImage(slot, editing?.id)}>
                     <Feather name="refresh-cw" size={16} color="#FFFFFF" />
                     <Text style={styles.photoOverlayText}>Retry</Text>
                   </Pressable>
@@ -355,6 +403,23 @@ export default function SellerAddProductScreen() {
               </Pressable>
             ) : null}
           </ScrollView>
+
+          {isCloudMode && isCloudinaryConfigured && images.some((s) => s.status !== 'done') ? (
+            <Pressable
+              disabled={isUploadingAll}
+              onPress={handleManualUploadAll}
+              style={[styles.uploadButton, { backgroundColor: colors.mossSoft, borderColor: colors.moss }]}
+            >
+              {isUploadingAll ? (
+                <ActivityIndicator size="small" color={colors.moss} />
+              ) : (
+                <>
+                  <Feather name="upload-cloud" size={15} color={colors.moss} />
+                  <Text style={[styles.uploadButtonText, { color: colors.moss }]}>Upload selected photos to Cloudinary</Text>
+                </>
+              )}
+            </Pressable>
+          ) : null}
 
           <Text style={[styles.label, { color: colors.foreground }]}>Category</Text>
           <View style={styles.chipRow}>
@@ -545,6 +610,8 @@ const styles = StyleSheet.create({
   photoImage: { width: '100%', height: '100%' },
   primaryBadge: { position: 'absolute', bottom: 4, left: 4, paddingHorizontal: 6, paddingVertical: 2, borderRadius: 6 },
   primaryBadgeText: { color: '#FFFFFF', fontSize: 7, fontFamily: 'Inter_700Bold' },
+  statusBadge: { position: 'absolute', top: 4, left: 4, paddingHorizontal: 5, paddingVertical: 2, borderRadius: 5, alignItems: 'center', justifyContent: 'center' },
+  statusBadgeText: { color: '#FFFFFF', fontSize: 7, fontFamily: 'Inter_700Bold' },
   photoOverlay: { ...StyleSheet.absoluteFill, backgroundColor: 'rgba(0,0,0,0.55)', alignItems: 'center', justifyContent: 'center', gap: 4 },
   photoOverlayText: { color: '#FFFFFF', fontSize: 10, fontFamily: 'Inter_700Bold' },
   photoRemove: { position: 'absolute', top: 4, right: 4, width: 20, height: 20, borderRadius: 10, alignItems: 'center', justifyContent: 'center' },
@@ -552,6 +619,10 @@ const styles = StyleSheet.create({
   reorderButton: { width: 18, height: 18, borderRadius: 9, backgroundColor: 'rgba(0,0,0,0.55)', alignItems: 'center', justifyContent: 'center' },
   addPhotoSlot: { width: 92, height: 92, borderRadius: 14, borderWidth: 1, borderStyle: 'dashed', alignItems: 'center', justifyContent: 'center', gap: 4 },
   addPhotoText: { fontSize: 11, fontFamily: 'Inter_600SemiBold' },
+  configWarningBox: { flexDirection: 'row', alignItems: 'center', gap: 8, padding: 12, borderRadius: 13, borderWidth: 1, marginBottom: 10 },
+  configWarningText: { flex: 1, fontSize: 11, fontFamily: 'Inter_500Medium', lineHeight: 15 },
+  uploadButton: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8, height: 42, borderRadius: 12, borderWidth: 1, marginTop: 10 },
+  uploadButtonText: { fontSize: 12, fontFamily: 'Inter_600SemiBold' },
   previewCard: { flexDirection: 'row', justifyContent: 'space-between', borderRadius: 17, padding: 16, marginTop: 24 },
   previewLabel: { fontSize: 9, fontFamily: 'Inter_700Bold', letterSpacing: 1 },
   previewPrice: { fontSize: 20, fontFamily: 'Inter_700Bold', marginTop: 4 },
