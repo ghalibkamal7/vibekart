@@ -10,7 +10,7 @@ import { doc, getDoc, serverTimestamp, setDoc } from 'firebase/firestore';
 import { auth, db } from './config';
 import { performGoogleSignIn, signOutOfGoogle } from './googleSignIn';
 
-export type UserRole = 'customer' | 'seller';
+export type UserRole = 'customer' | 'seller' | 'admin';
 
 export type UserProfile = {
   uid: string;
@@ -18,6 +18,8 @@ export type UserProfile = {
   name: string;
   phone?: string;
   role: UserRole;
+  status?: 'active' | 'suspended';
+  createdAt?: any;
 };
 
 /**

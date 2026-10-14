@@ -97,7 +97,7 @@ function ProductCard({ product }: { product: Product }) {
 export default function HomeScreen() {
   const colors = useColors();
   const insets = useSafeAreaInsets();
-  const { cartCount, products, categories } = useStore();
+  const { cartCount, products, categories, storeSettings } = useStore();
   const params = useLocalSearchParams<{ category?: string }>();
 
   // selectedId is a category id/slug or 'all'. Default to 'all'.
@@ -149,10 +149,18 @@ export default function HomeScreen() {
         contentContainerStyle={{ paddingTop: insets.top + 12, paddingBottom: 120, paddingHorizontal: 18 }}
         ListHeaderComponent={
           <>
+            {storeSettings?.announcementActive && storeSettings?.announcement ? (
+              <View style={[styles.announcementBanner, { backgroundColor: colors.coralSoft, borderColor: colors.coral }]}>
+                <Feather name="bell" size={13} color={colors.coral} />
+                <Text style={[styles.announcementText, { color: colors.foreground }]} numberOfLines={2}>
+                  {storeSettings.announcement}
+                </Text>
+              </View>
+            ) : null}
             <View style={styles.header}>
               <View>
                 <Text style={[styles.eyebrow, { color: colors.coral }]}>GOOD THINGS, CURATED</Text>
-                <Text style={[styles.brand, { color: colors.foreground }]}>VibeKart</Text>
+                <Text style={[styles.brand, { color: colors.foreground }]}>{storeSettings?.storeName || 'VibeKart'}</Text>
               </View>
               <Pressable
                 onPress={() => router.push('/cart')}
@@ -325,4 +333,6 @@ const styles = StyleSheet.create({
   emptyBody: { fontSize: 13, fontFamily: 'Inter_400Regular', marginTop: 5 },
   sortChip: { paddingHorizontal: 14, paddingVertical: 7, borderRadius: 20, borderWidth: 1 },
   sortChipText: { fontSize: 12, fontFamily: 'Inter_600SemiBold' },
+  announcementBanner: { flexDirection: 'row', alignItems: 'center', gap: 8, paddingHorizontal: 12, paddingVertical: 8, borderRadius: 12, borderWidth: 1, marginBottom: 12 },
+  announcementText: { flex: 1, fontSize: 11, fontFamily: 'Inter_500Medium', lineHeight: 15 },
 });

@@ -15,8 +15,8 @@ const rows = [
 export default function AccountScreen() {
   const colors = useColors();
   const insets = useSafeAreaInsets();
-  const { favorites, authUser, logout, isCloudMode } = useStore();
-  const isSeller = !isCloudMode || (authUser && !authUser.isGuest && authUser.role === 'seller');
+  const { favorites, authUser, logout, isCloudMode, isAdmin } = useStore();
+  const isSeller = !isCloudMode || (authUser && !authUser.isGuest && (authUser.role === 'seller' || authUser.role === 'admin'));
   return (
     <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={[styles.container, { paddingTop: insets.top + 20, paddingBottom: 120 }]}>
       <Text style={[styles.kicker, { color: colors.coral }]}>MAKE IT YOURS</Text>
@@ -28,7 +28,7 @@ export default function AccountScreen() {
             {!authUser || authUser.isGuest ? 'Browsing as guest' : authUser.name || authUser.email}
           </Text>
           <Text style={styles.profileDetail}>
-            {!authUser || authUser.isGuest ? 'Log in to save your order history' : authUser.email}
+            {!authUser || authUser.isGuest ? 'Log in to save your order history' : `${authUser.email} (${authUser.role})`}
           </Text>
         </View>
         <Pressable
@@ -41,6 +41,18 @@ export default function AccountScreen() {
           <Feather name="log-out" size={19} color="#FFFFFF" />
         </Pressable>
       </View>
+      {isAdmin ? (
+        <Pressable onPress={() => router.push('/admin' as any)} style={[styles.sellerCard, { backgroundColor: '#EEF4FF', borderColor: '#4A6CF7', borderWidth: 1 }]}>
+          <View style={[styles.sellerIcon, { backgroundColor: '#4A6CF7' }]}>
+            <Feather name="shield" size={20} color="#FFFFFF" />
+          </View>
+          <View style={{ flex: 1 }}>
+            <Text style={[styles.sellerTitle, { color: colors.foreground }]}>Admin Panel</Text>
+            <Text style={[styles.sellerDetail, { color: colors.mutedForeground }]}>Manage products, orders, users, sellers & store settings</Text>
+          </View>
+          <Feather name="chevron-right" size={19} color="#4A6CF7" />
+        </Pressable>
+      ) : null}
       {isSeller ? (
         <Pressable onPress={() => router.push('/seller')} style={[styles.sellerCard, { backgroundColor: colors.coralSoft }]}>
           <View style={[styles.sellerIcon, { backgroundColor: colors.coral }]}>

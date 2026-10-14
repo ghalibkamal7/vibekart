@@ -2,18 +2,21 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as Haptics from 'expo-haptics';
 import React, { createContext, useContext, useEffect, useMemo, useState } from 'react';
 import {
+  AdminAuditLog,
   canCancelOrder,
   canTransitionOrderStatus,
   CategoryItem,
   computeDisplayPrice,
   defaultCategoryItems,
   defaultProducts,
+  defaultStoreSettings,
   getAssignedProductCount,
   NewProductInput,
   normalizeSlug,
   Order,
   OrderStatus,
   Product,
+  StoreSettings,
   validateCategoryName,
 } from '@/data/store';
 
@@ -26,16 +29,21 @@ import {
   signOutUser,
   signUp as firebaseSignUp,
   subscribeToAuthState,
+  UserProfile,
   UserRole,
 } from '@/services/firebase/auth';
 import { isFirebaseConfigured } from '@/services/firebase/config';
 import {
+  createAuditLogRemote,
   createCategoryRemote,
   createOrder,
   createOrderViaWorker,
   createProduct,
   editProduct,
+  fetchAuditLogsRemote,
   fetchSellerProducts,
+  fetchStoreSettingsRemote,
+  fetchUsersRemote,
   removeCategoryRemote,
   removeProduct,
   setOrderTrackingId as setOrderTrackingIdRemote,
@@ -47,6 +55,9 @@ import {
   subscribeToProducts,
   updateCategoryRemote,
   updateOrderStatusRemote,
+  updateStoreSettingsRemote,
+  updateUserRoleRemote,
+  updateUserStatusRemote,
 } from '@/services/firebase/firestore';
 
 type CartLine = {
@@ -118,6 +129,17 @@ type StoreContextValue = {
     disabledCount: number;       // products with enabled = false
   };
 
+  // admin
+  isAdmin: boolean;
+  storeSettings: StoreSettings;
+  updateStoreSettings: (patch: Partial<StoreSettings>) => Promise<void>;
+  usersList: UserProfile[];
+  refreshUsers: () => Promise<void>;
+  changeUserRole: (uid: string, role: UserRole) => Promise<void>;
+  changeUserStatus: (uid: string, status: 'active' | 'suspended') => Promise<void>;
+  auditLogs: AdminAuditLog[];
+  logAdminActivity: (action: string, details: string, targetId?: string) => Promise<void>;
+
   // auth
   authUser: AuthUser;
   authLoaded: boolean;
@@ -140,6 +162,9 @@ const STORAGE_KEYS = {
   products: 'vibekart-products',
   categories: 'vibekart-categories',
   auth: 'vibekart-auth',
+  settings: 'vibekart-settings',
+  users: 'vibekart-users',
+  auditLogs: 'vibekart-audit-logs',
 };
 
 export function StoreProvider({ children }: { children: React.ReactNode }) {
@@ -152,7 +177,12 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   const [authLoaded, setAuthLoaded] = useState(false);
   const [authError, setAuthError] = useState<string | null>(null);
 
+  const [storeSettings, setStoreSettings] = useState<StoreSettings>(defaultStoreSettings);
+  const [usersList, setUsersList] = useState<UserProfile[]>([]);
+  const [auditLogs, setAuditLogs] = useState<AdminAuditLog[]>([]);
+
   const isCloudMode = isFirebaseConfigured && !!authUser && !authUser.isGuest;
+  const isAdmin = !isCloudMode || (authUser && !authUser.isGuest && authUser.role === 'admin');
 
   // ---------------- cart / favorites — always on-device ----------------
 
@@ -764,6 +794,114 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     setOrders((current) => current.map((order) => (order.id === orderId ? { ...order, trackingId } : order)));
   };
 
+  // ---------------- admin methods ----------------
+
+  useEffect(() => {
+    if (isCloudMode) {
+      fetchStoreSettingsRemote().then(setStoreSettings).catch(() => {});
+      if (isAdmin) {
+        fetchUsersRemote().then(setUsersList).catch(() => {});
+        fetchAuditLogsRemote().then(setAuditLogs).catch(() => {});
+      }
+    } else {
+      AsyncStorage.getItem(STORAGE_KEYS.settings).then((saved) => {
+        if (saved) setStoreSettings(JSON.parse(saved));
+      });
+      AsyncStorage.getItem(STORAGE_KEYS.users).then((saved) => {
+        if (saved) {
+          setUsersList(JSON.parse(saved));
+        } else {
+          setUsersList([
+            { uid: 'demo-admin', email: 'admin@vibekart.in', name: 'Store Owner', role: 'admin', status: 'active' },
+            { uid: 'demo-seller', email: 'seller@vibekart.in', name: 'Studio Clay Co.', role: 'seller', status: 'active' },
+            { uid: 'demo-cust-1', email: 'aarav@example.com', name: 'Aarav Sharma', role: 'customer', status: 'active' },
+            { uid: 'demo-cust-2', email: 'priya@example.com', name: 'Priya Patel', role: 'customer', status: 'active' },
+          ]);
+        }
+      });
+      AsyncStorage.getItem(STORAGE_KEYS.auditLogs).then((saved) => {
+        if (saved) setAuditLogs(JSON.parse(saved));
+      });
+    }
+  }, [isCloudMode, isAdmin]);
+
+  const refreshUsers: StoreContextValue['refreshUsers'] = async () => {
+    if (isCloudMode) {
+      const list = await fetchUsersRemote();
+      setUsersList(list);
+    }
+  };
+
+  const changeUserRole: StoreContextValue['changeUserRole'] = async (uid, role) => {
+    if (authUser && !authUser.isGuest && authUser.uid === uid) {
+      throw new Error('Administrators cannot change their own role.');
+    }
+    if (isCloudMode) {
+      await updateUserRoleRemote(uid, role);
+      await refreshUsers();
+    } else {
+      setUsersList((curr) => {
+        const next = curr.map((u) => (u.uid === uid ? { ...u, role } : u));
+        AsyncStorage.setItem(STORAGE_KEYS.users, JSON.stringify(next));
+        return next;
+      });
+    }
+    await logAdminActivity('Update Role', `Changed role for user ${uid} to ${role}`, uid);
+  };
+
+  const changeUserStatus: StoreContextValue['changeUserStatus'] = async (uid, status) => {
+    if (authUser && !authUser.isGuest && authUser.uid === uid) {
+      throw new Error('Administrators cannot suspend their own account.');
+    }
+    if (isCloudMode) {
+      await updateUserStatusRemote(uid, status);
+      await refreshUsers();
+    } else {
+      setUsersList((curr) => {
+        const next = curr.map((u) => (u.uid === uid ? { ...u, status } : u));
+        AsyncStorage.setItem(STORAGE_KEYS.users, JSON.stringify(next));
+        return next;
+      });
+    }
+    await logAdminActivity('Update Account Status', `Set status to ${status} for user ${uid}`, uid);
+  };
+
+  const updateStoreSettings: StoreContextValue['updateStoreSettings'] = async (patch) => {
+    const merged = { ...storeSettings, ...patch };
+    setStoreSettings(merged);
+    if (isCloudMode) {
+      await updateStoreSettingsRemote(patch);
+    } else {
+      await AsyncStorage.setItem(STORAGE_KEYS.settings, JSON.stringify(merged));
+    }
+    await logAdminActivity('Update Store Settings', `Updated settings: ${Object.keys(patch).join(', ')}`);
+  };
+
+  const logAdminActivity: StoreContextValue['logAdminActivity'] = async (action, details, targetId) => {
+    const adminEmail = authUser && !authUser.isGuest ? authUser.email : 'admin@vibekart.in';
+    const adminUid = authUser && !authUser.isGuest ? authUser.uid : 'admin-local';
+    if (isCloudMode) {
+      await createAuditLogRemote({ adminEmail, adminUid, action, details, targetId });
+      const logs = await fetchAuditLogsRemote();
+      setAuditLogs(logs);
+    } else {
+      const newLog: AdminAuditLog = {
+        id: `log-${Date.now()}`,
+        timestamp: new Date().toISOString(),
+        adminEmail,
+        adminUid,
+        action,
+        details,
+        targetId,
+      };
+      setAuditLogs((curr) => {
+        const next = [newLog, ...curr.slice(0, 49)];
+        AsyncStorage.setItem(STORAGE_KEYS.auditLogs, JSON.stringify(next));
+        return next;
+      });
+    }
+  };
+
   // ---------------- analytics ----------------
 
   const analytics = useMemo(() => {
@@ -816,6 +954,15 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       setTrackingId,
       cancelOrder,
       analytics,
+      isAdmin,
+      storeSettings,
+      updateStoreSettings,
+      usersList,
+      refreshUsers,
+      changeUserRole,
+      changeUserStatus,
+      auditLogs,
+      logAdminActivity,
       authUser,
       authLoaded,
       authError,
@@ -827,7 +974,22 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       continueAsGuest,
       logout,
     }),
-    [isCloudMode, products, categories, cart, orders, favorites, analytics, authUser, authLoaded, authError],
+    [
+      isCloudMode,
+      products,
+      categories,
+      cart,
+      orders,
+      favorites,
+      analytics,
+      isAdmin,
+      storeSettings,
+      usersList,
+      auditLogs,
+      authUser,
+      authLoaded,
+      authError,
+    ],
   );
 
   return <StoreContext.Provider value={value}>{children}</StoreContext.Provider>;

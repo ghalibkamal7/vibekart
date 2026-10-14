@@ -6,6 +6,7 @@ import {
   DocumentData,
   getDoc,
   getDocs,
+  limit,
   onSnapshot,
   orderBy,
   query,
@@ -14,18 +15,26 @@ import {
   updateDoc,
 } from 'firebase/firestore';
 import {
+  AdminAuditLog,
   CategoryItem,
   computeDisplayPrice,
+  defaultStoreSettings,
   NewProductInput,
   Order,
   OrderStatus,
   Product,
+  StoreSettings,
 } from '@/data/store';
 import { auth, db } from './config';
+import { UserProfile, UserRole } from './auth';
 
 const PRODUCTS_COLLECTION = 'products';
 const CATEGORIES_COLLECTION = 'categories';
 const ORDERS_COLLECTION = 'orders';
+const USERS_COLLECTION = 'users';
+const SETTINGS_COLLECTION = 'settings';
+const SETTINGS_DOC_ID = 'store';
+const AUDIT_LOGS_COLLECTION = 'audit_logs';
 const PRIVATE_SUBCOLLECTION = 'private';
 const PRIVATE_DOC_ID = 'data';
 
@@ -405,4 +414,107 @@ export async function updateCategoryRemote(
 export async function removeCategoryRemote(id: string): Promise<void> {
   const database = requireDb();
   await deleteDoc(doc(database, CATEGORIES_COLLECTION, id));
+}
+
+// ---------------- Admin: Users & Sellers ----------------
+
+export async function fetchUsersRemote(): Promise<UserProfile[]> {
+  const database = requireDb();
+  const snapshot = await getDocs(query(collection(database, USERS_COLLECTION)));
+  return snapshot.docs.map((d) => {
+    const data = d.data();
+    return {
+      uid: d.id,
+      email: data.email ?? '',
+      name: data.name ?? 'Anonymous User',
+      phone: data.phone,
+      role: (data.role ?? 'customer') as UserRole,
+      status: (data.status ?? 'active') as 'active' | 'suspended',
+      createdAt: data.createdAt?.toDate ? data.createdAt.toDate().toISOString() : data.createdAt,
+    };
+  });
+}
+
+export async function updateUserRoleRemote(uid: string, role: UserRole): Promise<void> {
+  const database = requireDb();
+  await updateDoc(doc(database, USERS_COLLECTION, uid), {
+    role,
+    updatedAt: serverTimestamp(),
+  });
+}
+
+export async function updateUserStatusRemote(uid: string, status: 'active' | 'suspended'): Promise<void> {
+  const database = requireDb();
+  await updateDoc(doc(database, USERS_COLLECTION, uid), {
+    status,
+    updatedAt: serverTimestamp(),
+  });
+}
+
+// ---------------- Admin: Store Settings ----------------
+
+export async function fetchStoreSettingsRemote(): Promise<StoreSettings> {
+  const database = requireDb();
+  try {
+    const snap = await getDoc(doc(database, SETTINGS_COLLECTION, SETTINGS_DOC_ID));
+    if (snap.exists()) {
+      return { ...defaultStoreSettings, ...snap.data() } as StoreSettings;
+    }
+  } catch (err) {
+    console.warn('[firestore] fetchStoreSettingsRemote fallback to default', err);
+  }
+  return defaultStoreSettings;
+}
+
+export async function updateStoreSettingsRemote(settings: Partial<StoreSettings>): Promise<void> {
+  const database = requireDb();
+  await setDoc(
+    doc(database, SETTINGS_COLLECTION, SETTINGS_DOC_ID),
+    {
+      ...settings,
+      updatedAt: serverTimestamp(),
+    },
+    { merge: true },
+  );
+}
+
+// ---------------- Admin: Audit Logs ----------------
+
+export async function fetchAuditLogsRemote(): Promise<AdminAuditLog[]> {
+  const database = requireDb();
+  try {
+    const q = query(collection(database, AUDIT_LOGS_COLLECTION), orderBy('timestamp', 'desc'), limit(50));
+    const snap = await getDocs(q);
+    return snap.docs.map((d) => {
+      const data = d.data();
+      return {
+        id: d.id,
+        timestamp: data.timestamp?.toDate ? data.timestamp.toDate().toISOString() : (data.timestamp ?? new Date().toISOString()),
+        adminEmail: data.adminEmail ?? 'admin',
+        adminUid: data.adminUid ?? '',
+        action: data.action ?? 'Action',
+        targetId: data.targetId,
+        details: data.details ?? '',
+      };
+    });
+  } catch (err) {
+    console.warn('[firestore] fetchAuditLogsRemote failed', err);
+    return [];
+  }
+}
+
+export async function createAuditLogRemote(
+  log: Omit<AdminAuditLog, 'id' | 'timestamp'>,
+): Promise<string> {
+  const database = requireDb();
+  try {
+    const ref = await addDoc(collection(database, AUDIT_LOGS_COLLECTION), {
+      ...log,
+      timestamp: serverTimestamp(),
+    });
+    return ref.id;
+  } catch (err) {
+    console.warn('[firestore] createAuditLogRemote failed', err);
+    return `local-${Date.now()}`;
+  }
 }

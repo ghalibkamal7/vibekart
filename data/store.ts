@@ -389,3 +389,33 @@ export const categories: { label: Category; icon: string }[] = [
 ];
 
 export const formatPrice = (amount: number) => `₹${Math.round(amount).toLocaleString('en-IN')}`;
+
+export type StoreSettings = {
+  storeName: string;
+  supportEmail: string;
+  supportPhone?: string;
+  announcement: string;
+  announcementActive: boolean;
+  maintenanceMode: boolean;
+  freeDeliveryThreshold?: number;
+};
+
+export const defaultStoreSettings: StoreSettings = {
+  storeName: 'VibeKart',
+  supportEmail: 'support@vibekart.in',
+  supportPhone: '+91 98765 43210',
+  announcement: 'Welcome to VibeKart — Handpicked, honest aesthetic picks for your space.',
+  announcementActive: true,
+  maintenanceMode: false,
+  freeDeliveryThreshold: 499,
+};
+
+export type AdminAuditLog = {
+  id: string;
+  timestamp: string;
+  adminEmail: string;
+  adminUid: string;
+  action: string;
+  targetId?: string;
+  details: string;
+};
