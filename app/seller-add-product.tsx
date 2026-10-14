@@ -9,13 +9,14 @@ import {
   Pressable,
   ScrollView,
   StyleSheet,
+  Switch,
   Text,
   TextInput,
   View,
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { MAX_PRODUCT_IMAGES } from '@/constants/config';
-import { Category, computeDisplayPrice, formatPrice, MarkupType } from '@/data/store';
+import { Category, computeDisplayPrice, formatPrice, MarkupType, NewProductInput } from '@/data/store';
 import { isCloudinaryConfigured, uploadImageToCloudinary } from '@/services/cloudinary/upload';
 import { useColors } from '@/hooks/useColors';
 import { useStore } from '@/context/StoreContext';
@@ -65,16 +66,39 @@ export default function SellerAddProductScreen() {
   const [baseCost, setBaseCost] = useState(editing ? String(editing.baseCost) : '');
   const [markupType, setMarkupType] = useState<MarkupType>(editing?.markupType ?? 'percent');
   const [markupValue, setMarkupValue] = useState(editing ? String(editing.markupValue) : '25');
+  const [manualPrice, setManualPrice] = useState(
+    editing?.manualPrice !== undefined
+      ? String(editing.manualPrice)
+      : editing?.markupType === 'manual'
+      ? String(editing.price)
+      : '',
+  );
+  const [enabled, setEnabled] = useState(editing?.enabled ?? true);
+  const [featured, setFeatured] = useState(editing?.featured ?? false);
+  const [isNew, setIsNew] = useState(editing?.isNew ?? false);
   const [originalPrice, setOriginalPrice] = useState(editing?.originalPrice ? String(editing.originalPrice) : '');
   const [colorsInput, setColorsInput] = useState(editing?.colors?.join(', ') ?? '');
   const [sizesInput, setSizesInput] = useState(editing?.sizes?.join(', ') ?? '');
 
   const costNum = parseFloat(baseCost) || 0;
   const markupNum = parseFloat(markupValue) || 0;
-  const previewPrice = computeDisplayPrice(costNum, markupType, markupNum);
-  const previewMargin = previewPrice - costNum;
+  const manualNum = parseFloat(manualPrice);
+  const isManualValid = Number.isFinite(manualNum) && manualNum >= 0;
 
-  const canSave = name.trim().length > 0 && costNum > 0 && !saving;
+  const previewPrice = computeDisplayPrice(
+    costNum,
+    markupType,
+    markupNum,
+    markupType === 'manual' ? (isManualValid ? manualNum : 0) : undefined,
+  );
+  const previewMargin = previewPrice - costNum;
+  const isLoss = previewMargin < 0;
+
+  const canSave =
+    name.trim().length > 0 &&
+    costNum > 0 &&
+    (markupType === 'manual' ? isManualValid : true) &&
+    !saving;
 
   const handlePasteUrl = () => {
     if (!sourceUrl.trim()) return;
@@ -176,7 +200,7 @@ export default function SellerAddProductScreen() {
     }
     setSaving(true);
     try {
-      const input = {
+      const input: NewProductInput = {
         name: name.trim(),
         subtitle: subtitle.trim(),
         description: description.trim(),
@@ -184,11 +208,15 @@ export default function SellerAddProductScreen() {
         baseCost: costNum,
         markupType,
         markupValue: markupNum,
+        manualPrice: markupType === 'manual' ? (isManualValid ? Math.round(manualNum) : undefined) : undefined,
         originalPrice: originalPrice ? parseFloat(originalPrice) : undefined,
         colors: colorsInput.split(',').map((c) => c.trim()).filter(Boolean),
         sizes: sizesInput.trim() ? sizesInput.split(',').map((s) => s.trim()).filter(Boolean) : undefined,
         sourceUrl: sourceUrl.trim() || undefined,
         sourceCode: sourceCode.trim() || undefined,
+        enabled,
+        featured,
+        isNew,
       };
 
       const productId = editing ? editing.id : await addProduct(input);
@@ -351,35 +379,119 @@ export default function SellerAddProductScreen() {
 
           <Text style={[styles.label, { color: colors.foreground }]}>Markup type</Text>
           <View style={styles.chipRow}>
-            {(['fixed', 'percent'] as MarkupType[]).map((type) => (
+            {(['fixed', 'percent', 'manual'] as MarkupType[]).map((type) => (
               <Pressable
                 key={type}
                 onPress={() => setMarkupType(type)}
                 style={[styles.chip, { backgroundColor: markupType === type ? colors.moss : colors.card, borderColor: markupType === type ? colors.moss : colors.border }]}
               >
                 <Text style={[styles.chipText, { color: markupType === type ? '#FFFFFF' : colors.foreground }]}>
-                  {type === 'fixed' ? 'Fixed ₹' : 'Percent %'}
+                  {type === 'fixed' ? 'Fixed ₹' : type === 'percent' ? 'Percent %' : 'Manual ₹'}
                 </Text>
               </Pressable>
             ))}
           </View>
-          <Text style={[styles.label, { color: colors.foreground }]}>
-            Markup value {markupType === 'percent' ? '(%)' : '(₹)'}
-          </Text>
-          <TextInput value={markupValue} onChangeText={setMarkupValue} keyboardType="numeric" placeholder={markupType === 'percent' ? '25' : '150'} placeholderTextColor={colors.mutedForeground} style={[styles.input, { backgroundColor: colors.card, borderColor: colors.border, color: colors.foreground }]} />
+
+          {markupType === 'manual' ? (
+            <>
+              <Text style={[styles.label, { color: colors.foreground }]}>Target selling price ₹</Text>
+              <TextInput
+                value={manualPrice}
+                onChangeText={setManualPrice}
+                keyboardType="numeric"
+                placeholder="1499"
+                placeholderTextColor={colors.mutedForeground}
+                style={[styles.input, { backgroundColor: colors.card, borderColor: colors.border, color: colors.foreground }]}
+              />
+              {manualPrice.trim().length > 0 && !isManualValid ? (
+                <Text style={{ fontSize: 11, color: colors.destructive, marginTop: 4 }}>
+                  Enter a valid non-negative number for the selling price
+                </Text>
+              ) : null}
+            </>
+          ) : (
+            <>
+              <Text style={[styles.label, { color: colors.foreground }]}>
+                Markup value {markupType === 'percent' ? '(%)' : '(₹)'}
+              </Text>
+              <TextInput
+                value={markupValue}
+                onChangeText={setMarkupValue}
+                keyboardType="numeric"
+                placeholder={markupType === 'percent' ? '25' : '150'}
+                placeholderTextColor={colors.mutedForeground}
+                style={[styles.input, { backgroundColor: colors.card, borderColor: colors.border, color: colors.foreground }]}
+              />
+            </>
+          )}
 
           <Text style={[styles.label, { color: colors.foreground }]}>Strike-through original price (optional) ₹</Text>
           <TextInput value={originalPrice} onChangeText={setOriginalPrice} keyboardType="numeric" placeholder="1999" placeholderTextColor={colors.mutedForeground} style={[styles.input, { backgroundColor: colors.card, borderColor: colors.border, color: colors.foreground }]} />
 
-          <View style={[styles.previewCard, { backgroundColor: colors.mossSoft }]}>
+          {isLoss && costNum > 0 ? (
+            <View style={[styles.lossWarning, { backgroundColor: colors.coralSoft, borderColor: colors.destructive }]}>
+              <Feather name="alert-triangle" size={16} color={colors.destructive} />
+              <Text style={[styles.lossWarningText, { color: colors.destructive }]}>
+                Selling price ({formatPrice(previewPrice)}) is below supplier cost ({formatPrice(costNum)}). You will make a negative margin of {formatPrice(previewMargin)} per unit.
+              </Text>
+            </View>
+          ) : null}
+
+          <View style={[styles.previewCard, { backgroundColor: isLoss ? colors.coralSoft : colors.mossSoft }]}>
             <View>
-              <Text style={[styles.previewLabel, { color: colors.moss }]}>CUSTOMER SEES</Text>
-              <Text style={[styles.previewPrice, { color: colors.moss }]}>{formatPrice(previewPrice)}</Text>
+              <Text style={[styles.previewLabel, { color: isLoss ? colors.destructive : colors.moss }]}>CUSTOMER SEES</Text>
+              <Text style={[styles.previewPrice, { color: isLoss ? colors.destructive : colors.moss }]}>{formatPrice(previewPrice)}</Text>
             </View>
             <View>
-              <Text style={[styles.previewLabel, { color: colors.moss }]}>YOUR MARGIN</Text>
-              <Text style={[styles.previewPrice, { color: colors.moss }]}>{formatPrice(previewMargin)}</Text>
+              <Text style={[styles.previewLabel, { color: isLoss ? colors.destructive : colors.moss }]}>YOUR MARGIN</Text>
+              <Text style={[styles.previewPrice, { color: isLoss ? colors.destructive : colors.moss }]}>{formatPrice(previewMargin)}</Text>
             </View>
+          </View>
+
+          <Text style={[styles.sectionLabel, { color: colors.coral, marginTop: 26 }]}>VISIBILITY & FLAGS</Text>
+          <View style={[styles.switchRow, { backgroundColor: colors.card, borderColor: colors.border }]}>
+            <View style={{ flex: 1 }}>
+              <Text style={[styles.switchTitle, { color: colors.foreground }]}>Active in storefront</Text>
+              <Text style={[styles.switchSubtitle, { color: colors.mutedForeground }]}>
+                When turned off, customers cannot view or purchase this product
+              </Text>
+            </View>
+            <Switch
+              value={enabled}
+              onValueChange={setEnabled}
+              trackColor={{ false: colors.border, true: colors.mossSoft }}
+              thumbColor={enabled ? colors.moss : colors.mutedForeground}
+            />
+          </View>
+
+          <View style={[styles.switchRow, { backgroundColor: colors.card, borderColor: colors.border, marginTop: 10 }]}>
+            <View style={{ flex: 1 }}>
+              <Text style={[styles.switchTitle, { color: colors.foreground }]}>Featured pick</Text>
+              <Text style={[styles.switchSubtitle, { color: colors.mutedForeground }]}>
+                Highlight this product in Explore and curated edits
+              </Text>
+            </View>
+            <Switch
+              value={featured}
+              onValueChange={setFeatured}
+              trackColor={{ false: colors.border, true: colors.coralSoft }}
+              thumbColor={featured ? colors.coral : colors.mutedForeground}
+            />
+          </View>
+
+          <View style={[styles.switchRow, { backgroundColor: colors.card, borderColor: colors.border, marginTop: 10 }]}>
+            <View style={{ flex: 1 }}>
+              <Text style={[styles.switchTitle, { color: colors.foreground }]}>Badge as "NEW"</Text>
+              <Text style={[styles.switchSubtitle, { color: colors.mutedForeground }]}>
+                Displays a prominent "NEW" badge on product cards
+              </Text>
+            </View>
+            <Switch
+              value={isNew}
+              onValueChange={setIsNew}
+              trackColor={{ false: colors.border, true: colors.mossSoft }}
+              thumbColor={isNew ? colors.moss : colors.mutedForeground}
+            />
           </View>
         </View>
       </ScrollView>
@@ -436,6 +548,11 @@ const styles = StyleSheet.create({
   previewCard: { flexDirection: 'row', justifyContent: 'space-between', borderRadius: 17, padding: 16, marginTop: 24 },
   previewLabel: { fontSize: 9, fontFamily: 'Inter_700Bold', letterSpacing: 1 },
   previewPrice: { fontSize: 20, fontFamily: 'Inter_700Bold', marginTop: 4 },
+  lossWarning: { flexDirection: 'row', alignItems: 'center', gap: 8, padding: 12, borderRadius: 14, borderWidth: 1, marginTop: 18 },
+  lossWarningText: { flex: 1, fontSize: 12, fontFamily: 'Inter_500Medium', lineHeight: 16 },
+  switchRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', padding: 14, borderWidth: 1, borderRadius: 16 },
+  switchTitle: { fontSize: 13, fontFamily: 'Inter_600SemiBold' },
+  switchSubtitle: { fontSize: 11, fontFamily: 'Inter_400Regular', marginTop: 3 },
   bottomBar: { position: 'absolute', bottom: 0, left: 0, right: 0, paddingHorizontal: 18, paddingTop: 13, borderTopWidth: 1 },
   saveButton: { height: 54, borderRadius: 18, alignItems: 'center', justifyContent: 'center' },
   saveText: { fontSize: 14, fontFamily: 'Inter_700Bold' },

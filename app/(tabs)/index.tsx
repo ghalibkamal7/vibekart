@@ -41,6 +41,10 @@ function ProductCard({ product }: { product: Product }) {
           <View style={[styles.newBadge, { backgroundColor: colors.moss }]}>
             <Text style={styles.newBadgeText}>NEW</Text>
           </View>
+        ) : product.featured ? (
+          <View style={[styles.newBadge, { backgroundColor: colors.coral }]}>
+            <Text style={styles.newBadgeText}>FEATURED</Text>
+          </View>
         ) : null}
         <Pressable
           onPress={() => toggleFavorite(product.id)}
@@ -99,6 +103,7 @@ export default function HomeScreen() {
   const filteredProducts = useMemo(
     () =>
       products.filter((product) => {
+        if (product.enabled === false) return false;
         const matchesCategory = category === 'All' || product.category === category;
         const matchesQuery =
           !query.trim() ||

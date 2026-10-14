@@ -32,8 +32,8 @@ function requireDb() {
   return db;
 }
 
-const PRIVATE_FIELDS = ['baseCost', 'markupType', 'markupValue', 'sourceUrl', 'sourceCode'] as const;
-type PrivateFields = Pick<Product, 'baseCost' | 'markupType' | 'markupValue' | 'sourceUrl' | 'sourceCode'>;
+const PRIVATE_FIELDS = ['baseCost', 'markupType', 'markupValue', 'manualPrice', 'sourceUrl', 'sourceCode'] as const;
+type PrivateFields = Pick<Product, 'baseCost' | 'markupType' | 'markupValue' | 'manualPrice' | 'sourceUrl' | 'sourceCode'>;
 
 function splitProductInput(input: Partial<NewProductInput>) {
   const priv: Record<string, unknown> = {};
@@ -42,6 +42,10 @@ function splitProductInput(input: Partial<NewProductInput>) {
     if (value === undefined) continue;
     if ((PRIVATE_FIELDS as readonly string[]).includes(key)) priv[key] = value;
     else pub[key] = value;
+  }
+  // Explicit sanitization: ensure no private field ever lands in the public doc
+  for (const field of PRIVATE_FIELDS) {
+    delete pub[field];
   }
   return { pub, priv };
 }
@@ -77,14 +81,23 @@ export function subscribeToProducts(onChange: (products: Product[]) => void, onE
 }
 
 function toPublicProduct(id: string, data: DocumentData): Product {
-  // baseCost/markup*/sourceUrl/sourceCode are simply absent here — they live
-  // in the private sub-document a customer's rules never permit reading.
+  // Explicit sanitization: baseCost/markup*/manualPrice/sourceUrl/sourceCode are
+  // guaranteed absent — they live in the private sub-document a customer's rules
+  // never permit reading.
+  const sanitized = { ...data };
+  for (const field of PRIVATE_FIELDS) {
+    delete sanitized[field];
+  }
   return {
     id,
     baseCost: 0,
     markupType: 'fixed',
     markupValue: 0,
-    ...data,
+    inStock: sanitized.inStock ?? true,
+    enabled: sanitized.enabled ?? true,
+    featured: sanitized.featured ?? false,
+    isNew: sanitized.isNew ?? false,
+    ...sanitized,
   } as Product;
 }
 
@@ -97,7 +110,15 @@ export async function fetchSellerProducts(): Promise<Product[]> {
     snapshot.docs.map(async (d) => {
       const privateSnap = await getDoc(doc(database, PRODUCTS_COLLECTION, d.id, PRIVATE_SUBCOLLECTION, PRIVATE_DOC_ID));
       const priv = (privateSnap.exists() ? privateSnap.data() : {}) as Partial<PrivateFields>;
-      return { id: d.id, ...d.data(), ...priv } as Product;
+      return {
+        id: d.id,
+        inStock: d.data().inStock ?? true,
+        enabled: d.data().enabled ?? true,
+        featured: d.data().featured ?? false,
+        isNew: d.data().isNew ?? false,
+        ...d.data(),
+        ...priv,
+      } as Product;
     }),
   );
   return products;
@@ -107,12 +128,15 @@ export async function fetchSellerProducts(): Promise<Product[]> {
 
 export async function createProduct(input: NewProductInput): Promise<string> {
   const database = requireDb();
-  const price = computeDisplayPrice(input.baseCost, input.markupType, input.markupValue);
+  const price = computeDisplayPrice(input.baseCost, input.markupType, input.markupValue, input.manualPrice);
   const { pub, priv } = splitProductInput(input);
   const docRef = await addDoc(collection(database, PRODUCTS_COLLECTION), {
     ...pub,
     price,
-    inStock: true,
+    inStock: input.inStock ?? true,
+    enabled: input.enabled ?? true,
+    featured: input.featured ?? false,
+    isNew: input.isNew ?? false,
     rating: 4.5,
     reviews: 0,
     createdAt: serverTimestamp(),
@@ -129,12 +153,17 @@ export async function editProduct(id: string, patch: Partial<NewProductInput>): 
   }
   if (Object.keys(priv).length) {
     await setDoc(doc(database, PRODUCTS_COLLECTION, id, PRIVATE_SUBCOLLECTION, PRIVATE_DOC_ID), priv, { merge: true });
-    // Price always depends on cost + markup, so recompute it on the public
+    // Price always depends on cost + markup or manual price, so recompute it on the public
     // doc whenever either changes — customers only ever read this field.
     const privateSnap = await getDoc(doc(database, PRODUCTS_COLLECTION, id, PRIVATE_SUBCOLLECTION, PRIVATE_DOC_ID));
     const merged = privateSnap.data() as PrivateFields;
     if (merged?.baseCost !== undefined) {
-      const price = computeDisplayPrice(merged.baseCost, merged.markupType, merged.markupValue);
+      const price = computeDisplayPrice(
+        merged.baseCost,
+        merged.markupType ?? 'fixed',
+        merged.markupValue ?? 0,
+        merged.manualPrice,
+      );
       await updateDoc(doc(database, PRODUCTS_COLLECTION, id), { price });
     }
   }
@@ -149,6 +178,16 @@ export async function removeProduct(id: string): Promise<void> {
 export async function setProductStock(id: string, inStock: boolean): Promise<void> {
   const database = requireDb();
   await updateDoc(doc(database, PRODUCTS_COLLECTION, id), { inStock });
+}
+
+export async function setProductEnabled(id: string, enabled: boolean): Promise<void> {
+  const database = requireDb();
+  await updateDoc(doc(database, PRODUCTS_COLLECTION, id), { enabled });
+}
+
+export async function setProductFeatured(id: string, featured: boolean): Promise<void> {
+  const database = requireDb();
+  await updateDoc(doc(database, PRODUCTS_COLLECTION, id), { featured });
 }
 
 // ---------------- Orders ----------------

@@ -22,6 +22,8 @@ import {
   fetchSellerProducts,
   removeProduct,
   setOrderTrackingId as setOrderTrackingIdRemote,
+  setProductEnabled as setProductEnabledRemote,
+  setProductFeatured as setProductFeaturedRemote,
   setProductStock as setProductStockRemote,
   subscribeToOrders,
   subscribeToProducts,
@@ -51,6 +53,8 @@ type StoreContextValue = {
   updateProduct: (id: string, patch: Partial<NewProductInput>) => Promise<void>;
   deleteProduct: (id: string) => Promise<void>;
   toggleStock: (id: string) => Promise<void>;
+  toggleEnabled: (id: string) => Promise<void>;
+  toggleFeatured: (id: string) => Promise<void>;
 
   // cart / orders (customer side) — cart/favorites always stay on-device
   cart: CartLine[];
@@ -290,7 +294,24 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     }
 
     AsyncStorage.getItem(STORAGE_KEYS.products).then((saved) => {
-      setProducts(saved ? (JSON.parse(saved) as Product[]) : defaultProducts);
+      if (saved) {
+        try {
+          const parsed = JSON.parse(saved) as Product[];
+          setProducts(
+            parsed.map((p) => ({
+              ...p,
+              enabled: p.enabled ?? true,
+              featured: p.featured ?? false,
+              isNew: p.isNew ?? false,
+              inStock: p.inStock ?? true,
+            })),
+          );
+        } catch {
+          setProducts(defaultProducts);
+        }
+      } else {
+        setProducts(defaultProducts);
+      }
     });
   }, [isCloudMode, authUser && !authUser.isGuest ? authUser.role : null]);
 
@@ -304,7 +325,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       await refreshSellerProducts();
       return id;
     }
-    const price = computeDisplayPrice(input.baseCost, input.markupType, input.markupValue);
+    const price = computeDisplayPrice(input.baseCost, input.markupType, input.markupValue, input.manualPrice);
     const product: Product = {
       id: `${input.name.toLowerCase().replace(/[^a-z0-9]+/g, '-').slice(0, 24)}-${Date.now().toString().slice(-4)}`,
       name: input.name,
@@ -312,14 +333,20 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       description: input.description,
       category: input.category,
       image: input.image ?? defaultProducts[0].image,
+      imageUrls: input.imageUrls,
+      imagePublicIds: input.imagePublicIds,
       rating: 4.5,
       reviews: 0,
       colors: input.colors.length ? input.colors : ['Standard'],
       sizes: input.sizes,
-      inStock: true,
+      inStock: input.inStock ?? true,
+      enabled: input.enabled ?? true,
+      featured: input.featured ?? false,
+      isNew: input.isNew ?? false,
       baseCost: input.baseCost,
       markupType: input.markupType,
       markupValue: input.markupValue,
+      manualPrice: input.manualPrice,
       originalPrice: input.originalPrice,
       sourceUrl: input.sourceUrl,
       sourceCode: input.sourceCode,
@@ -339,7 +366,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       current.map((product) => {
         if (product.id !== id) return product;
         const merged = { ...product, ...patch };
-        const price = computeDisplayPrice(merged.baseCost, merged.markupType, merged.markupValue);
+        const price = computeDisplayPrice(merged.baseCost, merged.markupType, merged.markupValue, merged.manualPrice);
         return { ...merged, price };
       }),
     );
@@ -365,6 +392,34 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     }
     setProducts((current) =>
       current.map((product) => (product.id === id ? { ...product, inStock: !product.inStock } : product)),
+    );
+  };
+
+  const toggleEnabled: StoreContextValue['toggleEnabled'] = async (id) => {
+    if (isCloudMode) {
+      const target = products.find((product) => product.id === id);
+      if (target) await setProductEnabledRemote(id, !(target.enabled ?? true));
+      await refreshSellerProducts();
+      return;
+    }
+    setProducts((current) =>
+      current.map((product) =>
+        product.id === id ? { ...product, enabled: !(product.enabled ?? true) } : product,
+      ),
+    );
+  };
+
+  const toggleFeatured: StoreContextValue['toggleFeatured'] = async (id) => {
+    if (isCloudMode) {
+      const target = products.find((product) => product.id === id);
+      if (target) await setProductFeaturedRemote(id, !(target.featured ?? false));
+      await refreshSellerProducts();
+      return;
+    }
+    setProducts((current) =>
+      current.map((product) =>
+        product.id === id ? { ...product, featured: !(product.featured ?? false) } : product,
+      ),
     );
   };
 
@@ -514,6 +569,8 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       updateProduct,
       deleteProduct,
       toggleStock,
+      toggleEnabled,
+      toggleFeatured,
       cart,
       orders,
       favorites,

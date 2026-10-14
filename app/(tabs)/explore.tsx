@@ -1,6 +1,6 @@
 import { Feather } from '@expo/vector-icons';
 import { router } from 'expo-router';
-import React from 'react';
+import React, { useMemo } from 'react';
 import { Image, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { categories, formatPrice, getProductImages } from '@/data/store';
@@ -12,6 +12,14 @@ export default function ExploreScreen() {
   const colors = useColors();
   const insets = useSafeAreaInsets();
   const { products } = useStore();
+
+  const trendingProducts = useMemo(() => {
+    const active = products.filter((p) => p.enabled !== false);
+    const featured = active.filter((p) => p.featured);
+    const nonFeatured = active.filter((p) => !p.featured);
+    return [...featured, ...nonFeatured].slice(0, 4);
+  }, [products]);
+
   return (
     <ScrollView
       showsVerticalScrollIndicator={false}
@@ -33,7 +41,7 @@ export default function ExploreScreen() {
               <Feather name={category.icon as keyof typeof Feather.glyphMap} size={21} color={index % 2 ? colors.moss : colors.coral} />
               <Text style={[styles.collectionTitle, { color: colors.foreground }]}>{category.label}</Text>
               <Text style={[styles.collectionCount, { color: colors.mutedForeground }]}>
-                {products.filter((product) => product.category === category.label).length} curated picks
+                {products.filter((product) => product.category === category.label && product.enabled !== false).length} curated picks
               </Text>
             </View>
             <Feather name="arrow-up-right" size={18} color={colors.foreground} />
@@ -50,7 +58,7 @@ export default function ExploreScreen() {
       </View>
       <Text style={[styles.sectionTitle, { color: colors.foreground }]}>Trending right now</Text>
       <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.horizontalProducts}>
-        {products.slice(0, 4).map((product) => {
+        {trendingProducts.map((product) => {
           const images = getProductImages(product);
           return (
             <Pressable key={product.id} onPress={() => router.push(`/product/${product.id}`)} style={styles.miniProduct}>

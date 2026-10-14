@@ -10,7 +10,7 @@ import { useStore } from '@/context/StoreContext';
 export default function SellerScreen() {
   const colors = useColors();
   const insets = useSafeAreaInsets();
-  const { products, analytics, toggleStock, deleteProduct } = useStore();
+  const { products, analytics, toggleStock, toggleEnabled, deleteProduct } = useStore();
 
   const confirmDelete = (id: string, name: string) => {
     Alert.alert('Delete product?', `"${name}" will be permanently removed from your catalogue.`, [
@@ -67,36 +67,80 @@ export default function SellerScreen() {
       <View style={styles.sectionRow}>
         <Text style={[styles.sectionTitle, { color: colors.foreground }]}>Catalogue ({products.length})</Text>
       </View>
-      {products.map((product) => (
-        <View key={product.id} style={[styles.productRow, { backgroundColor: colors.card, borderColor: colors.border }]}>
-          <View style={[styles.productDot, { backgroundColor: product.inStock ? colors.mossSoft : colors.coralSoft }]}>
-            <Feather name="package" size={16} color={product.inStock ? colors.moss : colors.coral} />
+      {products.map((product) => {
+        const margin = product.price - product.baseCost;
+        const isLoss = margin < 0;
+        return (
+          <View key={product.id} style={[styles.productRow, { backgroundColor: colors.card, borderColor: colors.border }]}>
+            <View style={[styles.productDot, { backgroundColor: product.inStock ? colors.mossSoft : colors.coralSoft }]}>
+              <Feather name="package" size={16} color={product.inStock ? colors.moss : colors.coral} />
+            </View>
+            <View style={{ flex: 1 }}>
+              <Text style={[styles.productName, { color: colors.foreground }]} numberOfLines={1}>{product.name}</Text>
+              <View style={{ flexDirection: 'row', alignItems: 'center', gap: 5, flexWrap: 'wrap', marginVertical: 3 }}>
+                {product.enabled === false ? (
+                  <View style={{ backgroundColor: colors.destructive, paddingHorizontal: 6, paddingVertical: 1, borderRadius: 5 }}>
+                    <Text style={{ color: '#FFFFFF', fontSize: 8, fontFamily: 'Inter_700Bold' }}>UNLISTED</Text>
+                  </View>
+                ) : null}
+                {product.featured ? (
+                  <View style={{ backgroundColor: colors.coralSoft, paddingHorizontal: 6, paddingVertical: 1, borderRadius: 5 }}>
+                    <Text style={{ color: colors.coral, fontSize: 8, fontFamily: 'Inter_700Bold' }}>FEATURED</Text>
+                  </View>
+                ) : null}
+                {product.isNew ? (
+                  <View style={{ backgroundColor: colors.mossSoft, paddingHorizontal: 6, paddingVertical: 1, borderRadius: 5 }}>
+                    <Text style={{ color: colors.moss, fontSize: 8, fontFamily: 'Inter_700Bold' }}>NEW</Text>
+                  </View>
+                ) : null}
+              </View>
+              <Text style={[styles.productMeta, { color: colors.mutedForeground }]}>
+                Cost {formatPrice(product.baseCost)} → Sell {formatPrice(product.price)} · Margin{' '}
+                <Text style={{ color: isLoss ? colors.destructive : colors.mutedForeground }}>
+                  {formatPrice(margin)}
+                </Text>
+              </Text>
+              <Text style={[styles.markupTag, { color: isLoss ? colors.destructive : colors.moss }]}>
+                {product.markupType === 'manual'
+                  ? `Manual price: ${formatPrice(product.price)}${isLoss ? ' (Loss!)' : ''}`
+                  : product.markupType === 'percent'
+                  ? `+${product.markupValue}% markup`
+                  : `+${formatPrice(product.markupValue)} markup`}
+              </Text>
+            </View>
+            <View style={styles.productActions}>
+              <View style={{ alignItems: 'center' }}>
+                <Text style={{ fontSize: 8, fontFamily: 'Inter_600SemiBold', color: colors.mutedForeground, marginBottom: 2 }}>
+                  {product.inStock ? 'Stock' : 'Out'}
+                </Text>
+                <Switch
+                  value={product.inStock}
+                  onValueChange={() => toggleStock(product.id)}
+                  trackColor={{ false: colors.border, true: colors.mossSoft }}
+                  thumbColor={product.inStock ? colors.moss : colors.mutedForeground}
+                />
+              </View>
+              <View style={{ alignItems: 'center', marginTop: 6 }}>
+                <Text style={{ fontSize: 8, fontFamily: 'Inter_600SemiBold', color: colors.mutedForeground, marginBottom: 2 }}>
+                  {product.enabled !== false ? 'Active' : 'Hidden'}
+                </Text>
+                <Switch
+                  value={product.enabled !== false}
+                  onValueChange={() => toggleEnabled(product.id)}
+                  trackColor={{ false: colors.border, true: colors.mossSoft }}
+                  thumbColor={product.enabled !== false ? colors.moss : colors.mutedForeground}
+                />
+              </View>
+              <Pressable onPress={() => router.push({ pathname: '/seller-add-product', params: { id: product.id } })} hitSlop={8} style={{ marginTop: 8 }}>
+                <Feather name="edit-3" size={16} color={colors.moss} />
+              </Pressable>
+              <Pressable onPress={() => confirmDelete(product.id, product.name)} hitSlop={8} style={{ marginTop: 10 }}>
+                <Feather name="trash-2" size={16} color={colors.destructive} />
+              </Pressable>
+            </View>
           </View>
-          <View style={{ flex: 1 }}>
-            <Text style={[styles.productName, { color: colors.foreground }]} numberOfLines={1}>{product.name}</Text>
-            <Text style={[styles.productMeta, { color: colors.mutedForeground }]}>
-              Cost {formatPrice(product.baseCost)} → Sell {formatPrice(product.price)} · Margin {formatPrice(product.price - product.baseCost)}
-            </Text>
-            <Text style={[styles.markupTag, { color: colors.moss }]}>
-              {product.markupType === 'percent' ? `+${product.markupValue}%` : `+${formatPrice(product.markupValue)}`} markup
-            </Text>
-          </View>
-          <View style={styles.productActions}>
-            <Switch
-              value={product.inStock}
-              onValueChange={() => toggleStock(product.id)}
-              trackColor={{ false: colors.border, true: colors.mossSoft }}
-              thumbColor={product.inStock ? colors.moss : colors.mutedForeground}
-            />
-            <Pressable onPress={() => router.push({ pathname: '/seller-add-product', params: { id: product.id } })} hitSlop={8} style={{ marginTop: 10 }}>
-              <Feather name="edit-3" size={16} color={colors.moss} />
-            </Pressable>
-            <Pressable onPress={() => confirmDelete(product.id, product.name)} hitSlop={8} style={{ marginTop: 12 }}>
-              <Feather name="trash-2" size={16} color={colors.destructive} />
-            </Pressable>
-          </View>
-        </View>
-      ))}
+        );
+      })}
     </ScrollView>
   );
 }

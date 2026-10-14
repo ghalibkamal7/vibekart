@@ -2,7 +2,7 @@ import { ImageSourcePropType } from 'react-native';
 
 export type Category = 'All' | 'Home' | 'Style' | 'Beauty' | 'Wellness';
 
-export type MarkupType = 'fixed' | 'percent';
+export type MarkupType = 'fixed' | 'percent' | 'manual';
 
 /**
  * Product = ek "catalogue item" jo humne kisi supplier (jaise Meesho) se socure
@@ -24,17 +24,20 @@ export type Product = {
   colors: string[];
   sizes?: string[];
   isNew?: boolean;
+  featured?: boolean;
+  enabled?: boolean; // defaults to true; if false, hidden from customer catalogue
   inStock: boolean;
 
   // --- Seller / admin-only fields (never render these on customer screens) ---
   baseCost: number; // Meesho / supplier cost price
-  markupType: MarkupType; // 'fixed' -> +₹, 'percent' -> +%
+  markupType: MarkupType; // 'fixed' -> +₹, 'percent' -> +%, 'manual' -> direct price
   markupValue: number;
+  manualPrice?: number; // target sell price when markupType is 'manual'
   sourceUrl?: string; // supplier product link, for manual fulfilment reference
   sourceCode?: string; // supplier product/SKU code
 
   // --- Customer-facing computed field ---
-  price: number; // = computeDisplayPrice(baseCost, markupType, markupValue)
+  price: number; // = computeDisplayPrice(baseCost, markupType, markupValue, manualPrice)
   originalPrice?: number; // optional strike-through price, admin sets manually
 };
 
@@ -69,11 +72,20 @@ export type Order = {
 /** Seller ka pricing-engine: cost + margin/markup = customer ko dikhne wala price. */
 export function computeDisplayPrice(
   baseCost: number,
-  markupType: MarkupType,
-  markupValue: number,
+  markupType: MarkupType = 'fixed',
+  markupValue: number = 0,
+  manualPrice?: number,
 ): number {
+  if (markupType === 'manual') {
+    const candidate = manualPrice !== undefined ? manualPrice : markupValue;
+    const valid = Number.isFinite(candidate) && candidate >= 0 ? candidate : 0;
+    return Math.max(0, Math.round(valid));
+  }
+  const safeMarkup = Number.isFinite(markupValue) ? markupValue : 0;
   const raw =
-    markupType === 'percent' ? baseCost + (baseCost * markupValue) / 100 : baseCost + markupValue;
+    markupType === 'percent'
+      ? baseCost + (baseCost * safeMarkup) / 100
+      : baseCost + safeMarkup;
   return Math.max(0, Math.round(raw));
 }
 
@@ -97,6 +109,8 @@ export const defaultProducts: Product[] = (
       reviews: 128,
       colors: ['Clay', 'Sand'],
       isNew: true,
+      featured: true,
+      enabled: true,
       inStock: true,
       sourceUrl: 'https://www.meesho.com/s/p/terra-glow-lamp',
       sourceCode: 'MSH-LAMP-001',
@@ -117,6 +131,9 @@ export const defaultProducts: Product[] = (
       reviews: 94,
       colors: ['Sage', 'Oat'],
       sizes: ['S', 'M', 'L', 'XL'],
+      isNew: false,
+      featured: false,
+      enabled: true,
       inStock: true,
       sourceUrl: 'https://www.meesho.com/s/p/sage-everyday-overshirt',
       sourceCode: 'MSH-SHIRT-014',
@@ -137,6 +154,8 @@ export const defaultProducts: Product[] = (
       reviews: 203,
       colors: ['30 ml'],
       isNew: true,
+      featured: false,
+      enabled: true,
       inStock: true,
       sourceUrl: 'https://www.meesho.com/s/p/cloud-mist-face-serum',
       sourceCode: 'MSH-BEAUTY-088',
@@ -155,6 +174,9 @@ export const defaultProducts: Product[] = (
       rating: 4.6,
       reviews: 67,
       colors: ['Olive', 'Natural'],
+      isNew: false,
+      featured: false,
+      enabled: true,
       inStock: true,
       sourceUrl: 'https://www.meesho.com/s/p/linen-daily-carryall',
       sourceCode: 'MSH-BAG-042',
@@ -174,6 +196,9 @@ export const defaultProducts: Product[] = (
       rating: 4.8,
       reviews: 51,
       colors: ['Dune'],
+      isNew: false,
+      featured: true,
+      enabled: true,
       inStock: true,
       sourceUrl: 'https://www.meesho.com/s/p/pause-tea-set',
       sourceCode: 'MSH-HOME-233',
@@ -192,6 +217,9 @@ export const defaultProducts: Product[] = (
       rating: 4.7,
       reviews: 39,
       colors: ['Moss', 'Cream'],
+      isNew: false,
+      featured: false,
+      enabled: true,
       inStock: false,
       sourceUrl: 'https://www.meesho.com/s/p/soft-knit-throw',
       sourceCode: 'MSH-HOME-091',
@@ -201,7 +229,7 @@ export const defaultProducts: Product[] = (
   ] as Omit<Product, 'price'>[]
 ).map((product) => ({
   ...product,
-  price: computeDisplayPrice(product.baseCost, product.markupType, product.markupValue),
+  price: computeDisplayPrice(product.baseCost, product.markupType, product.markupValue, product.manualPrice),
 }));
 
 /**
@@ -226,6 +254,7 @@ export type NewProductInput = {
   baseCost: number;
   markupType: MarkupType;
   markupValue: number;
+  manualPrice?: number;
   originalPrice?: number;
   colors: string[];
   sizes?: string[];
@@ -234,6 +263,10 @@ export type NewProductInput = {
   image?: ImageSourcePropType;
   imageUrls?: string[];
   imagePublicIds?: string[];
+  inStock?: boolean;
+  enabled?: boolean;
+  featured?: boolean;
+  isNew?: boolean;
 };
 
 export const categories: { label: Category; icon: string }[] = [

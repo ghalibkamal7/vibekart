@@ -12,8 +12,31 @@ export default function ProductDetailScreen() {
   const { id } = useLocalSearchParams<{ id: string }>();
   const colors = useColors();
   const insets = useSafeAreaInsets();
-  const { products, addToCart, isFavorite, toggleFavorite } = useStore();
-  const product = products.find((item) => item.id === id) ?? products[0];
+  const { products, addToCart, isFavorite, toggleFavorite, authUser, isCloudMode } = useStore();
+  const isSeller = !isCloudMode || (authUser && !authUser.isGuest && authUser.role === 'seller');
+  const product = products.find((item) => item.id === id);
+  const isUnavailable = !product || (product.enabled === false && !isSeller);
+
+  if (isUnavailable || !product) {
+    return (
+      <View style={[styles.screen, { backgroundColor: colors.background, justifyContent: 'center', alignItems: 'center', padding: 24 }]}>
+        <Feather name="slash" size={48} color={colors.mutedForeground} />
+        <Text style={{ fontSize: 20, fontFamily: 'Inter_700Bold', color: colors.foreground, marginTop: 16 }}>
+          This pick is no longer available
+        </Text>
+        <Text style={{ fontSize: 13, fontFamily: 'Inter_400Regular', color: colors.mutedForeground, textAlign: 'center', marginTop: 8, marginBottom: 24 }}>
+          This product has been unlisted or is no longer in the catalogue.
+        </Text>
+        <Pressable
+          onPress={() => router.replace('/(tabs)')}
+          style={{ backgroundColor: colors.moss, paddingHorizontal: 20, paddingVertical: 12, borderRadius: 14 }}
+        >
+          <Text style={{ color: '#FFFFFF', fontFamily: 'Inter_700Bold', fontSize: 13 }}>Explore other picks</Text>
+        </Pressable>
+      </View>
+    );
+  }
+
   const [selected, setSelected] = useState(product.sizes?.[1] ?? product.colors[0]);
   const images = getProductImages(product);
   const [activeImage, setActiveImage] = useState(0);
@@ -53,7 +76,24 @@ export default function ProductDetailScreen() {
         <View style={styles.content}>
           <View style={styles.detailTop}>
             <View style={{ flex: 1 }}>
-              <Text style={[styles.category, { color: colors.coral }]}>{product.category.toUpperCase()}</Text>
+              <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+                <Text style={[styles.category, { color: colors.coral }]}>{product.category.toUpperCase()}</Text>
+                {product.isNew ? (
+                  <View style={{ backgroundColor: colors.moss, paddingHorizontal: 6, paddingVertical: 2, borderRadius: 6 }}>
+                    <Text style={{ color: '#FFFFFF', fontSize: 8, fontFamily: 'Inter_700Bold' }}>NEW</Text>
+                  </View>
+                ) : null}
+                {product.featured ? (
+                  <View style={{ backgroundColor: colors.coralSoft, paddingHorizontal: 6, paddingVertical: 2, borderRadius: 6 }}>
+                    <Text style={{ color: colors.coral, fontSize: 8, fontFamily: 'Inter_700Bold' }}>FEATURED</Text>
+                  </View>
+                ) : null}
+                {product.enabled === false ? (
+                  <View style={{ backgroundColor: colors.destructive, paddingHorizontal: 6, paddingVertical: 2, borderRadius: 6 }}>
+                    <Text style={{ color: '#FFFFFF', fontSize: 8, fontFamily: 'Inter_700Bold' }}>UNLISTED</Text>
+                  </View>
+                ) : null}
+              </View>
               <Text style={[styles.title, { color: colors.foreground }]}>{product.name}</Text>
               <Text style={[styles.subtitle, { color: colors.mutedForeground }]}>{product.subtitle}</Text>
             </View>
