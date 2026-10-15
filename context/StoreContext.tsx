@@ -8,6 +8,7 @@ import {
   CategoryItem,
   computeDisplayPrice,
   defaultCategoryItems,
+  defaultPaymentSettings,
   defaultProducts,
   defaultStoreSettings,
   getAssignedProductCount,
@@ -15,6 +16,7 @@ import {
   normalizeSlug,
   Order,
   OrderStatus,
+  PaymentSettings,
   Product,
   StoreSettings,
   validateCategoryName,
@@ -41,6 +43,7 @@ import {
   createProduct,
   editProduct,
   fetchAuditLogsRemote,
+  fetchPaymentSettingsRemote,
   fetchSellerProducts,
   fetchStoreSettingsRemote,
   fetchUsersRemote,
@@ -54,10 +57,13 @@ import {
   subscribeToOrders,
   subscribeToProducts,
   updateCategoryRemote,
+  updateOrderPaymentStatusRemote,
   updateOrderStatusRemote,
+  updatePaymentSettingsRemote,
   updateStoreSettingsRemote,
   updateUserRoleRemote,
   updateUserStatusRemote,
+  verifyPaymentViaWorker,
 } from '@/services/firebase/firestore';
 
 type CartLine = {
@@ -108,10 +114,21 @@ type StoreContextValue = {
     customerPhone: string;
     customerAddress: string;
     paymentMethod: 'UPI' | 'COD';
+    customerUtr?: string;
   }) => Promise<Order | null>;
+  verifyPayment: (orderId: string, paymentReference?: string, bankRrn?: string) => Promise<{
+    success: boolean;
+    verified: boolean;
+    paymentStatus: string;
+    paymentVerifiedAt?: string;
+    bankRrn?: string;
+    error?: string;
+    message?: string;
+  }>;
 
   // order fulfilment (seller side)
   updateOrderStatus: (orderId: string, status: OrderStatus) => Promise<void>;
+  updateOrderPaymentStatus: (orderId: string, status: 'Paid' | 'Failed' | 'Pending', extra?: { bankRrn?: string; customerUtr?: string }) => Promise<void>;
   setTrackingId: (orderId: string, trackingId: string) => Promise<void>;
   cancelOrder: (orderId: string) => Promise<void>;
 
@@ -133,6 +150,8 @@ type StoreContextValue = {
   isAdmin: boolean;
   storeSettings: StoreSettings;
   updateStoreSettings: (patch: Partial<StoreSettings>) => Promise<void>;
+  paymentSettings: PaymentSettings;
+  updatePaymentSettings: (patch: Partial<PaymentSettings>) => Promise<void>;
   usersList: UserProfile[];
   refreshUsers: () => Promise<void>;
   changeUserRole: (uid: string, role: UserRole) => Promise<void>;
@@ -163,6 +182,7 @@ const STORAGE_KEYS = {
   categories: 'vibekart-categories',
   auth: 'vibekart-auth',
   settings: 'vibekart-settings',
+  paymentSettings: 'vibekart-payment-settings',
   users: 'vibekart-users',
   auditLogs: 'vibekart-audit-logs',
 };
@@ -178,6 +198,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   const [authError, setAuthError] = useState<string | null>(null);
 
   const [storeSettings, setStoreSettings] = useState<StoreSettings>(defaultStoreSettings);
+  const [paymentSettings, setPaymentSettings] = useState<PaymentSettings>(defaultPaymentSettings);
   const [usersList, setUsersList] = useState<UserProfile[]>([]);
   const [auditLogs, setAuditLogs] = useState<AdminAuditLog[]>([]);
 
@@ -659,7 +680,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
 
   useEffect(() => {
     if (isCloudMode && authUser && !authUser.isGuest) {
-      const uidFilter = authUser.role === 'seller' ? undefined : authUser.uid;
+      const uidFilter = authUser.role === 'seller' || authUser.role === 'admin' ? undefined : authUser.uid;
       const unsubscribe = subscribeToOrders(setOrders, (error) => console.warn('[orders]', error.message), uidFilter);
       return unsubscribe;
     }
@@ -708,6 +729,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
           customerAddress: details.customerAddress,
           paymentMethod: details.paymentMethod,
           idempotencyKey,
+          customerUtr: details.customerUtr,
         });
         setCart([]);
         await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
@@ -731,6 +753,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         customerAddress: details.customerAddress,
         paymentMethod: details.paymentMethod,
         idempotencyKey,
+        customerUtr: details.customerUtr,
       });
       setCart([]);
       await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
@@ -739,7 +762,11 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         items: customerSafeItems,
         total,
         status: 'Placed',
-        paymentStatus: 'Selected',
+        paymentStatus: 'Pending',
+        paymentReference: `VKUPI${Date.now()}`,
+        customerUtr: details.customerUtr,
+        amountPaise: Math.round(total * 100),
+        currency: 'INR',
         date: new Date().toLocaleDateString('en-IN', { day: '2-digit', month: 'short' }),
         ...details,
       } as Order;
@@ -752,6 +779,11 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       costTotal,
       profitTotal: total - costTotal,
       status: 'Placed',
+      paymentStatus: 'Pending',
+      paymentReference: `VKUPI${Date.now()}`,
+      customerUtr: details.customerUtr,
+      amountPaise: Math.round(total * 100),
+      currency: 'INR',
       date: new Date().toLocaleDateString('en-IN', { day: '2-digit', month: 'short' }),
       customerName: details.customerName,
       customerPhone: details.customerPhone,
@@ -762,6 +794,24 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     setCart([]);
     await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
     return order;
+  };
+
+  const verifyPayment: StoreContextValue['verifyPayment'] = async (orderId, paymentReference, bankRrn) => {
+    if (isCloudMode) {
+      const res = await verifyPaymentViaWorker({ orderId, paymentReference, bankRrn });
+      if (res.verified && res.paymentStatus === 'Paid') {
+        setOrders((current) =>
+          current.map((o) => (o.id === orderId ? { ...o, paymentStatus: 'Paid', paymentVerifiedAt: res.paymentVerifiedAt, bankRrn: res.bankRrn } : o)),
+        );
+      }
+      return res;
+    }
+    return {
+      success: false,
+      verified: false,
+      paymentStatus: 'Pending',
+      message: 'Direct payment verification requires cloud mode with backend server.',
+    };
   };
 
   const updateOrderStatus: StoreContextValue['updateOrderStatus'] = async (orderId, status) => {
@@ -803,6 +853,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   useEffect(() => {
     if (isCloudMode) {
       fetchStoreSettingsRemote().then(setStoreSettings).catch(() => {});
+      fetchPaymentSettingsRemote().then(setPaymentSettings).catch(() => {});
       if (isAdmin) {
         fetchUsersRemote().then(setUsersList).catch(() => {});
         fetchAuditLogsRemote().then(setAuditLogs).catch(() => {});
@@ -810,6 +861,9 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     } else {
       AsyncStorage.getItem(STORAGE_KEYS.settings).then((saved) => {
         if (saved) setStoreSettings(JSON.parse(saved));
+      });
+      AsyncStorage.getItem(STORAGE_KEYS.paymentSettings).then((saved) => {
+        if (saved) setPaymentSettings(JSON.parse(saved));
       });
       AsyncStorage.getItem(STORAGE_KEYS.users).then((saved) => {
         if (saved) {
@@ -879,6 +933,47 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       await AsyncStorage.setItem(STORAGE_KEYS.settings, JSON.stringify(merged));
     }
     await logAdminActivity('Update Store Settings', `Updated settings: ${Object.keys(patch).join(', ')}`);
+  };
+
+  const updatePaymentSettings: StoreContextValue['updatePaymentSettings'] = async (patch) => {
+    if (!isAdmin) throw new Error('Only administrators can update payment settings.');
+    const merged = { ...paymentSettings, ...patch };
+    setPaymentSettings(merged);
+    await AsyncStorage.setItem(STORAGE_KEYS.paymentSettings, JSON.stringify(merged));
+    if (isCloudMode) {
+      await updatePaymentSettingsRemote(patch);
+    }
+    await logAdminActivity('Update Payment Settings', `Updated payment config: ${Object.keys(patch).join(', ')}`);
+  };
+
+  const updateOrderPaymentStatus: StoreContextValue['updateOrderPaymentStatus'] = async (
+    orderId,
+    paymentStatus,
+    extra,
+  ) => {
+    if (!isAdmin) throw new Error('Only administrators can verify or update order payment status.');
+    const nowIso = new Date().toISOString();
+    setOrders((current) =>
+      current.map((o) =>
+        o.id === orderId
+          ? {
+              ...o,
+              paymentStatus,
+              paymentVerifiedAt: paymentStatus === 'Paid' ? nowIso : undefined,
+              ...(extra?.bankRrn ? { bankRrn: extra.bankRrn } : {}),
+              ...(extra?.customerUtr ? { customerUtr: extra.customerUtr } : {}),
+            }
+          : o,
+      ),
+    );
+    if (isCloudMode) {
+      await updateOrderPaymentStatusRemote(orderId, paymentStatus, extra);
+    }
+    await logAdminActivity(
+      'Verify Payment',
+      `Marked order ${orderId} payment status as ${paymentStatus}${extra?.bankRrn ? ` (RRN: ${extra.bankRrn})` : ''}`,
+      orderId,
+    );
   };
 
   const logAdminActivity: StoreContextValue['logAdminActivity'] = async (action, details, targetId) => {
@@ -954,6 +1049,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       toggleFavorite,
       isFavorite: (productId: string) => favorites.includes(productId),
       placeOrder,
+      verifyPayment,
       updateOrderStatus,
       setTrackingId,
       cancelOrder,
@@ -961,6 +1057,9 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       isAdmin,
       storeSettings,
       updateStoreSettings,
+      paymentSettings,
+      updatePaymentSettings,
+      updateOrderPaymentStatus,
       usersList,
       refreshUsers,
       changeUserRole,
@@ -988,6 +1087,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       analytics,
       isAdmin,
       storeSettings,
+      paymentSettings,
       usersList,
       auditLogs,
       authUser,

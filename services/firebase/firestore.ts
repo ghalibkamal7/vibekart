@@ -18,10 +18,12 @@ import {
   AdminAuditLog,
   CategoryItem,
   computeDisplayPrice,
+  defaultPaymentSettings,
   defaultStoreSettings,
   NewProductInput,
   Order,
   OrderStatus,
+  PaymentSettings,
   Product,
   StoreSettings,
 } from '@/data/store';
@@ -34,6 +36,7 @@ const ORDERS_COLLECTION = 'orders';
 const USERS_COLLECTION = 'users';
 const SETTINGS_COLLECTION = 'settings';
 const SETTINGS_DOC_ID = 'store';
+export const PAYMENT_SETTINGS_DOC_ID = 'payment';
 const AUDIT_LOGS_COLLECTION = 'audit_logs';
 const PRIVATE_SUBCOLLECTION = 'private';
 const PRIVATE_DOC_ID = 'data';
@@ -222,6 +225,7 @@ export type NewOrderInput = {
   customerAddress: string;
   paymentMethod: 'UPI' | 'COD';
   idempotencyKey?: string;
+  customerUtr?: string;
 };
 
 export async function createOrderViaWorker(input: {
@@ -231,6 +235,7 @@ export async function createOrderViaWorker(input: {
   customerAddress: string;
   paymentMethod: 'UPI' | 'COD';
   idempotencyKey?: string;
+  customerUtr?: string;
 }): Promise<Order> {
   const workerUrl = process.env.EXPO_PUBLIC_OTP_WORKER_URL?.replace(/\/+$/, '');
   if (!workerUrl) {
@@ -257,6 +262,81 @@ export async function createOrderViaWorker(input: {
     throw new Error(resJson?.error || `Order creation failed with status ${response.status}`);
   }
   return resJson.order;
+}
+
+export async function fetchPaymentConfigViaWorker(): Promise<{
+  gpayEnabled: boolean;
+  status: 'CONFIGURED' | 'SETUP_PENDING';
+  merchantName: string;
+  merchantVpa: string | null;
+  merchantMcc: string;
+  environment: string;
+  missing?: string[];
+  message: string;
+}> {
+  const workerUrl = process.env.EXPO_PUBLIC_OTP_WORKER_URL?.replace(/\/+$/, '');
+  if (!workerUrl) {
+    return {
+      gpayEnabled: false,
+      status: 'SETUP_PENDING',
+      merchantName: 'VibeKart',
+      merchantVpa: null,
+      merchantMcc: '5399',
+      environment: 'TEST',
+      missing: ['EXPO_PUBLIC_OTP_WORKER_URL'],
+      message: 'Payment worker URL is not configured.',
+    };
+  }
+  try {
+    const response = await fetch(`${workerUrl}/payment/config`);
+    if (!response.ok) {
+      throw new Error(`Failed to load payment config (${response.status})`);
+    }
+    return await response.json();
+  } catch (err: any) {
+    return {
+      gpayEnabled: false,
+      status: 'SETUP_PENDING',
+      merchantName: 'VibeKart',
+      merchantVpa: null,
+      merchantMcc: '5399',
+      environment: 'TEST',
+      message: err?.message || 'Payment service unreachable.',
+    };
+  }
+}
+
+export async function verifyPaymentViaWorker(input: {
+  orderId: string;
+  paymentReference?: string;
+  bankRrn?: string;
+}): Promise<{
+  success: boolean;
+  verified: boolean;
+  paymentStatus: string;
+  paymentVerifiedAt?: string;
+  bankRrn?: string;
+  error?: string;
+  message?: string;
+}> {
+  const workerUrl = process.env.EXPO_PUBLIC_OTP_WORKER_URL?.replace(/\/+$/, '');
+  if (!workerUrl) {
+    throw new Error('EXPO_PUBLIC_OTP_WORKER_URL is not configured.');
+  }
+  const currentUser = auth?.currentUser;
+  if (!currentUser) {
+    throw new Error('You must be signed in to verify payment.');
+  }
+  const idToken = await currentUser.getIdToken();
+  const response = await fetch(`${workerUrl}/payment/verify`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${idToken}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(input),
+  });
+  return response.json();
 }
 
 export async function fetchSellerOrderPrivateData(orderId: string): Promise<{
@@ -293,13 +373,18 @@ export function subscribeToOrders(
 
 export async function createOrder(input: NewOrderInput): Promise<string> {
   const database = requireDb();
+  const paymentReference = `VKUPI${Date.now()}${Math.random().toString(36).substring(2, 10).toUpperCase()}`;
   const docRef = await addDoc(collection(database, ORDERS_COLLECTION), {
     customerUid: input.customerUid,
     customerName: input.customerName,
     customerPhone: input.customerPhone,
     customerAddress: input.customerAddress,
     paymentMethod: input.paymentMethod,
-    paymentStatus: 'Selected',
+    paymentStatus: 'Pending',
+    paymentReference,
+    ...(input.customerUtr ? { customerUtr: input.customerUtr } : {}),
+    amountPaise: Math.round(input.total * 100),
+    currency: 'INR',
     status: 'Placed' as OrderStatus,
     items: input.items.map((it) => ({
       productId: it.productId,
@@ -476,6 +561,56 @@ export async function updateStoreSettingsRemote(settings: Partial<StoreSettings>
     },
     { merge: true },
   );
+}
+
+// ---------------- Admin: Payment Settings ----------------
+
+export async function fetchPaymentSettingsRemote(): Promise<PaymentSettings> {
+  const database = requireDb();
+  try {
+    const snap = await getDoc(doc(database, SETTINGS_COLLECTION, PAYMENT_SETTINGS_DOC_ID));
+    if (snap.exists()) {
+      const data = snap.data();
+      const rawUpdated = data.updatedAt;
+      const updatedAtStr =
+        rawUpdated && typeof rawUpdated === 'object' && 'toDate' in rawUpdated && typeof rawUpdated.toDate === 'function'
+          ? rawUpdated.toDate().toISOString()
+          : typeof rawUpdated === 'string'
+          ? rawUpdated
+          : undefined;
+      return { ...defaultPaymentSettings, ...data, updatedAt: updatedAtStr } as PaymentSettings;
+    }
+  } catch (err) {
+    console.warn('[firestore] fetchPaymentSettingsRemote fallback to default', err);
+  }
+  return defaultPaymentSettings;
+}
+
+export async function updatePaymentSettingsRemote(settings: Partial<PaymentSettings>): Promise<void> {
+  const database = requireDb();
+  await setDoc(
+    doc(database, SETTINGS_COLLECTION, PAYMENT_SETTINGS_DOC_ID),
+    {
+      ...settings,
+      updatedAt: serverTimestamp(),
+    },
+    { merge: true },
+  );
+}
+
+export async function updateOrderPaymentStatusRemote(
+  orderId: string,
+  paymentStatus: 'Paid' | 'Failed' | 'Pending',
+  extra?: { bankRrn?: string; customerUtr?: string },
+): Promise<void> {
+  const database = requireDb();
+  const patch: Record<string, unknown> = {
+    paymentStatus,
+    paymentVerifiedAt: paymentStatus === 'Paid' ? serverTimestamp() : null,
+  };
+  if (extra?.bankRrn !== undefined) patch.bankRrn = extra.bankRrn;
+  if (extra?.customerUtr !== undefined) patch.customerUtr = extra.customerUtr;
+  await updateDoc(doc(database, ORDERS_COLLECTION, orderId), patch);
 }
 
 // ---------------- Admin: Audit Logs ----------------

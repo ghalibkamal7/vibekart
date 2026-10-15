@@ -175,7 +175,14 @@ export type Order = {
   customerPhone: string;
   customerAddress: string;
   paymentMethod: 'UPI' | 'COD';
-  paymentStatus?: 'Selected' | 'Pending' | 'Paid';
+  paymentStatus?: 'Selected' | 'Pending' | 'Paid' | 'Failed';
+  paymentReference?: string; // UPI transaction reference ID (max 35 chars)
+  customerUtr?: string; // 12-digit customer submitted UPI reference / UTR
+  amountPaise?: number; // Total in paise (₹ * 100)
+  currency?: string; // 'INR'
+  paymentInitiatedAt?: string;
+  paymentVerifiedAt?: string;
+  bankRrn?: string; // Bank Retrieval Reference Number from settlement
   trackingId?: string;
   costReconciled?: boolean;
 };
@@ -419,3 +426,41 @@ export type AdminAuditLog = {
   targetId?: string;
   details: string;
 };
+
+export type PaymentSettings = {
+  merchantName: string;
+  merchantVpa: string;
+  qrImageUrl?: string;
+  qrImagePublicId?: string;
+  instructions: string;
+  enabled: boolean;
+  autoGenerateQr: boolean;
+  updatedAt?: string;
+};
+
+export const defaultPaymentSettings: PaymentSettings = {
+  merchantName: 'VibeKart',
+  merchantVpa: '',
+  qrImageUrl: '',
+  qrImagePublicId: '',
+  instructions: 'Scan the QR code with Google Pay, PhonePe, Paytm, or any UPI app. After payment, enter your 12-digit UPI Reference Number / UTR below.',
+  enabled: false,
+  autoGenerateQr: true,
+};
+
+export function buildUpiUri(vpa: string, merchantName: string, amount?: number): string {
+  const cleanVpa = vpa.trim();
+  if (!cleanVpa) return '';
+  const cleanName = merchantName.trim() || 'Merchant';
+  let uri = `upi://pay?pa=${encodeURIComponent(cleanVpa)}&pn=${encodeURIComponent(cleanName)}&cu=INR`;
+  if (amount && Number.isFinite(amount) && amount > 0) {
+    uri += `&am=${amount.toFixed(2)}`;
+  }
+  return uri;
+}
+
+export function buildUpiQrUrl(vpa: string, merchantName: string, amount?: number): string {
+  const upiUri = buildUpiUri(vpa, merchantName, amount);
+  if (!upiUri) return '';
+  return `https://api.qrserver.com/v1/create-qr-code/?size=300x300&margin=10&data=${encodeURIComponent(upiUri)}`;
+}

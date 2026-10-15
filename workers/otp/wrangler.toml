@@ -16,7 +16,14 @@ id = "629e174b698047339ed0ee471691c973"
 # paste its id below.
 [vars]
 MSG91_TEMPLATE_ID = "REPLACE_WITH_YOUR_MSG91_TEMPLATE_ID"
+MERCHANT_NAME = "VibeKart"
+MERCHANT_MCC = "5399"
+GPAY_ENV = "TEST"
 
-# MSG91_AUTH_KEY and FIREBASE_SERVICE_ACCOUNT_JSON are set as Worker
-# secrets (`wrangler secret put ...`), never written here — see
-# workers/otp/README.md.
+# Secrets required for production:
+# - MSG91_AUTH_KEY (`wrangler secret put MSG91_AUTH_KEY`)
+# - FIREBASE_SERVICE_ACCOUNT_JSON (`wrangler secret put FIREBASE_SERVICE_ACCOUNT_JSON`)
+# - MERCHANT_VPA (`wrangler secret put MERCHANT_VPA`) - Registered merchant UPI VPA
+# - BANK_PSP_API_URL (`wrangler secret put BANK_PSP_API_URL`) - Bank UPI status inquiry endpoint
+# - BANK_PSP_API_KEY (`wrangler secret put BANK_PSP_API_KEY`) - Bank authorization token
+# - BANK_PSP_MERCHANT_ID (`wrangler secret put BANK_PSP_MERCHANT_ID`) - Acquiring bank merchant ID

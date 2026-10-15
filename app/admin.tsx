@@ -1,9 +1,11 @@
 import { Feather } from '@expo/vector-icons';
+import * as ImagePicker from 'expo-image-picker';
 import { router } from 'expo-router';
 import React, { useMemo, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
+  Image,
   Linking,
   Platform,
   Pressable,
@@ -17,15 +19,19 @@ import {
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import {
   ALLOWED_STATUS_TRANSITIONS,
+  buildUpiQrUrl,
+  buildUpiUri,
   canCancelOrder,
   canTransitionOrderStatus,
   CategoryItem,
+  defaultPaymentSettings,
   formatPrice,
   getAssignedProductCount,
   getCategoryDisplayName,
   normalizeSlug,
   Order,
   OrderStatus,
+  PaymentSettings,
   Product,
   StoreSettings,
   validateCategoryName,
@@ -33,8 +39,9 @@ import {
 import { useColors } from '@/hooks/useColors';
 import { useStore } from '@/context/StoreContext';
 import { fetchSellerOrderPrivateData } from '@/services/firebase/firestore';
+import { uploadImageToCloudinary } from '@/services/cloudinary/upload';
 
-type AdminTab = 'dashboard' | 'products' | 'categories' | 'orders' | 'users' | 'settings';
+type AdminTab = 'dashboard' | 'products' | 'categories' | 'orders' | 'users' | 'payments' | 'settings';
 
 export default function AdminScreen() {
   const colors = useColors();
@@ -55,6 +62,7 @@ export default function AdminScreen() {
     deleteCategory,
     toggleCategoryEnabled,
     updateOrderStatus,
+    updateOrderPaymentStatus,
     setTrackingId,
     cancelOrder,
     usersList,
@@ -62,6 +70,8 @@ export default function AdminScreen() {
     changeUserStatus,
     storeSettings,
     updateStoreSettings,
+    paymentSettings,
+    updatePaymentSettings,
     auditLogs,
     logAdminActivity,
   } = useStore();
@@ -91,15 +101,26 @@ export default function AdminScreen() {
   const [userSearch, setUserSearch] = useState('');
   const [userRoleFilter, setUserRoleFilter] = useState<'All' | 'customer' | 'seller' | 'admin'>('All');
 
-  // Settings Tab State
+  // Store Settings Tab State
   const [settingsForm, setSettingsForm] = useState<StoreSettings>(storeSettings);
   const [savingSettings, setSavingSettings] = useState(false);
   const [settingsSuccess, setSettingsSuccess] = useState(false);
+
+  // Payment Settings Tab State
+  const [paymentForm, setPaymentForm] = useState<PaymentSettings>(paymentSettings);
+  const [savingPayment, setSavingPayment] = useState(false);
+  const [paymentSuccess, setPaymentSuccess] = useState(false);
+  const [uploadingQr, setUploadingQr] = useState(false);
 
   // Sync settingsForm when storeSettings changes
   React.useEffect(() => {
     setSettingsForm(storeSettings);
   }, [storeSettings]);
+
+  // Sync paymentForm when paymentSettings changes
+  React.useEffect(() => {
+    setPaymentForm(paymentSettings);
+  }, [paymentSettings]);
 
   // Load private order data on order expand
   const handleToggleExpandOrder = async (orderId: string) => {
@@ -305,6 +326,56 @@ export default function AdminScreen() {
     }
   };
 
+  // Handle Save Payment Settings
+  const handleSavePaymentSettings = async () => {
+    setSavingPayment(true);
+    setPaymentSuccess(false);
+    try {
+      await updatePaymentSettings(paymentForm);
+      setPaymentSuccess(true);
+      setTimeout(() => setPaymentSuccess(false), 3000);
+    } catch (err: any) {
+      Alert.alert('Error', err?.message || 'Failed to save payment settings.');
+    } finally {
+      setSavingPayment(false);
+    }
+  };
+
+  // Handle Pick and Upload QR image via Cloudinary
+  const handlePickQrImage = async () => {
+    try {
+      const res = await ImagePicker.launchImageLibraryAsync({
+        mediaTypes: ImagePicker.MediaTypeOptions.Images,
+        allowsEditing: true,
+        aspect: [1, 1],
+        quality: 0.85,
+      });
+      if (!res.canceled && res.assets?.[0]?.uri) {
+        setUploadingQr(true);
+        const uploadResult = await uploadImageToCloudinary(res.assets[0].uri, 'vibekart/payment');
+        setPaymentForm((prev) => ({
+          ...prev,
+          qrImageUrl: uploadResult.url,
+          qrImagePublicId: uploadResult.publicId,
+        }));
+      }
+    } catch (err: any) {
+      Alert.alert('Upload Failed', err?.message || 'Could not upload QR image to Cloudinary.');
+    } finally {
+      setUploadingQr(false);
+    }
+  };
+
+  // Handle manual order payment verification by admin
+  const handleVerifyOrderPayment = async (orderId: string, status: 'Paid' | 'Failed' | 'Pending') => {
+    try {
+      await updateOrderPaymentStatus(orderId, status);
+      Alert.alert('Payment Status Updated', `Order payment marked as "${status}".`);
+    } catch (err: any) {
+      Alert.alert('Error', err?.message || 'Failed to update order payment status.');
+    }
+  };
+
   return (
     <View style={[styles.screen, { backgroundColor: colors.background }]}>
       {/* ---------------- Top App Header ---------------- */}
@@ -345,6 +416,7 @@ export default function AdminScreen() {
               { key: 'categories', label: `Categories (${categories.length})`, icon: 'tag' },
               { key: 'orders', label: `Orders (${orders.length})`, icon: 'shopping-bag' },
               { key: 'users', label: `Users & Sellers (${usersList.length})`, icon: 'users' },
+              { key: 'payments', label: 'Payment Settings', icon: 'credit-card' },
               { key: 'settings', label: 'Store Settings', icon: 'settings' },
             ] as const
           ).map((tab) => {
@@ -887,6 +959,102 @@ export default function AdminScreen() {
                           </View>
                         </View>
 
+                        {/* Payment Details & Verification Section */}
+                        <View style={[styles.paymentAuditBox, { backgroundColor: colors.background, borderColor: colors.border }]}>
+                          <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}>
+                            <Text style={[styles.detailHeading, { color: colors.foreground }]}>Payment Verification</Text>
+                            <View
+                              style={[
+                                styles.paymentBadge,
+                                {
+                                  backgroundColor:
+                                    order.paymentStatus === 'Paid'
+                                      ? colors.mossSoft
+                                      : order.paymentStatus === 'Failed'
+                                      ? colors.coralSoft
+                                      : '#FFF8E1',
+                                },
+                              ]}
+                            >
+                              <Text
+                                style={[
+                                  styles.paymentBadgeText,
+                                  {
+                                    color:
+                                      order.paymentStatus === 'Paid'
+                                        ? colors.moss
+                                        : order.paymentStatus === 'Failed'
+                                        ? colors.coral
+                                        : '#D97706',
+                                  },
+                                ]}
+                              >
+                                {order.paymentStatus === 'Paid'
+                                  ? 'Paid (Verified)'
+                                  : order.paymentStatus === 'Failed'
+                                  ? 'Payment Failed'
+                                  : 'Pending Verification'}
+                              </Text>
+                            </View>
+                          </View>
+
+                          <View style={{ marginTop: 6, gap: 2 }}>
+                            <Text style={[styles.detailText, { color: colors.mutedForeground }]}>
+                              Method: {order.paymentMethod}
+                            </Text>
+                            {order.paymentReference ? (
+                              <Text style={[styles.detailText, { color: colors.mutedForeground }]}>
+                                System UPI Ref: {order.paymentReference}
+                              </Text>
+                            ) : null}
+                            {order.customerUtr ? (
+                              <Text style={[styles.detailText, { color: colors.foreground, fontFamily: 'Inter_600SemiBold' }]}>
+                                Customer Submitted UTR: {order.customerUtr}
+                              </Text>
+                            ) : (
+                              <Text style={[styles.detailText, { color: colors.mutedForeground, fontStyle: 'italic' }]}>
+                                Customer UTR: None submitted
+                              </Text>
+                            )}
+                            {order.bankRrn ? (
+                              <Text style={[styles.detailText, { color: colors.moss }]}>
+                                Bank Settlement RRN: {order.bankRrn}
+                              </Text>
+                            ) : null}
+                          </View>
+
+                          {/* Verification Actions */}
+                          <View style={{ flexDirection: 'row', gap: 8, marginTop: 10, flexWrap: 'wrap' }}>
+                            {order.paymentStatus !== 'Paid' && (
+                              <Pressable
+                                onPress={() => handleVerifyOrderPayment(order.id, 'Paid')}
+                                style={[styles.smallVerifyBtn, { backgroundColor: colors.moss }]}
+                              >
+                                <Feather name="check-circle" size={12} color="#FFFFFF" />
+                                <Text style={styles.smallVerifyBtnText}>Mark as Paid</Text>
+                              </Pressable>
+                            )}
+                            {order.paymentStatus !== 'Failed' && (
+                              <Pressable
+                                onPress={() => handleVerifyOrderPayment(order.id, 'Failed')}
+                                style={[styles.smallVerifyBtn, { backgroundColor: '#EF4444' }]}
+                              >
+                                <Feather name="x-circle" size={12} color="#FFFFFF" />
+                                <Text style={styles.smallVerifyBtnText}>Mark as Failed</Text>
+                              </Pressable>
+                            )}
+                            {order.paymentStatus !== 'Pending' && (
+                              <Pressable
+                                onPress={() => handleVerifyOrderPayment(order.id, 'Pending')}
+                                style={[styles.smallVerifyBtn, { backgroundColor: '#F59E0B' }]}
+                              >
+                                <Feather name="rotate-ccw" size={12} color="#FFFFFF" />
+                                <Text style={styles.smallVerifyBtnText}>Reset to Pending</Text>
+                              </Pressable>
+                            )}
+                          </View>
+                        </View>
+
                         {/* Tracking Input */}
                         <View style={styles.trackingRow}>
                           <TextInput
@@ -1118,7 +1286,197 @@ export default function AdminScreen() {
           </View>
         )}
 
-        {/* ==================== 6. SETTINGS TAB ==================== */}
+        {/* ==================== 6. PAYMENT SETTINGS TAB ==================== */}
+        {activeTab === 'payments' && (
+          <View>
+            <Text style={[styles.sectionHeading, { color: colors.foreground }]}>UPI & Google Pay Settings</Text>
+            <Text style={[styles.sectionSub, { color: colors.mutedForeground }]}>
+              Configure your store's UPI VPA, QR code, and customer payment instructions for self-service checkout.
+            </Text>
+
+            <View style={[styles.settingsCard, { backgroundColor: colors.card, borderColor: colors.border }]}>
+              {/* Enable / Disable Manual UPI */}
+              <View style={[styles.switchRow, { borderTopWidth: 0, paddingTop: 0 }]}>
+                <View style={{ flex: 1, paddingRight: 12 }}>
+                  <Text style={[styles.switchTitle, { color: colors.foreground }]}>Enable UPI Payments</Text>
+                  <Text style={[styles.switchSub, { color: colors.mutedForeground }]}>
+                    When active, customers can pay using Google Pay, PhonePe, or any UPI app at checkout.
+                  </Text>
+                </View>
+                <Switch
+                  value={paymentForm.enabled}
+                  onValueChange={(v) => setPaymentForm((prev) => ({ ...prev, enabled: v }))}
+                  trackColor={{ false: colors.border, true: colors.moss }}
+                  thumbColor="#FFFFFF"
+                />
+              </View>
+
+              {/* Merchant Display Name */}
+              <Text style={[styles.settingLabel, { color: colors.foreground, marginTop: 16 }]}>
+                Merchant / Business Display Name
+              </Text>
+              <TextInput
+                value={paymentForm.merchantName}
+                onChangeText={(t) => setPaymentForm((prev) => ({ ...prev, merchantName: t }))}
+                placeholder="e.g. VibeKart Official"
+                placeholderTextColor={colors.mutedForeground}
+                style={[
+                  styles.settingInput,
+                  { backgroundColor: colors.background, borderColor: colors.border, color: colors.foreground },
+                ]}
+              />
+
+              {/* Merchant UPI ID (VPA) */}
+              <Text style={[styles.settingLabel, { color: colors.foreground, marginTop: 14 }]}>
+                Merchant UPI ID (VPA)
+              </Text>
+              <TextInput
+                value={paymentForm.merchantVpa}
+                onChangeText={(t) => setPaymentForm((prev) => ({ ...prev, merchantVpa: t.trim().toLowerCase() }))}
+                placeholder="e.g. merchant@icici or store@upi"
+                placeholderTextColor={colors.mutedForeground}
+                autoCapitalize="none"
+                style={[
+                  styles.settingInput,
+                  { backgroundColor: colors.background, borderColor: colors.border, color: colors.foreground },
+                ]}
+              />
+
+              {/* Auto-generate UPI QR toggle */}
+              <View style={[styles.switchRow, { marginTop: 16 }]}>
+                <View style={{ flex: 1, paddingRight: 12 }}>
+                  <Text style={[styles.switchTitle, { color: colors.foreground }]}>Auto-Generate UPI QR Code</Text>
+                  <Text style={[styles.switchSub, { color: colors.mutedForeground }]}>
+                    Automatically create a standard UPI payment QR from your VPA and Merchant Name.
+                  </Text>
+                </View>
+                <Switch
+                  value={paymentForm.autoGenerateQr}
+                  onValueChange={(v) => setPaymentForm((prev) => ({ ...prev, autoGenerateQr: v }))}
+                  trackColor={{ false: colors.border, true: colors.moss }}
+                  thumbColor="#FFFFFF"
+                />
+              </View>
+
+              {/* Custom QR Upload via Cloudinary */}
+              <Text style={[styles.settingLabel, { color: colors.foreground, marginTop: 16 }]}>
+                Custom Merchant QR Code Image (Cloudinary)
+              </Text>
+              <Text style={[styles.switchSub, { color: colors.mutedForeground, marginTop: 2, marginBottom: 8 }]}>
+                Upload your official QR code image provided by Google Pay for Business, PhonePe, or your bank.
+              </Text>
+
+              {paymentForm.qrImageUrl ? (
+                <View style={[styles.qrPreviewBox, { borderColor: colors.border, backgroundColor: colors.background }]}>
+                  <Image source={{ uri: paymentForm.qrImageUrl }} style={styles.qrImage} resizeMode="contain" />
+                  <View style={{ flex: 1, gap: 6 }}>
+                    <Text style={[styles.qrTitle, { color: colors.foreground }]}>Custom QR Active</Text>
+                    <Text style={[styles.qrSub, { color: colors.mutedForeground }]}>
+                      This image will be displayed to customers during checkout.
+                    </Text>
+                    <Pressable
+                      onPress={() => setPaymentForm((prev) => ({ ...prev, qrImageUrl: '', qrImagePublicId: '' }))}
+                      style={[styles.smallDangerBtn, { borderColor: colors.destructive }]}
+                    >
+                      <Feather name="trash-2" size={13} color={colors.destructive} />
+                      <Text style={[styles.smallDangerBtnText, { color: colors.destructive }]}>Remove Image</Text>
+                    </Pressable>
+                  </View>
+                </View>
+              ) : (
+                <Pressable
+                  disabled={uploadingQr}
+                  onPress={handlePickQrImage}
+                  style={[styles.uploadQrBtn, { backgroundColor: colors.background, borderColor: colors.border }]}
+                >
+                  {uploadingQr ? (
+                    <ActivityIndicator size="small" color={colors.coral} />
+                  ) : (
+                    <>
+                      <Feather name="upload-cloud" size={20} color={colors.coral} />
+                      <Text style={[styles.uploadQrBtnText, { color: colors.coral }]}>Upload Custom QR Code</Text>
+                    </>
+                  )}
+                </Pressable>
+              )}
+
+              {/* Dynamic QR Preview if autoGenerateQr or VPA is present */}
+              {paymentForm.autoGenerateQr && paymentForm.merchantVpa ? (
+                <View style={[styles.generatedQrBox, { backgroundColor: colors.background, borderColor: colors.border }]}>
+                  <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6, marginBottom: 8 }}>
+                    <Feather name="smartphone" size={14} color={colors.moss} />
+                    <Text style={[styles.qrTitle, { color: colors.foreground }]}>Standard UPI QR Preview</Text>
+                  </View>
+                  <View style={{ alignItems: 'center', paddingVertical: 10 }}>
+                    <Image
+                      source={{ uri: buildUpiQrUrl(paymentForm.merchantVpa, paymentForm.merchantName) }}
+                      style={{ width: 160, height: 160, borderRadius: 10 }}
+                      resizeMode="contain"
+                    />
+                    <Text style={[styles.qrSub, { color: colors.mutedForeground, marginTop: 8, textAlign: 'center' }]}>
+                      URI: {buildUpiUri(paymentForm.merchantVpa, paymentForm.merchantName)}
+                    </Text>
+                  </View>
+                  <View style={[styles.disclaimerBox, { backgroundColor: '#FFFBEB', borderColor: '#F59E0B' }]}>
+                    <Feather name="alert-circle" size={13} color="#D97706" />
+                    <Text style={[styles.disclaimerText, { color: '#92400E' }]}>
+                      Visual Payment Prompt: Generating or displaying a UPI QR code does not verify transaction completion or imply merchant verification by Google Pay or your bank. Payments must be verified manually by the admin.
+                    </Text>
+                  </View>
+                </View>
+              ) : null}
+
+              {/* Payment Instructions */}
+              <Text style={[styles.settingLabel, { color: colors.foreground, marginTop: 16 }]}>
+                Customer Payment Instructions
+              </Text>
+              <TextInput
+                value={paymentForm.instructions}
+                onChangeText={(t) => setPaymentForm((prev) => ({ ...prev, instructions: t }))}
+                multiline
+                numberOfLines={3}
+                placeholder="Enter step-by-step instructions for customers..."
+                placeholderTextColor={colors.mutedForeground}
+                style={[
+                  styles.settingInput,
+                  {
+                    minHeight: 74,
+                    textAlignVertical: 'top',
+                    backgroundColor: colors.background,
+                    borderColor: colors.border,
+                    color: colors.foreground,
+                  },
+                ]}
+              />
+
+              {/* Success Notification */}
+              {paymentSuccess && (
+                <View style={styles.successNote}>
+                  <Feather name="check-circle" size={15} color={colors.moss} />
+                  <Text style={[styles.successNoteText, { color: colors.moss }]}>Payment settings saved successfully!</Text>
+                </View>
+              )}
+
+              {/* Save Button */}
+              <Pressable
+                disabled={savingPayment}
+                onPress={handleSavePaymentSettings}
+                style={[styles.saveBtn, { backgroundColor: colors.moss, marginTop: 18 }]}
+              >
+                {savingPayment ? (
+                  <ActivityIndicator color="#FFFFFF" size="small" />
+                ) : (
+                  <>
+                    <Feather name="save" size={16} color="#FFFFFF" />
+                    <Text style={styles.saveBtnText}>Save Payment Settings</Text>
+                  </>
+                )}
+              </Pressable>
+            </View>
+          </View>
+        )}
+
+        {/* ==================== 7. SETTINGS TAB ==================== */}
         {activeTab === 'settings' && (
           <View>
             <Text style={[styles.sectionHeading, { color: colors.foreground }]}>Store & Homepage Settings</Text>
@@ -1374,6 +1732,23 @@ const styles = StyleSheet.create({
   successNoteText: { fontSize: 12, fontFamily: 'Inter_600SemiBold' },
   saveBtn: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8, height: 46, borderRadius: 14 },
   saveBtnText: { color: '#FFFFFF', fontSize: 13, fontFamily: 'Inter_700Bold' },
+
+  paymentAuditBox: { padding: 12, borderRadius: 12, borderWidth: 1, marginTop: 10 },
+  paymentBadge: { paddingHorizontal: 7, paddingVertical: 3, borderRadius: 6 },
+  paymentBadgeText: { fontSize: 10, fontFamily: 'Inter_700Bold' },
+  smallVerifyBtn: { flexDirection: 'row', alignItems: 'center', gap: 5, paddingHorizontal: 10, paddingVertical: 6, borderRadius: 8 },
+  smallVerifyBtnText: { color: '#FFFFFF', fontSize: 11, fontFamily: 'Inter_700Bold' },
+  qrPreviewBox: { flexDirection: 'row', alignItems: 'center', gap: 12, padding: 12, borderRadius: 12, borderWidth: 1, marginTop: 8 },
+  qrImage: { width: 90, height: 90, borderRadius: 8 },
+  qrTitle: { fontSize: 13, fontFamily: 'Inter_700Bold' },
+  qrSub: { fontSize: 11, fontFamily: 'Inter_400Regular' },
+  smallDangerBtn: { flexDirection: 'row', alignItems: 'center', gap: 4, paddingHorizontal: 8, paddingVertical: 5, borderRadius: 6, borderWidth: 1, alignSelf: 'flex-start', marginTop: 4 },
+  smallDangerBtnText: { fontSize: 10, fontFamily: 'Inter_700Bold' },
+  uploadQrBtn: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8, height: 50, borderRadius: 12, borderWidth: 1, borderStyle: 'dashed', marginTop: 8 },
+  uploadQrBtnText: { fontSize: 12, fontFamily: 'Inter_700Bold' },
+  generatedQrBox: { padding: 12, borderRadius: 12, borderWidth: 1, marginTop: 14 },
+  disclaimerBox: { flexDirection: 'row', alignItems: 'flex-start', gap: 6, padding: 10, borderRadius: 8, borderWidth: 1, marginTop: 10 },
+  disclaimerText: { flex: 1, fontSize: 10, fontFamily: 'Inter_400Regular', lineHeight: 14 },
 
   emptyBox: { alignItems: 'center', justifyContent: 'center', padding: 32, borderRadius: 16, borderWidth: 1, borderStyle: 'dashed', gap: 8, marginVertical: 12 },
   emptyText: { fontSize: 13, fontFamily: 'Inter_500Medium' },

@@ -1,5 +1,13 @@
 import { corsHeaders, isAllowedOrigin, jsonResponse } from './cors';
-import { createUserProfileDoc, getProductDoc, getProductPrivateDoc, saveOrderTwoDoc, userProfileExists } from './firestore';
+import {
+  createUserProfileDoc,
+  getOrderDoc,
+  getProductDoc,
+  getProductPrivateDoc,
+  saveOrderTwoDoc,
+  updateOrderPaymentDoc,
+  userProfileExists,
+} from './firestore';
 import { createFirebaseCustomToken, createUserWithPhone, findUserByPhone, getGoogleAccessToken, parseServiceAccount, verifyFirebaseIdToken } from './google';
 import { sendOtpSms } from './msg91';
 import {
@@ -25,6 +33,15 @@ export interface Env {
   /** Cloudflare Worker secret — the full Firebase service-account JSON, as
    * one string. Set with `wrangler secret put FIREBASE_SERVICE_ACCOUNT_JSON`. */
   FIREBASE_SERVICE_ACCOUNT_JSON: string;
+
+  // Direct Google Pay India UPI & Acquiring Bank Configuration (optional until onboarding)
+  MERCHANT_NAME?: string;
+  MERCHANT_VPA?: string;
+  MERCHANT_MCC?: string;
+  GPAY_ENV?: string; // 'TEST' | 'PRODUCTION'
+  BANK_PSP_API_URL?: string;
+  BANK_PSP_API_KEY?: string;
+  BANK_PSP_MERCHANT_ID?: string;
 }
 
 async function handleSendOtp(request: Request, env: Env, origin: string | null): Promise<Response> {
@@ -160,6 +177,7 @@ async function handleCreateOrder(request: Request, env: Env, origin: string | nu
     customerAddress?: string;
     paymentMethod?: string;
     idempotencyKey?: string;
+    customerUtr?: string;
   } | null;
 
   if (!body || !Array.isArray(body.items) || body.items.length === 0) {
@@ -170,6 +188,7 @@ async function handleCreateOrder(request: Request, env: Env, origin: string | nu
   const customerPhone = String(body.customerPhone || '').trim();
   const customerAddress = String(body.customerAddress || '').trim();
   const paymentMethod = String(body.paymentMethod || '').trim();
+  const customerUtr = body.customerUtr ? String(body.customerUtr).trim().slice(0, 100) : undefined;
 
   // COD is no longer accepted — online payment only
   if (paymentMethod !== 'UPI') {
@@ -263,6 +282,8 @@ async function handleCreateOrder(request: Request, env: Env, origin: string | nu
 
   const profitTotal = total - costTotal;
   const orderId = `ord-${Date.now().toString().slice(-6)}-${crypto.randomUUID().slice(0, 6)}`;
+  // Alphanumeric UPI transaction reference (max 35 chars): e.g. VKUPI1729000000000ABCDEF12
+  const paymentReference = `VKUPI${Date.now()}${crypto.randomUUID().replace(/-/g, '').slice(0, 8).toUpperCase()}`;
   const nowIso = new Date().toISOString();
 
   const publicOrderDoc = {
@@ -272,7 +293,12 @@ async function handleCreateOrder(request: Request, env: Env, origin: string | nu
     customerPhone,
     customerAddress,
     paymentMethod,
-    paymentStatus: 'Selected',
+    paymentStatus: 'Pending',
+    paymentReference,
+    ...(customerUtr ? { customerUtr } : {}),
+    amountPaise: Math.round(total * 100),
+    currency: 'INR',
+    paymentInitiatedAt: nowIso,
     status: 'Placed',
     items: publicItems,
     total,
@@ -303,6 +329,166 @@ async function handleCreateOrder(request: Request, env: Env, origin: string | nu
   return jsonResponse({ success: true, order: publicOrderDoc }, 201, origin);
 }
 
+async function handlePaymentConfig(request: Request, env: Env, origin: string | null): Promise<Response> {
+  const isMerchantConfigured = Boolean(env.MERCHANT_VPA && env.MERCHANT_NAME);
+  const isBankConfigured = Boolean(env.BANK_PSP_API_URL);
+
+  const missing: string[] = [];
+  if (!env.MERCHANT_VPA) missing.push('MERCHANT_VPA');
+  if (!env.MERCHANT_NAME) missing.push('MERCHANT_NAME');
+  if (!env.BANK_PSP_API_URL) missing.push('BANK_PSP_API_URL');
+
+  return jsonResponse({
+    gpayEnabled: isMerchantConfigured && isBankConfigured,
+    status: (isMerchantConfigured && isBankConfigured) ? 'CONFIGURED' : 'SETUP_PENDING',
+    merchantName: env.MERCHANT_NAME || 'VibeKart',
+    merchantVpa: env.MERCHANT_VPA || null,
+    merchantMcc: env.MERCHANT_MCC || '5399',
+    environment: env.GPAY_ENV || 'TEST',
+    missing: missing.length > 0 ? missing : undefined,
+    message: (isMerchantConfigured && isBankConfigured)
+      ? 'Payment gateway configured.'
+      : 'Direct Google Pay India UPI setup is pending merchant onboarding and bank PSP verification credentials.',
+  }, 200, origin);
+}
+
+async function handlePaymentVerify(request: Request, env: Env, origin: string | null): Promise<Response> {
+  const authHeader = request.headers.get('Authorization');
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return jsonResponse({ error: 'Missing or invalid Authorization header.' }, 401, origin);
+  }
+  const idToken = authHeader.slice(7).trim();
+  if (!idToken) {
+    return jsonResponse({ error: 'Authentication token required.' }, 401, origin);
+  }
+
+  let sa;
+  try {
+    sa = parseServiceAccount(env.FIREBASE_SERVICE_ACCOUNT_JSON);
+  } catch {
+    return jsonResponse({ error: 'Server authentication configuration is missing.' }, 503, origin);
+  }
+
+  const accessToken = await getGoogleAccessToken(sa);
+  const user = await verifyFirebaseIdToken(sa, accessToken, idToken);
+  if (!user) {
+    return jsonResponse({ error: 'Invalid or expired authentication token.' }, 401, origin);
+  }
+
+  const body = (await request.json().catch(() => null)) as {
+    orderId?: string;
+    paymentReference?: string;
+    bankRrn?: string;
+  } | null;
+
+  const orderId = body?.orderId ? String(body.orderId).trim() : null;
+  if (!orderId) {
+    return jsonResponse({ error: 'Order ID is required for payment verification.' }, 400, origin);
+  }
+
+  // Retrieve authoritative order document from Firestore
+  const orderSnap = await getOrderDoc(sa, accessToken, orderId);
+  if (!orderSnap.exists || !orderSnap.data) {
+    return jsonResponse({ error: `Order with ID ${orderId} was not found.` }, 404, origin);
+  }
+
+  const orderData = orderSnap.data;
+
+  // Strict ownership check: only the customer who placed the order can verify
+  if (orderData.customerUid !== user.uid) {
+    return jsonResponse({ error: 'You are not authorized to access or verify this order.' }, 403, origin);
+  }
+
+  // Idempotency: If already verified and marked Paid, return success immediately
+  if (orderData.paymentStatus === 'Paid') {
+    return jsonResponse({
+      success: true,
+      verified: true,
+      paymentStatus: 'Paid',
+      message: 'Order payment is already verified.',
+      orderId,
+    }, 200, origin);
+  }
+
+  // Server-authoritative check: Bank PSP status inquiry API
+  // Google Pay is a payment orchestrator / UPI app, not an acquiring bank.
+  // Direct integration requires bank PSP inquiry API to confirm settlement.
+  if (!env.BANK_PSP_API_URL) {
+    return jsonResponse({
+      success: false,
+      verified: false,
+      error: 'Direct Google Pay UPI verification is currently pending merchant onboarding and Bank PSP API configuration on the server. Your payment remains in Pending status.',
+      paymentStatus: orderData.paymentStatus || 'Pending',
+      orderId,
+    }, 400, origin);
+  }
+
+  try {
+    const bankResp = await fetch(`${env.BANK_PSP_API_URL}/upi/status`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(env.BANK_PSP_API_KEY ? { 'Authorization': `Bearer ${env.BANK_PSP_API_KEY}` } : {}),
+        ...(env.BANK_PSP_MERCHANT_ID ? { 'X-Merchant-ID': env.BANK_PSP_MERCHANT_ID } : {}),
+      },
+      body: JSON.stringify({
+        merchantTranId: orderData.paymentReference || body?.paymentReference,
+        orderId,
+        amount: orderData.total,
+      }),
+    });
+
+    if (!bankResp.ok) {
+      return jsonResponse({
+        success: false,
+        verified: false,
+        error: 'Bank PSP status inquiry failed or returned an error.',
+        paymentStatus: orderData.paymentStatus || 'Pending',
+      }, 502, origin);
+    }
+
+    const bankResult = (await bankResp.json().catch(() => null)) as {
+      status?: string;
+      rrn?: string;
+      code?: string;
+    } | null;
+
+    if (bankResult && (bankResult.status === 'SUCCESS' || bankResult.status === 'COMPLETED' || bankResult.status === 'PAID')) {
+      const verifiedAt = new Date().toISOString();
+      const rrn = bankResult.rrn || body?.bankRrn || null;
+
+      await updateOrderPaymentDoc(sa, accessToken, orderId, {
+        paymentStatus: 'Paid',
+        paymentVerifiedAt: verifiedAt,
+        ...(rrn ? { bankRrn: String(rrn) } : {}),
+      });
+
+      return jsonResponse({
+        success: true,
+        verified: true,
+        paymentStatus: 'Paid',
+        paymentVerifiedAt: verifiedAt,
+        bankRrn: rrn,
+        orderId,
+      }, 200, origin);
+    }
+
+    return jsonResponse({
+      success: false,
+      verified: false,
+      paymentStatus: orderData.paymentStatus || 'Pending',
+      message: 'Payment has not been confirmed by the bank.',
+      bankResponse: bankResult?.status || 'UNCONFIRMED',
+    }, 200, origin);
+  } catch (bankErr) {
+    console.error('[payment-verify] Bank PSP inquiry failed:', bankErr);
+    return jsonResponse({
+      error: 'Failed to communicate with acquiring bank PSP.',
+      paymentStatus: orderData.paymentStatus || 'Pending',
+    }, 502, origin);
+  }
+}
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const origin = request.headers.get('Origin');
@@ -314,6 +500,11 @@ export default {
     if (origin && !isAllowedOrigin(origin)) {
       return jsonResponse({ error: 'Origin not allowed.' }, 403, null);
     }
+
+    if (request.method === 'GET' && url.pathname === '/payment/config') {
+      return handlePaymentConfig(request, env, origin);
+    }
+
     if (request.method !== 'POST') {
       return jsonResponse({ error: 'Method not allowed.' }, 405, origin);
     }
@@ -321,6 +512,7 @@ export default {
     if (url.pathname === '/send-otp') return handleSendOtp(request, env, origin);
     if (url.pathname === '/verify-otp') return handleVerifyOtp(request, env, origin);
     if (url.pathname === '/create-order') return handleCreateOrder(request, env, origin);
+    if (url.pathname === '/payment/verify') return handlePaymentVerify(request, env, origin);
     return jsonResponse({ error: 'Not found.' }, 404, origin);
   },
 };

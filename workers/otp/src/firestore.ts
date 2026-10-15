@@ -152,3 +152,43 @@ export async function saveOrderTwoDoc(
     throw new Error(`Firestore create private order data failed: ${privResp.status} ${await privResp.text()}`);
   }
 }
+
+export async function getOrderDoc(
+  sa: ServiceAccount,
+  accessToken: string,
+  orderId: string,
+): Promise<{ exists: boolean; data?: Record<string, any> }> {
+  const url = `https://firestore.googleapis.com/v1/projects/${sa.project_id}/databases/(default)/documents/orders/${orderId}`;
+  const response = await fetch(url, { headers: { Authorization: `Bearer ${accessToken}` } });
+  if (response.status === 404) return { exists: false };
+  if (!response.ok) {
+    throw new Error(`Firestore get order failed: ${response.status} ${await response.text()}`);
+  }
+  const body = (await response.json()) as { fields?: Record<string, any> };
+  return { exists: true, data: fromFirestoreFields(body.fields || {}) };
+}
+
+export async function updateOrderPaymentDoc(
+  sa: ServiceAccount,
+  accessToken: string,
+  orderId: string,
+  updates: {
+    paymentStatus: string;
+    paymentVerifiedAt?: string;
+    bankRrn?: string;
+  },
+): Promise<void> {
+  const fields = toFirestoreFields(updates);
+  const mask = Object.keys(updates)
+    .map((k) => `updateMask.fieldPaths=${encodeURIComponent(k)}`)
+    .join('&');
+  const url = `https://firestore.googleapis.com/v1/projects/${sa.project_id}/databases/(default)/documents/orders/${orderId}?${mask}`;
+  const response = await fetch(url, {
+    method: 'PATCH',
+    headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ fields }),
+  });
+  if (!response.ok) {
+    throw new Error(`Firestore update order payment failed: ${response.status} ${await response.text()}`);
+  }
+}

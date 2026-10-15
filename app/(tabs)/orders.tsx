@@ -89,8 +89,40 @@ export default function OrdersScreen() {
                 </View>
               ) : null}
               <View style={[styles.orderBottom, { borderTopColor: colors.border }]}>
-                <Text style={[styles.orderTotal, { color: colors.foreground }]}>{formatPrice(order.total)}</Text>
-                <Text style={[styles.paymentTag, { color: colors.mutedForeground }]}>{order.paymentMethod}</Text>
+                <View>
+                  <Text style={[styles.orderTotal, { color: colors.foreground }]}>{formatPrice(order.total)}</Text>
+                  {order.paymentReference ? (
+                    <Text style={[styles.refText, { color: colors.mutedForeground }]}>UPI Ref: {order.paymentReference}</Text>
+                  ) : null}
+                </View>
+                <View style={styles.paymentStatusContainer}>
+                  <Text style={[styles.paymentTag, { color: colors.mutedForeground }]}>{order.paymentMethod}</Text>
+                  <View style={[
+                    styles.paymentBadge,
+                    {
+                      backgroundColor:
+                        order.paymentStatus === 'Paid'
+                          ? colors.mossSoft
+                          : order.paymentStatus === 'Failed'
+                          ? colors.coralSoft
+                          : '#FFF8E1',
+                    },
+                  ]}>
+                    <Text style={[
+                      styles.paymentBadgeText,
+                      {
+                        color:
+                          order.paymentStatus === 'Paid'
+                            ? colors.moss
+                            : order.paymentStatus === 'Failed'
+                            ? colors.coral
+                            : '#D97706',
+                      },
+                    ]}>
+                      {order.paymentStatus === 'Paid' ? 'Paid' : order.paymentStatus === 'Failed' ? 'Failed' : 'Payment Pending'}
+                    </Text>
+                  </View>
+                </View>
               </View>
               {cancellable ? (
                 <Pressable
@@ -129,7 +161,11 @@ const styles = StyleSheet.create({
   trackingText: { fontSize: 11, fontFamily: 'Inter_600SemiBold' },
   orderBottom: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginTop: 18, paddingTop: 14, borderTopWidth: 1 },
   orderTotal: { fontSize: 15, fontFamily: 'Inter_700Bold' },
+  refText: { fontSize: 10, fontFamily: 'Inter_400Regular', marginTop: 2 },
+  paymentStatusContainer: { alignItems: 'flex-end', gap: 4 },
   paymentTag: { fontSize: 11, fontFamily: 'Inter_600SemiBold' },
+  paymentBadge: { paddingHorizontal: 7, paddingVertical: 3, borderRadius: 6 },
+  paymentBadgeText: { fontSize: 10, fontFamily: 'Inter_700Bold' },
   cancelButton: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 6, marginTop: 12, paddingVertical: 9, borderRadius: 12, borderWidth: 1 },
   cancelText: { fontSize: 12, fontFamily: 'Inter_600SemiBold' },
 });
