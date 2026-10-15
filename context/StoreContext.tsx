@@ -16,6 +16,7 @@ import {
   normalizeSlug,
   Order,
   OrderStatus,
+  PaymentAttempt,
   PaymentSettings,
   Product,
   StoreSettings,
@@ -38,9 +39,10 @@ import { isFirebaseConfigured } from '@/services/firebase/config';
 import {
   createAuditLogRemote,
   createCategoryRemote,
-  createOrder,
-  createOrderViaWorker,
+  createPaymentAttemptViaWorker,
   createProduct,
+  confirmLegacyOrderPaymentViaWorker,
+  confirmPaymentAttemptViaWorker,
   editProduct,
   fetchAuditLogsRemote,
   fetchPaymentSettingsRemote,
@@ -53,17 +55,19 @@ import {
   setProductEnabled as setProductEnabledRemote,
   setProductFeatured as setProductFeaturedRemote,
   setProductStock as setProductStockRemote,
+  subscribeToPaymentAttempts,
   subscribeToCategories,
   subscribeToOrders,
   subscribeToProducts,
   updateCategoryRemote,
-  updateOrderPaymentStatusRemote,
   updateOrderStatusRemote,
   updatePaymentSettingsRemote,
   updateStoreSettingsRemote,
   updateUserRoleRemote,
   updateUserStatusRemote,
-  verifyPaymentViaWorker,
+  rejectLegacyOrderPaymentViaWorker,
+  reviewPaymentAttemptViaWorker,
+  submitPaymentDetailsViaWorker,
 } from '@/services/firebase/firestore';
 
 type CartLine = {
@@ -102,6 +106,7 @@ type StoreContextValue = {
   // cart / orders (customer side) — cart/favorites always stay on-device
   cart: CartLine[];
   orders: Order[];
+  paymentAttempts: PaymentAttempt[];
   favorites: string[];
   cartCount: number;
   cartTotal: number;
@@ -114,21 +119,16 @@ type StoreContextValue = {
     customerPhone: string;
     customerAddress: string;
     paymentMethod: 'UPI' | 'COD';
-    customerUtr?: string;
-  }) => Promise<Order | null>;
-  verifyPayment: (orderId: string, paymentReference?: string, bankRrn?: string) => Promise<{
-    success: boolean;
-    verified: boolean;
-    paymentStatus: string;
-    paymentVerifiedAt?: string;
-    bankRrn?: string;
-    error?: string;
-    message?: string;
-  }>;
+    idempotencyKey: string;
+  }) => Promise<PaymentAttempt>;
+  submitPaymentDetails: (attemptId: string, customerUtr: string) => Promise<void>;
+  verifyPaymentAttempt: (attemptId: string) => Promise<void>;
+  reviewPaymentAttempt: (action: 'reject' | 'cancel' | 'expire', attemptId: string, reason: string) => Promise<void>;
+  verifyLegacyOrderPayment: (orderId: string, customerUtr: string) => Promise<void>;
+  rejectLegacyOrderPayment: (orderId: string, reason: string) => Promise<void>;
 
   // order fulfilment (seller side)
   updateOrderStatus: (orderId: string, status: OrderStatus) => Promise<void>;
-  updateOrderPaymentStatus: (orderId: string, status: 'Paid' | 'Failed' | 'Pending', extra?: { bankRrn?: string; customerUtr?: string }) => Promise<void>;
   setTrackingId: (orderId: string, trackingId: string) => Promise<void>;
   cancelOrder: (orderId: string) => Promise<void>;
 
@@ -192,6 +192,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   const [categories, setCategories] = useState<CategoryItem[]>(defaultCategoryItems);
   const [cart, setCart] = useState<CartLine[]>([]);
   const [orders, setOrders] = useState<Order[]>([]);
+  const [paymentAttempts, setPaymentAttempts] = useState<PaymentAttempt[]>([]);
   const [favorites, setFavorites] = useState<string[]>([]);
   const [authUser, setAuthUser] = useState<AuthUser>(null);
   const [authLoaded, setAuthLoaded] = useState(false);
@@ -682,9 +683,18 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     if (isCloudMode && authUser && !authUser.isGuest) {
       const uidFilter = authUser.role === 'seller' || authUser.role === 'admin' ? undefined : authUser.uid;
       const unsubscribe = subscribeToOrders(setOrders, (error) => console.warn('[orders]', error.message), uidFilter);
-      return unsubscribe;
+      const unsubscribeAttempts = subscribeToPaymentAttempts(
+        setPaymentAttempts,
+        (error) => console.warn('[payment attempts]', error.message),
+        authUser.role === 'admin' ? undefined : authUser.uid,
+      );
+      return () => {
+        unsubscribe();
+        unsubscribeAttempts();
+      };
     }
 
+    setPaymentAttempts([]);
     AsyncStorage.getItem(STORAGE_KEYS.orders).then((saved) => {
       setOrders(saved ? (JSON.parse(saved) as Order[]) : []);
     });
@@ -695,128 +705,63 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   }, [orders, isCloudMode]);
 
   const placeOrder: StoreContextValue['placeOrder'] = async (details) => {
-    // Enforce online-only payment — COD is no longer accepted
     if (details.paymentMethod !== 'UPI') {
       throw new Error('Only online payment (UPI) is accepted. Cash on delivery is no longer available.');
     }
-    if (!cart.length) return null;
-    const items = cart.map((line) => ({
-      productId: line.product.id,
-      name: line.product.name,
-      option: line.option,
-      quantity: line.quantity,
-      unitPrice: line.priceAtAdd,
-      unitCost: line.costAtAdd,
-      sourceUrl: line.product.sourceUrl,
-    }));
-    const total = items.reduce((sum, item) => sum + item.unitPrice * item.quantity, 0);
-    const costTotal = items.reduce((sum, item) => sum + item.unitCost * item.quantity, 0);
-
-    if (isCloudMode && authUser && !authUser.isGuest) {
-      const idempotencyKey = `idemp-${authUser.uid}-${Date.now().toString()}`;
-      const workerUrl = process.env.EXPO_PUBLIC_OTP_WORKER_URL?.replace(/\/+$/, '');
-
-      if (workerUrl) {
-        // Secure, server-authoritative flow via Cloudflare Worker
-        const order = await createOrderViaWorker({
-          items: cart.map((line) => ({
-            productId: line.product.id,
-            quantity: line.quantity,
-            option: line.option,
-          })),
-          customerName: details.customerName,
-          customerPhone: details.customerPhone,
-          customerAddress: details.customerAddress,
-          paymentMethod: details.paymentMethod,
-          idempotencyKey,
-          customerUtr: details.customerUtr,
-        });
-        setCart([]);
-        await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-        return order;
-      }
-
-      // Safe client creation without leaking supplier costs
-      const customerSafeItems = items.map((it) => ({
-        productId: it.productId,
-        name: it.name,
-        option: it.option,
-        quantity: it.quantity,
-        unitPrice: it.unitPrice,
-      }));
-      const id = await createOrder({
-        customerUid: authUser.uid,
-        items: customerSafeItems,
-        total,
-        customerName: details.customerName,
-        customerPhone: details.customerPhone,
-        customerAddress: details.customerAddress,
-        paymentMethod: details.paymentMethod,
-        idempotencyKey,
-        customerUtr: details.customerUtr,
-      });
-      setCart([]);
-      await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-      return {
-        id,
-        items: customerSafeItems,
-        total,
-        status: 'Placed',
-        paymentStatus: 'Pending',
-        paymentReference: `VKUPI${Date.now()}`,
-        customerUtr: details.customerUtr,
-        amountPaise: Math.round(total * 100),
-        currency: 'INR',
-        date: new Date().toLocaleDateString('en-IN', { day: '2-digit', month: 'short' }),
-        ...details,
-      } as Order;
+    if (!isCloudMode || !authUser || authUser.isGuest) {
+      throw new Error('Sign in with an account to create a secure UPI payment attempt.');
     }
-
-    const order: Order = {
-      id: `VK-${Date.now().toString().slice(-6)}`,
-      items,
-      total,
-      costTotal,
-      profitTotal: total - costTotal,
-      status: 'Placed',
-      paymentStatus: 'Pending',
-      paymentReference: `VKUPI${Date.now()}`,
-      customerUtr: details.customerUtr,
-      amountPaise: Math.round(total * 100),
-      currency: 'INR',
-      date: new Date().toLocaleDateString('en-IN', { day: '2-digit', month: 'short' }),
+    if (!cart.length) throw new Error('Your cart is empty.');
+    const attempt = await createPaymentAttemptViaWorker({
+      items: cart.map((line) => ({
+        productId: line.product.id,
+        quantity: line.quantity,
+        option: line.option,
+      })),
       customerName: details.customerName,
       customerPhone: details.customerPhone,
       customerAddress: details.customerAddress,
-      paymentMethod: details.paymentMethod,
-    };
-    setOrders((current) => [order, ...current]);
+      paymentMethod: 'UPI',
+      idempotencyKey: details.idempotencyKey,
+    });
     setCart([]);
     await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-    return order;
+    return attempt;
   };
 
-  const verifyPayment: StoreContextValue['verifyPayment'] = async (orderId, paymentReference, bankRrn) => {
-    if (isCloudMode) {
-      const res = await verifyPaymentViaWorker({ orderId, paymentReference, bankRrn });
-      if (res.verified && res.paymentStatus === 'Paid') {
-        setOrders((current) =>
-          current.map((o) => (o.id === orderId ? { ...o, paymentStatus: 'Paid', paymentVerifiedAt: res.paymentVerifiedAt, bankRrn: res.bankRrn } : o)),
-        );
-      }
-      return res;
+  const submitPaymentDetails: StoreContextValue['submitPaymentDetails'] = async (attemptId, customerUtr) => {
+    if (!isCloudMode || !authUser || authUser.isGuest) {
+      throw new Error('Sign in with an account to submit payment details.');
     }
-    return {
-      success: false,
-      verified: false,
-      paymentStatus: 'Pending',
-      message: 'Direct payment verification requires cloud mode with backend server.',
-    };
+    const trimmedUtr = customerUtr.trim();
+    if (!trimmedUtr) throw new Error('Enter the UTR/reference number from your payment app.');
+    await submitPaymentDetailsViaWorker({ attemptId, customerUtr: trimmedUtr });
+  };
+
+  const verifyPaymentAttempt: StoreContextValue['verifyPaymentAttempt'] = async (attemptId) => {
+    if (!isAdmin || !isCloudMode) throw new Error('Only an authenticated administrator can verify payments.');
+    await confirmPaymentAttemptViaWorker(attemptId);
+  };
+
+  const reviewPaymentAttempt: StoreContextValue['reviewPaymentAttempt'] = async (action, attemptId, reason) => {
+    if (!isAdmin || !isCloudMode) throw new Error('Only an authenticated administrator can review payments.');
+    await reviewPaymentAttemptViaWorker(action, attemptId, reason);
+  };
+
+  const verifyLegacyOrderPayment: StoreContextValue['verifyLegacyOrderPayment'] = async (orderId, customerUtr) => {
+    if (!isAdmin || !isCloudMode) throw new Error('Only an authenticated administrator can verify payments.');
+    await confirmLegacyOrderPaymentViaWorker(orderId, customerUtr.trim());
+  };
+
+  const rejectLegacyOrderPayment: StoreContextValue['rejectLegacyOrderPayment'] = async (orderId, reason) => {
+    if (!isAdmin || !isCloudMode) throw new Error('Only an authenticated administrator can review payments.');
+    await rejectLegacyOrderPaymentViaWorker(orderId, reason);
   };
 
   const updateOrderStatus: StoreContextValue['updateOrderStatus'] = async (orderId, status) => {
     const order = orders.find((o) => o.id === orderId);
     if (!order) throw new Error('Order not found.');
+    if (order.paymentStatus !== 'Paid') throw new Error('Only paid orders can enter fulfillment.');
     if (!canTransitionOrderStatus(order.status, status)) {
       throw new Error(`Cannot transition from "${order.status}" to "${status}".`);
     }
@@ -830,6 +775,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   const cancelOrder: StoreContextValue['cancelOrder'] = async (orderId) => {
     const order = orders.find((o) => o.id === orderId);
     if (!order) throw new Error('Order not found.');
+    if (order.paymentStatus !== 'Paid') throw new Error('Only paid orders can be cancelled as orders.');
     if (!canCancelOrder(order.status)) {
       throw new Error(`Orders in "${order.status}" status cannot be cancelled. Contact support if needed.`);
     }
@@ -946,36 +892,6 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     await logAdminActivity('Update Payment Settings', `Updated payment config: ${Object.keys(patch).join(', ')}`);
   };
 
-  const updateOrderPaymentStatus: StoreContextValue['updateOrderPaymentStatus'] = async (
-    orderId,
-    paymentStatus,
-    extra,
-  ) => {
-    if (!isAdmin) throw new Error('Only administrators can verify or update order payment status.');
-    const nowIso = new Date().toISOString();
-    setOrders((current) =>
-      current.map((o) =>
-        o.id === orderId
-          ? {
-              ...o,
-              paymentStatus,
-              paymentVerifiedAt: paymentStatus === 'Paid' ? nowIso : undefined,
-              ...(extra?.bankRrn ? { bankRrn: extra.bankRrn } : {}),
-              ...(extra?.customerUtr ? { customerUtr: extra.customerUtr } : {}),
-            }
-          : o,
-      ),
-    );
-    if (isCloudMode) {
-      await updateOrderPaymentStatusRemote(orderId, paymentStatus, extra);
-    }
-    await logAdminActivity(
-      'Verify Payment',
-      `Marked order ${orderId} payment status as ${paymentStatus}${extra?.bankRrn ? ` (RRN: ${extra.bankRrn})` : ''}`,
-      orderId,
-    );
-  };
-
   const logAdminActivity: StoreContextValue['logAdminActivity'] = async (action, details, targetId) => {
     const adminEmail = authUser && !authUser.isGuest ? authUser.email : 'admin@vibekart.in';
     const adminUid = authUser && !authUser.isGuest ? authUser.uid : 'admin-local';
@@ -1004,8 +920,8 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   // ---------------- analytics ----------------
 
   const analytics = useMemo(() => {
-    // Exclude cancelled orders from financial metrics
-    const activeOrders = orders.filter((o) => o.status !== 'Cancelled');
+    const paidOrders = orders.filter((o) => o.paymentStatus === 'Paid');
+    const activeOrders = paidOrders.filter((o) => o.status !== 'Cancelled');
     const totalRevenue = activeOrders.reduce((sum, o) => sum + o.total, 0);
     const totalCost = activeOrders.reduce((sum, o) => sum + (o.costTotal ?? 0), 0);
     const totalProfit = totalRevenue - totalCost;
@@ -1015,10 +931,10 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       totalCost,
       totalProfit,
       marginPercent,
-      ordersCount: orders.length,
-      activeOrdersCount: orders.filter((o) => !['Delivered', 'Cancelled'].includes(o.status)).length,
-      deliveredCount: orders.filter((o) => o.status === 'Delivered').length,
-      cancelledCount: orders.filter((o) => o.status === 'Cancelled').length,
+      ordersCount: paidOrders.length,
+      activeOrdersCount: paidOrders.filter((o) => !['Delivered', 'Cancelled'].includes(o.status)).length,
+      deliveredCount: paidOrders.filter((o) => o.status === 'Delivered').length,
+      cancelledCount: paidOrders.filter((o) => o.status === 'Cancelled').length,
       lowStockCount: products.filter((p) => !p.inStock).length,
       disabledCount: products.filter((p) => p.enabled === false).length,
     };
@@ -1041,6 +957,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       toggleCategoryEnabled,
       cart,
       orders,
+      paymentAttempts,
       favorites,
       cartCount: cart.reduce((sum, line) => sum + line.quantity, 0),
       cartTotal: cart.reduce((sum, line) => sum + line.priceAtAdd * line.quantity, 0),
@@ -1049,7 +966,11 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       toggleFavorite,
       isFavorite: (productId: string) => favorites.includes(productId),
       placeOrder,
-      verifyPayment,
+      submitPaymentDetails,
+      verifyPaymentAttempt,
+      reviewPaymentAttempt,
+      verifyLegacyOrderPayment,
+      rejectLegacyOrderPayment,
       updateOrderStatus,
       setTrackingId,
       cancelOrder,
@@ -1059,7 +980,6 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       updateStoreSettings,
       paymentSettings,
       updatePaymentSettings,
-      updateOrderPaymentStatus,
       usersList,
       refreshUsers,
       changeUserRole,
@@ -1083,6 +1003,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       categories,
       cart,
       orders,
+      paymentAttempts,
       favorites,
       analytics,
       isAdmin,

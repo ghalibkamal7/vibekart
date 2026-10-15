@@ -1,6 +1,6 @@
 # VibeKart OTP Worker
 
-A Cloudflare Worker that replaces the Firebase Cloud Functions `sendOtp` / `verifyOtp`.
+A Cloudflare Worker that replaces Firebase Cloud Functions for OTP and manual UPI payment operations.
 
 Firebase Cloud Functions require the Blaze plan, so this Worker keeps the OTP backend outside Firebase while allowing the Firebase project to remain on the Spark/free plan.
 
@@ -13,8 +13,10 @@ The Worker securely handles:
 * Firebase user lookup/creation
 * Firestore profile creation/repair
 * Firebase custom-token generation
+* Server-priced payment-attempt creation and UTR submission
+* Admin-only payment verification and atomic paid-order creation
 
-The Expo app never receives or stores the MSG91 authentication key or Firebase service-account credentials.
+The Expo app never receives or stores the MSG91 authentication key or Firebase service-account credentials. UPI payment confirmation uses the same Worker and does not require a payment gateway, Firebase Cloud Functions, or a billing-plan upgrade.
 
 ## Architecture
 
@@ -279,7 +281,7 @@ OTP_KV
 
 ## API endpoints
 
-The Worker exposes two main endpoints.
+The Worker exposes OTP and payment endpoints.
 
 ### Send OTP
 
@@ -340,6 +342,71 @@ signInWithCustomToken()
 ```
 
 The Worker does not expose the Firebase service-account credentials.
+
+## Manual UPI payments
+
+All payment endpoints below require `Authorization: Bearer <Firebase ID token>`.
+The Worker validates the token and checks the caller's active Firestore profile.
+
+### Create an attempt
+
+```text
+POST /payment-attempts/create
+```
+
+The request contains cart product IDs/quantities, customer delivery details,
+and an idempotency key. The Worker reloads product prices and availability;
+client-supplied totals and prices are ignored. It creates a `payment_attempts`
+document and an admin-only private cost snapshot. It does not create an order.
+Attempts have a 24-hour expiry timestamp, but are not automatically expired;
+customers can still submit a reference later for reconciliation.
+
+### Submit payment details
+
+```text
+POST /payment-attempts/submit
+```
+
+Request:
+
+```json
+{
+  "attemptId": "pay-...",
+  "customerUtr": "reference copied from the customer's payment app"
+}
+```
+
+The Worker trims and requires a non-empty reference (up to 100 characters)
+without assuming a provider-specific format. Submission leaves the attempt
+unverified and creates no order.
+
+### Admin review
+
+```text
+POST /admin/payment-attempts/confirm
+POST /admin/payment-attempts/reject
+POST /admin/payment-attempts/cancel
+POST /admin/payment-attempts/expire
+```
+
+Every route independently checks that the authenticated user's Firestore
+profile has the active `admin` role. Confirmation requires a submitted UTR and
+an explicit confirmation from the admin that the actual merchant-account
+credit was checked. It atomically creates the paid order, its private cost
+snapshot, updates the attempt, and claims a normalized transaction reference
+so that it cannot confirm a second order. The Worker cannot independently
+prove a manual UPI credit; the admin must verify the merchant's transaction
+history. Rejected, cancelled, and manually expired attempts never create an
+order.
+
+`POST /create-order` is retired and returns `410 Gone`; clients must use
+`/payment-attempts/create`. The old client-side `/payment/verify` route is not
+available for marking an order paid.
+
+The Expo client can read an attempt only when it belongs to the signed-in user.
+Direct client creates/updates/deletes of payment attempts and direct order
+creation/payment-status updates are denied by `firestore.rules`. Deploy the
+matching rules after review before enabling the updated app.
 
 ## OTP storage
 

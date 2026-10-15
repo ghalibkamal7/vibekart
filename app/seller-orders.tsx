@@ -200,7 +200,8 @@ export default function SellerOrdersScreen() {
   const { orders } = useStore();
   const [filter, setFilter] = useState<FilterGroup>('Active');
 
-  const visible = orders.filter((o) => matchesFilter(o, filter));
+  const paidOrders = orders.filter((order) => order.paymentStatus === 'Paid');
+  const visible = paidOrders.filter((o) => matchesFilter(o, filter));
 
   return (
     <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={[styles.container, { paddingTop: insets.top + 14, paddingBottom: 100 }]}>
@@ -235,7 +236,7 @@ export default function SellerOrdersScreen() {
         <View style={[styles.empty, { backgroundColor: colors.card, borderColor: colors.border }]}>
           <Feather name="inbox" size={26} color={colors.mutedForeground} />
           <Text style={[styles.emptyTitle, { color: colors.foreground }]}>
-            {orders.length === 0 ? 'No orders yet' : `No ${filter.toLowerCase()} orders`}
+            {paidOrders.length === 0 ? 'No paid orders yet' : `No ${filter.toLowerCase()} orders`}
           </Text>
         </View>
       ) : (
