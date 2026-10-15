@@ -192,3 +192,54 @@ export async function updateOrderPaymentDoc(
     throw new Error(`Firestore update order payment failed: ${response.status} ${await response.text()}`);
   }
 }
+
+export async function getVersionedDocument(
+  sa: ServiceAccount,
+  accessToken: string,
+  documentPath: string,
+): Promise<{ exists: boolean; data?: Record<string, any>; updateTime?: string }> {
+  const encodedPath = documentPath.split('/').map(encodeURIComponent).join('/');
+  const url = `https://firestore.googleapis.com/v1/projects/${sa.project_id}/databases/(default)/documents/${encodedPath}`;
+  const response = await fetch(url, { headers: { Authorization: `Bearer ${accessToken}` } });
+  if (response.status === 404) return { exists: false };
+  if (!response.ok) {
+    throw new Error(`Firestore get ${documentPath} failed: ${response.status} ${await response.text()}`);
+  }
+  const body = (await response.json()) as { fields?: Record<string, any>; updateTime?: string };
+  return { exists: true, data: fromFirestoreFields(body.fields || {}), updateTime: body.updateTime };
+}
+
+export async function createPaymentAttemptDoc(
+  sa: ServiceAccount,
+  accessToken: string,
+  attemptId: string,
+  data: Record<string, any>,
+): Promise<boolean> {
+  const url = `https://firestore.googleapis.com/v1/projects/${sa.project_id}/databases/(default)/documents/payment_attempts?documentId=${encodeURIComponent(attemptId)}`;
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ fields: toFirestoreFields(data) }),
+  });
+  if (response.status === 409) return false;
+  if (!response.ok) {
+    throw new Error(`Firestore create payment attempt failed: ${response.status} ${await response.text()}`);
+  }
+  return true;
+}
+
+export async function commitFirestoreWrites(
+  sa: ServiceAccount,
+  accessToken: string,
+  writes: Record<string, unknown>[],
+): Promise<void> {
+  const url = `https://firestore.googleapis.com/v1/projects/${sa.project_id}/databases/(default)/documents:commit`;
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ writes }),
+  });
+  if (!response.ok) {
+    throw new Error(`Firestore atomic commit failed: ${response.status} ${await response.text()}`);
+  }
+}

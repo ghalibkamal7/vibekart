@@ -31,6 +31,7 @@ import {
   normalizeSlug,
   Order,
   OrderStatus,
+  PaymentAttempt,
   PaymentSettings,
   Product,
   StoreSettings,
@@ -41,7 +42,7 @@ import { useStore } from '@/context/StoreContext';
 import { fetchSellerOrderPrivateData } from '@/services/firebase/firestore';
 import { uploadImageToCloudinary } from '@/services/cloudinary/upload';
 
-type AdminTab = 'dashboard' | 'products' | 'categories' | 'orders' | 'users' | 'payments' | 'settings';
+type AdminTab = 'dashboard' | 'products' | 'categories' | 'orders' | 'pendingPayments' | 'users' | 'payments' | 'settings';
 
 export default function AdminScreen() {
   const colors = useColors();
@@ -50,8 +51,10 @@ export default function AdminScreen() {
     products,
     categories,
     orders,
+    paymentAttempts,
     analytics,
     isAdmin,
+    isCloudMode,
     authUser,
     toggleStock,
     toggleEnabled,
@@ -62,7 +65,10 @@ export default function AdminScreen() {
     deleteCategory,
     toggleCategoryEnabled,
     updateOrderStatus,
-    updateOrderPaymentStatus,
+    verifyPaymentAttempt,
+    reviewPaymentAttempt,
+    verifyLegacyOrderPayment,
+    rejectLegacyOrderPayment,
     setTrackingId,
     cancelOrder,
     usersList,
@@ -93,6 +99,9 @@ export default function AdminScreen() {
   const [orderStatusFilter, setOrderStatusFilter] = useState<'All' | OrderStatus>('All');
   const [expandedOrderId, setExpandedOrderId] = useState<string | null>(null);
   const [orderTrackingInputs, setOrderTrackingInputs] = useState<Record<string, string>>({});
+  const [legacyUtrInputs, setLegacyUtrInputs] = useState<Record<string, string>>({});
+  const [reviewingPaymentId, setReviewingPaymentId] = useState<string | null>(null);
+  const [paymentView, setPaymentView] = useState<'Open' | 'History'>('Open');
   const [orderPrivates, setOrderPrivates] = useState<
     Record<string, { costTotal?: number; profitTotal?: number; items?: any[] }>
   >({});
@@ -176,6 +185,7 @@ export default function AdminScreen() {
 
   const filteredOrders = useMemo(() => {
     return orders.filter((o) => {
+      if (o.paymentStatus !== 'Paid') return false;
       const matchesSearch =
         !orderSearch.trim() ||
         o.id.toLowerCase().includes(orderSearch.toLowerCase()) ||
@@ -186,6 +196,22 @@ export default function AdminScreen() {
       return matchesSearch && matchesStatus;
     });
   }, [orders, orderSearch, orderStatusFilter]);
+
+  const pendingAttempts = paymentAttempts.filter((attempt) => ['Pending', 'Submitted'].includes(attempt.status));
+  const paymentAttemptHistory = paymentAttempts.filter((attempt) =>
+    ['Rejected', 'Cancelled', 'Expired'].includes(attempt.status),
+  );
+  const legacyPendingOrders = orders.filter((order) =>
+    order.paymentMethod === 'UPI' &&
+    order.paymentStatus !== 'Paid' &&
+    order.paymentStatus !== 'Failed' &&
+    order.status !== 'Cancelled',
+  );
+  const legacyClosedOrders = orders.filter((order) =>
+    order.paymentMethod === 'UPI' &&
+    order.paymentStatus !== 'Paid' &&
+    (order.paymentStatus === 'Failed' || order.status === 'Cancelled'),
+  );
 
   const filteredUsers = useMemo(() => {
     return usersList.filter((u) => {
@@ -366,14 +392,114 @@ export default function AdminScreen() {
     }
   };
 
-  // Handle manual order payment verification by admin
-  const handleVerifyOrderPayment = async (orderId: string, status: 'Paid' | 'Failed' | 'Pending') => {
-    try {
-      await updateOrderPaymentStatus(orderId, status);
-      Alert.alert('Payment Status Updated', `Order payment marked as "${status}".`);
-    } catch (err: any) {
-      Alert.alert('Error', err?.message || 'Failed to update order payment status.');
+  const handleVerifyPaymentAttempt = (attempt: PaymentAttempt) => {
+    Alert.alert(
+      'Verify & confirm payment?',
+      `Before continuing, check the merchant's Google Pay/PhonePe/bank transaction history. Confirm that the actual credit matches ${formatPrice(attempt.total)} and the submitted reference "${attempt.customerUtr ?? 'Not available'}". Customer-submitted details are unverified and are not proof of payment.`,
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'I verified the actual credit',
+          onPress: async () => {
+            setReviewingPaymentId(attempt.id);
+            try {
+              await verifyPaymentAttempt(attempt.id);
+              await logAdminActivity('Confirm Payment', `Verified payment attempt ${attempt.id}`, attempt.id);
+              Alert.alert('Payment confirmed', 'A paid order is now available in Orders and fulfillment.');
+            } catch (err) {
+              Alert.alert('Verification failed', err instanceof Error ? err.message : 'Could not confirm payment.');
+            } finally {
+              setReviewingPaymentId(null);
+            }
+          },
+        },
+      ],
+    );
+  };
+
+  const handleReviewPaymentAttempt = (action: 'reject' | 'cancel' | 'expire', attempt: PaymentAttempt) => {
+    const label = action === 'reject' ? 'Reject payment' : action === 'expire' ? 'Expire attempt' : 'Cancel attempt';
+    const reason = action === 'reject'
+      ? 'Payment was not found in the merchant account after review.'
+      : action === 'expire'
+        ? 'Attempt manually expired after merchant-account reconciliation.'
+        : 'Attempt cancelled by admin after merchant-account reconciliation.';
+    Alert.alert(
+      `${label}?`,
+      'Review the merchant transaction history first. Do not cancel or expire an attempt if a payment may have succeeded and still needs reconciliation.',
+      [
+        { text: 'Keep pending', style: 'cancel' },
+        {
+          text: label,
+          style: 'destructive',
+          onPress: async () => {
+            setReviewingPaymentId(attempt.id);
+            try {
+              await reviewPaymentAttempt(action, attempt.id, reason);
+              await logAdminActivity(label, `${label} ${attempt.id}: ${reason}`, attempt.id);
+            } catch (err) {
+              Alert.alert('Update failed', err instanceof Error ? err.message : 'Could not update payment attempt.');
+            } finally {
+              setReviewingPaymentId(null);
+            }
+          },
+        },
+      ],
+    );
+  };
+
+  const handleVerifyLegacyOrder = (order: Order) => {
+    const customerUtr = (legacyUtrInputs[order.id] ?? order.customerUtr ?? '').trim();
+    if (!customerUtr) {
+      Alert.alert('Reference required', 'Enter the transaction reference that you independently matched to the actual merchant-account credit.');
+      return;
     }
+    Alert.alert(
+      'Verify legacy payment?',
+      `Check the actual merchant-account credit for ${formatPrice(order.total)} and reference "${customerUtr}". This is an existing pre-workflow order. Customer-submitted data alone is not proof.`,
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'I verified the actual credit',
+          onPress: async () => {
+            setReviewingPaymentId(order.id);
+            try {
+              await verifyLegacyOrderPayment(order.id, customerUtr);
+              await logAdminActivity('Confirm Legacy Payment', `Verified legacy order ${order.id}`, order.id);
+            } catch (err) {
+              Alert.alert('Verification failed', err instanceof Error ? err.message : 'Could not confirm payment.');
+            } finally {
+              setReviewingPaymentId(null);
+            }
+          },
+        },
+      ],
+    );
+  };
+
+  const handleRejectLegacyOrder = (order: Order) => {
+    Alert.alert(
+      'Reject legacy payment?',
+      'Use this only after checking the merchant account and determining that the payment was not received. This will cancel the unpaid legacy order.',
+      [
+        { text: 'Keep for review', style: 'cancel' },
+        {
+          text: 'Reject and cancel',
+          style: 'destructive',
+          onPress: async () => {
+            setReviewingPaymentId(order.id);
+            try {
+              await rejectLegacyOrderPayment(order.id, 'Payment was not found in merchant account after review.');
+              await logAdminActivity('Reject Legacy Payment', `Rejected legacy order ${order.id}`, order.id);
+            } catch (err) {
+              Alert.alert('Update failed', err instanceof Error ? err.message : 'Could not reject payment.');
+            } finally {
+              setReviewingPaymentId(null);
+            }
+          },
+        },
+      ],
+    );
   };
 
   return (
@@ -414,7 +540,8 @@ export default function AdminScreen() {
               { key: 'dashboard', label: 'Dashboard', icon: 'grid' },
               { key: 'products', label: `Products (${products.length})`, icon: 'package' },
               { key: 'categories', label: `Categories (${categories.length})`, icon: 'tag' },
-              { key: 'orders', label: `Orders (${orders.length})`, icon: 'shopping-bag' },
+              { key: 'orders', label: `Orders (${orders.filter((order) => order.paymentStatus === 'Paid').length})`, icon: 'shopping-bag' },
+              { key: 'pendingPayments', label: `Pending Payments (${pendingAttempts.length + legacyPendingOrders.length})`, icon: 'credit-card' },
               { key: 'users', label: `Users & Sellers (${usersList.length})`, icon: 'users' },
               { key: 'payments', label: 'Payment Settings', icon: 'credit-card' },
               { key: 'settings', label: 'Store Settings', icon: 'settings' },
@@ -1009,7 +1136,7 @@ export default function AdminScreen() {
                             ) : null}
                             {order.customerUtr ? (
                               <Text style={[styles.detailText, { color: colors.foreground, fontFamily: 'Inter_600SemiBold' }]}>
-                                Customer Submitted UTR: {order.customerUtr}
+                                Verified transaction reference: {order.customerUtr}
                               </Text>
                             ) : (
                               <Text style={[styles.detailText, { color: colors.mutedForeground, fontStyle: 'italic' }]}>
@@ -1023,36 +1150,9 @@ export default function AdminScreen() {
                             ) : null}
                           </View>
 
-                          {/* Verification Actions */}
-                          <View style={{ flexDirection: 'row', gap: 8, marginTop: 10, flexWrap: 'wrap' }}>
-                            {order.paymentStatus !== 'Paid' && (
-                              <Pressable
-                                onPress={() => handleVerifyOrderPayment(order.id, 'Paid')}
-                                style={[styles.smallVerifyBtn, { backgroundColor: colors.moss }]}
-                              >
-                                <Feather name="check-circle" size={12} color="#FFFFFF" />
-                                <Text style={styles.smallVerifyBtnText}>Mark as Paid</Text>
-                              </Pressable>
-                            )}
-                            {order.paymentStatus !== 'Failed' && (
-                              <Pressable
-                                onPress={() => handleVerifyOrderPayment(order.id, 'Failed')}
-                                style={[styles.smallVerifyBtn, { backgroundColor: '#EF4444' }]}
-                              >
-                                <Feather name="x-circle" size={12} color="#FFFFFF" />
-                                <Text style={styles.smallVerifyBtnText}>Mark as Failed</Text>
-                              </Pressable>
-                            )}
-                            {order.paymentStatus !== 'Pending' && (
-                              <Pressable
-                                onPress={() => handleVerifyOrderPayment(order.id, 'Pending')}
-                                style={[styles.smallVerifyBtn, { backgroundColor: '#F59E0B' }]}
-                              >
-                                <Feather name="rotate-ccw" size={12} color="#FFFFFF" />
-                                <Text style={styles.smallVerifyBtnText}>Reset to Pending</Text>
-                              </Pressable>
-                            )}
-                          </View>
+                          <Text style={[styles.detailText, { color: colors.moss, marginTop: 10 }]}>
+                            Payment verified by an authorized administrator.
+                          </Text>
                         </View>
 
                         {/* Tracking Input */}
@@ -1286,7 +1386,208 @@ export default function AdminScreen() {
           </View>
         )}
 
-        {/* ==================== 6. PAYMENT SETTINGS TAB ==================== */}
+        {/* ==================== 6. PENDING PAYMENTS TAB ==================== */}
+        {activeTab === 'pendingPayments' && (
+          <View>
+            <Text style={[styles.sectionHeading, { color: colors.foreground }]}>Pending Payments</Text>
+            <Text style={[styles.sectionSub, { color: colors.mutedForeground }]}>
+              Payment attempts are not orders. Verify the actual merchant-account credit before creating an order; submitted UTRs are customer-provided and unverified.
+            </Text>
+            {!isCloudMode ? (
+              <Text style={[styles.sectionSub, { color: colors.coral }]}>
+                Payment review requires the configured authenticated Worker. Demo mode cannot confirm or reject real payments.
+              </Text>
+            ) : null}
+            <View style={styles.paymentViewRow}>
+              {(['Open', 'History'] as const).map((view) => {
+                const active = paymentView === view;
+                const count = view === 'Open'
+                  ? pendingAttempts.length + legacyPendingOrders.length
+                  : paymentAttemptHistory.length + legacyClosedOrders.length;
+                return (
+                  <Pressable
+                    key={view}
+                    onPress={() => setPaymentView(view)}
+                    style={[
+                      styles.paymentViewChip,
+                      { backgroundColor: active ? colors.moss : colors.card, borderColor: active ? colors.moss : colors.border },
+                    ]}
+                  >
+                    <Text style={[styles.paymentViewChipText, { color: active ? '#FFFFFF' : colors.foreground }]}>
+                      {view} ({count})
+                    </Text>
+                  </Pressable>
+                );
+              })}
+            </View>
+
+            {paymentView === 'Open' ? (
+              <>
+                {pendingAttempts.map((attempt) => {
+                  const expired = Date.parse(attempt.expiresAt) <= Date.now();
+                  return (
+                    <View key={attempt.id} style={[styles.paymentReviewCard, { backgroundColor: colors.card, borderColor: colors.border }]}>
+                      <View style={styles.paymentReviewHeader}>
+                        <View style={{ flex: 1 }}>
+                          <Text style={[styles.orderId, { color: colors.foreground }]}>{attempt.id}</Text>
+                          <Text style={[styles.detailText, { color: colors.mutedForeground }]}>
+                            {attempt.customerName} · {attempt.customerPhone}{attempt.customerEmail ? ` · ${attempt.customerEmail}` : ''}
+                          </Text>
+                        </View>
+                        <View style={[styles.paymentBadge, { backgroundColor: attempt.status === 'Submitted' ? '#FFF8E1' : colors.coralSoft }]}>
+                          <Text style={[styles.paymentBadgeText, { color: attempt.status === 'Submitted' ? '#D97706' : colors.coral }]}>
+                            {attempt.status}
+                          </Text>
+                        </View>
+                      </View>
+                      <Text style={[styles.detailText, { color: colors.foreground, marginTop: 8 }]}>
+                        Attempt ID: {attempt.id} · Order ID: Not created
+                      </Text>
+                      <Text style={[styles.detailText, { color: colors.foreground, marginTop: 4 }]}>
+                        Items: {attempt.items.map((item) => `${item.name} × ${item.quantity}`).join(' · ')}
+                      </Text>
+                      <Text style={[styles.detailText, { color: colors.foreground, marginTop: 4 }]}>
+                        Payable: {formatPrice(attempt.total)} · Method: {attempt.paymentMethod}
+                      </Text>
+                      <Text style={[styles.detailText, { color: colors.mutedForeground, marginTop: 4 }]}>
+                        Created: {new Date(attempt.createdAt).toLocaleString()} · Expires: {new Date(attempt.expiresAt).toLocaleString()}
+                      </Text>
+                      <Text style={[styles.detailText, { color: attempt.customerUtr ? '#D97706' : colors.mutedForeground, marginTop: 4 }]}>
+                        Submitted UTR (unverified): {attempt.customerUtr || 'Not submitted'}
+                      </Text>
+                      <Text style={[styles.detailText, { color: colors.mutedForeground, marginTop: 4 }]}>
+                        Payer UPI ID / name / bank: Not available
+                      </Text>
+                      {attempt.submittedAt ? (
+                        <Text style={[styles.detailText, { color: colors.mutedForeground, marginTop: 4 }]}>
+                          Submitted: {new Date(attempt.submittedAt).toLocaleString()}
+                        </Text>
+                      ) : null}
+                      <View style={styles.paymentActionRow}>
+                        {attempt.status === 'Submitted' ? (
+                          <>
+                            <Pressable
+                              disabled={!isCloudMode || reviewingPaymentId === attempt.id}
+                              onPress={() => handleVerifyPaymentAttempt(attempt)}
+                              style={[styles.smallVerifyBtn, { backgroundColor: colors.moss }]}
+                            >
+                              <Feather name="check-circle" size={12} color="#FFFFFF" />
+                              <Text style={styles.smallVerifyBtnText}>Verify & Confirm Payment</Text>
+                            </Pressable>
+                            <Pressable
+                              disabled={!isCloudMode || reviewingPaymentId === attempt.id}
+                              onPress={() => handleReviewPaymentAttempt('reject', attempt)}
+                              style={[styles.smallVerifyBtn, { backgroundColor: '#EF4444' }]}
+                            >
+                              <Feather name="x-circle" size={12} color="#FFFFFF" />
+                              <Text style={styles.smallVerifyBtnText}>Reject Payment</Text>
+                            </Pressable>
+                          </>
+                        ) : null}
+                        {expired ? (
+                          <Pressable
+                            disabled={!isCloudMode || reviewingPaymentId === attempt.id}
+                            onPress={() => handleReviewPaymentAttempt('expire', attempt)}
+                            style={[styles.smallVerifyBtn, { backgroundColor: '#6B7280' }]}
+                          >
+                            <Feather name="clock" size={12} color="#FFFFFF" />
+                            <Text style={styles.smallVerifyBtnText}>Expire after review</Text>
+                          </Pressable>
+                        ) : null}
+                        <Pressable
+                          disabled={!isCloudMode || reviewingPaymentId === attempt.id}
+                          onPress={() => handleReviewPaymentAttempt('cancel', attempt)}
+                          style={[styles.smallVerifyBtn, { backgroundColor: '#6B7280' }]}
+                        >
+                          <Feather name="slash" size={12} color="#FFFFFF" />
+                          <Text style={styles.smallVerifyBtnText}>Cancel after review</Text>
+                        </Pressable>
+                      </View>
+                    </View>
+                  );
+                })}
+
+                {legacyPendingOrders.map((order) => (
+                  <View key={`legacy-${order.id}`} style={[styles.paymentReviewCard, { backgroundColor: colors.card, borderColor: colors.border }]}>
+                    <Text style={[styles.orderId, { color: colors.foreground }]}>Legacy unpaid order · {order.id}</Text>
+                    <Text style={[styles.detailText, { color: colors.mutedForeground, marginTop: 4 }]}>
+                      {order.customerName} · {order.customerPhone} · {order.items.map((item) => `${item.name} × ${item.quantity}`).join(' · ')}
+                    </Text>
+                    <Text style={[styles.detailText, { color: colors.foreground, marginTop: 4 }]}>
+                      {formatPrice(order.total)} · {order.paymentMethod} · existing order (not a new payment attempt)
+                    </Text>
+                    <Text style={[styles.detailText, { color: '#D97706', marginTop: 4 }]}>
+                      Previously submitted UTR (unverified): {order.customerUtr || 'Not available'}
+                    </Text>
+                    <TextInput
+                      value={legacyUtrInputs[order.id] ?? order.customerUtr ?? ''}
+                      onChangeText={(value) => setLegacyUtrInputs((current) => ({ ...current, [order.id]: value }))}
+                      placeholder="Verified transaction reference"
+                      placeholderTextColor={colors.mutedForeground}
+                      autoCapitalize="none"
+                      maxLength={100}
+                      style={[styles.legacyUtrInput, { backgroundColor: colors.background, borderColor: colors.border, color: colors.foreground }]}
+                    />
+                    <View style={styles.paymentActionRow}>
+                      <Pressable
+                        disabled={!isCloudMode || reviewingPaymentId === order.id || !(legacyUtrInputs[order.id] ?? order.customerUtr ?? '').trim()}
+                        onPress={() => handleVerifyLegacyOrder(order)}
+                        style={[styles.smallVerifyBtn, { backgroundColor: colors.moss }]}
+                      >
+                        <Feather name="check-circle" size={12} color="#FFFFFF" />
+                        <Text style={styles.smallVerifyBtnText}>Verify & Confirm Payment</Text>
+                      </Pressable>
+                      <Pressable
+                        disabled={!isCloudMode || reviewingPaymentId === order.id}
+                        onPress={() => handleRejectLegacyOrder(order)}
+                        style={[styles.smallVerifyBtn, { backgroundColor: '#EF4444' }]}
+                      >
+                        <Feather name="x-circle" size={12} color="#FFFFFF" />
+                        <Text style={styles.smallVerifyBtnText}>Reject and cancel</Text>
+                      </Pressable>
+                    </View>
+                  </View>
+                ))}
+                {!pendingAttempts.length && !legacyPendingOrders.length ? (
+                  <View style={[styles.emptyBox, { borderColor: colors.border }]}>
+                    <Feather name="check-circle" size={30} color={colors.moss} />
+                    <Text style={[styles.emptyText, { color: colors.foreground }]}>No payments need review.</Text>
+                  </View>
+                ) : null}
+              </>
+            ) : (
+              <>
+                {paymentAttemptHistory.map((attempt) => (
+                  <View key={attempt.id} style={[styles.paymentReviewCard, { backgroundColor: colors.card, borderColor: colors.border }]}>
+                    <Text style={[styles.orderId, { color: colors.foreground }]}>{attempt.id} · {attempt.status}</Text>
+                    <Text style={[styles.detailText, { color: colors.mutedForeground, marginTop: 4 }]}>
+                      {attempt.customerName} · {attempt.customerPhone} · {formatPrice(attempt.total)}
+                    </Text>
+                    <Text style={[styles.detailText, { color: colors.mutedForeground, marginTop: 4 }]}>
+                      {attempt.rejectionReason || 'No additional review note.'}
+                    </Text>
+                  </View>
+                ))}
+                {legacyClosedOrders.map((order) => (
+                  <View key={`legacy-history-${order.id}`} style={[styles.paymentReviewCard, { backgroundColor: colors.card, borderColor: colors.border }]}>
+                    <Text style={[styles.orderId, { color: colors.foreground }]}>Legacy {order.paymentStatus || 'Unpaid'} · {order.id}</Text>
+                    <Text style={[styles.detailText, { color: colors.mutedForeground, marginTop: 4 }]}>
+                      {order.customerName} · {order.customerPhone} · {formatPrice(order.total)}
+                    </Text>
+                  </View>
+                ))}
+                {!paymentAttemptHistory.length && !legacyClosedOrders.length ? (
+                  <View style={[styles.emptyBox, { borderColor: colors.border }]}>
+                    <Feather name="archive" size={30} color={colors.mutedForeground} />
+                    <Text style={[styles.emptyText, { color: colors.foreground }]}>No rejected, cancelled, or expired attempts.</Text>
+                  </View>
+                ) : null}
+              </>
+            )}
+          </View>
+        )}
+
+        {/* ==================== 7. PAYMENT SETTINGS TAB ==================== */}
         {activeTab === 'payments' && (
           <View>
             <Text style={[styles.sectionHeading, { color: colors.foreground }]}>UPI & Google Pay Settings</Text>
@@ -1738,6 +2039,13 @@ const styles = StyleSheet.create({
   paymentBadgeText: { fontSize: 10, fontFamily: 'Inter_700Bold' },
   smallVerifyBtn: { flexDirection: 'row', alignItems: 'center', gap: 5, paddingHorizontal: 10, paddingVertical: 6, borderRadius: 8 },
   smallVerifyBtnText: { color: '#FFFFFF', fontSize: 11, fontFamily: 'Inter_700Bold' },
+  paymentViewRow: { flexDirection: 'row', gap: 8, marginTop: 15 },
+  paymentViewChip: { borderWidth: 1, borderRadius: 10, paddingHorizontal: 13, paddingVertical: 8 },
+  paymentViewChipText: { fontSize: 11, fontFamily: 'Inter_700Bold' },
+  paymentReviewCard: { padding: 14, borderRadius: 14, borderWidth: 1, marginTop: 12 },
+  paymentReviewHeader: { flexDirection: 'row', alignItems: 'flex-start', gap: 10 },
+  paymentActionRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginTop: 12 },
+  legacyUtrInput: { minHeight: 43, borderWidth: 1, borderRadius: 10, paddingHorizontal: 11, marginTop: 10, fontSize: 12 },
   qrPreviewBox: { flexDirection: 'row', alignItems: 'center', gap: 12, padding: 12, borderRadius: 12, borderWidth: 1, marginTop: 8 },
   qrImage: { width: 90, height: 90, borderRadius: 8 },
   qrTitle: { fontSize: 13, fontFamily: 'Inter_700Bold' },

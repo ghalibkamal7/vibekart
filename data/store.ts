@@ -163,6 +163,36 @@ export type OrderItem = {
   sourceUrl?: string; // admin-only, for manual "place this on Meesho" step
 };
 
+export type PaymentAttemptStatus =
+  | 'Pending'
+  | 'Submitted'
+  | 'Paid'
+  | 'Rejected'
+  | 'Cancelled'
+  | 'Expired';
+
+export type PaymentAttempt = {
+  id: string;
+  customerUid: string;
+  customerEmail?: string;
+  customerName: string;
+  customerPhone: string;
+  customerAddress: string;
+  items: OrderItem[];
+  total: number;
+  amountPaise?: number;
+  currency?: string;
+  paymentMethod: 'UPI';
+  status: PaymentAttemptStatus;
+  createdAt: string;
+  expiresAt: string;
+  submittedAt?: string;
+  customerUtr?: string;
+  paymentVerifiedAt?: string;
+  orderId?: string;
+  rejectionReason?: string;
+};
+
 export type Order = {
   id: string;
   items: OrderItem[];
@@ -443,7 +473,7 @@ export const defaultPaymentSettings: PaymentSettings = {
   merchantVpa: '',
   qrImageUrl: '',
   qrImagePublicId: '',
-  instructions: 'Scan the QR code with Google Pay, PhonePe, Paytm, or any UPI app. After payment, enter your 12-digit UPI Reference Number / UTR below.',
+  instructions: 'Scan the QR code with Google Pay, PhonePe, Paytm, or any UPI app. After payment, enter the transaction reference / UTR shown in your payment app. Reference formats vary by provider.',
   enabled: false,
   autoGenerateQr: true,
 };

@@ -13,6 +13,7 @@ import {
   serverTimestamp,
   setDoc,
   updateDoc,
+  where,
 } from 'firebase/firestore';
 import {
   AdminAuditLog,
@@ -22,7 +23,7 @@ import {
   defaultStoreSettings,
   NewProductInput,
   Order,
-  OrderStatus,
+  PaymentAttempt,
   PaymentSettings,
   Product,
   StoreSettings,
@@ -205,64 +206,7 @@ export async function setProductFeatured(id: string, featured: boolean): Promise
 }
 
 // ---------------- Orders ----------------
-// A customer can create an order and read only their own (uid == request
-// customerUid); only role == 'seller' can read every order, update status,
-// or set trackingId. costTotal/profitTotal/item.unitCost stay out of every
-// screen customers see, but — unlike products — they live on the same
-// order doc the customer owns, so a customer inspecting raw network traffic
-// could technically see them. That residual gap is called out in the
-// migration report; closing it fully would need the same doc-split treatment
-// applied to orders.
-
-export type NewOrderInput = {
-  customerUid: string;
-  items: Order['items'];
-  total: number;
-  costTotal?: number;
-  profitTotal?: number;
-  customerName: string;
-  customerPhone: string;
-  customerAddress: string;
-  paymentMethod: 'UPI' | 'COD';
-  idempotencyKey?: string;
-  customerUtr?: string;
-};
-
-export async function createOrderViaWorker(input: {
-  items: Array<{ productId: string; quantity: number; option?: string }>;
-  customerName: string;
-  customerPhone: string;
-  customerAddress: string;
-  paymentMethod: 'UPI' | 'COD';
-  idempotencyKey?: string;
-  customerUtr?: string;
-}): Promise<Order> {
-  const workerUrl = process.env.EXPO_PUBLIC_OTP_WORKER_URL?.replace(/\/+$/, '');
-  if (!workerUrl) {
-    throw new Error(
-      'EXPO_PUBLIC_OTP_WORKER_URL is not configured. Cloud order creation requires the secure pricing worker.',
-    );
-  }
-  const currentUser = auth?.currentUser;
-  if (!currentUser) {
-    throw new Error('You must be signed in to place an order.');
-  }
-  const idToken = await currentUser.getIdToken();
-  const response = await fetch(`${workerUrl}/create-order`, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${idToken}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify(input),
-  });
-
-  const resJson = (await response.json().catch(() => null)) as { success?: boolean; order?: Order; error?: string } | null;
-  if (!response.ok || !resJson?.success || !resJson.order) {
-    throw new Error(resJson?.error || `Order creation failed with status ${response.status}`);
-  }
-  return resJson.order;
-}
+// The Worker creates orders only after an administrator verifies the UPI credit.
 
 export async function fetchPaymentConfigViaWorker(): Promise<{
   gpayEnabled: boolean;
@@ -306,39 +250,6 @@ export async function fetchPaymentConfigViaWorker(): Promise<{
   }
 }
 
-export async function verifyPaymentViaWorker(input: {
-  orderId: string;
-  paymentReference?: string;
-  bankRrn?: string;
-}): Promise<{
-  success: boolean;
-  verified: boolean;
-  paymentStatus: string;
-  paymentVerifiedAt?: string;
-  bankRrn?: string;
-  error?: string;
-  message?: string;
-}> {
-  const workerUrl = process.env.EXPO_PUBLIC_OTP_WORKER_URL?.replace(/\/+$/, '');
-  if (!workerUrl) {
-    throw new Error('EXPO_PUBLIC_OTP_WORKER_URL is not configured.');
-  }
-  const currentUser = auth?.currentUser;
-  if (!currentUser) {
-    throw new Error('You must be signed in to verify payment.');
-  }
-  const idToken = await currentUser.getIdToken();
-  const response = await fetch(`${workerUrl}/payment/verify`, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${idToken}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify(input),
-  });
-  return response.json();
-}
-
 export async function fetchSellerOrderPrivateData(orderId: string): Promise<{
   costTotal?: number;
   profitTotal?: number;
@@ -359,49 +270,23 @@ export function subscribeToOrders(
   uidFilter?: string,
 ) {
   const database = requireDb();
-  const q = query(collection(database, ORDERS_COLLECTION), orderBy('createdAt', 'desc'));
+  const constraints = uidFilter
+    ? [where('customerUid', '==', uidFilter)]
+    : [orderBy('createdAt', 'desc')];
+  const q = query(collection(database, ORDERS_COLLECTION), ...constraints);
   return onSnapshot(
     q,
     (snapshot) => {
-      let orders = snapshot.docs.map((d) => ({ id: d.id, ...d.data() }) as Order & { customerUid?: string });
-      if (uidFilter) orders = orders.filter((order) => order.customerUid === uidFilter);
+      const orders = snapshot.docs
+        .map((d) => ({ id: d.id, ...d.data() }) as Order & { customerUid?: string; createdAt?: string })
+        .sort((a, b) => String(b.createdAt ?? '').localeCompare(String(a.createdAt ?? '')));
       onChange(orders);
     },
     (error) => onError?.(error as Error),
   );
 }
 
-export async function createOrder(input: NewOrderInput): Promise<string> {
-  const database = requireDb();
-  const paymentReference = `VKUPI${Date.now()}${Math.random().toString(36).substring(2, 10).toUpperCase()}`;
-  const docRef = await addDoc(collection(database, ORDERS_COLLECTION), {
-    customerUid: input.customerUid,
-    customerName: input.customerName,
-    customerPhone: input.customerPhone,
-    customerAddress: input.customerAddress,
-    paymentMethod: input.paymentMethod,
-    paymentStatus: 'Pending',
-    paymentReference,
-    ...(input.customerUtr ? { customerUtr: input.customerUtr } : {}),
-    amountPaise: Math.round(input.total * 100),
-    currency: 'INR',
-    status: 'Placed' as OrderStatus,
-    items: input.items.map((it) => ({
-      productId: it.productId,
-      name: it.name,
-      option: it.option,
-      quantity: it.quantity,
-      unitPrice: it.unitPrice,
-      itemTotal: it.unitPrice * it.quantity,
-    })),
-    total: input.total,
-    costReconciled: true,
-    createdAt: serverTimestamp(),
-  });
-  return docRef.id;
-}
-
-export async function updateOrderStatusRemote(id: string, status: OrderStatus): Promise<void> {
+export async function updateOrderStatusRemote(id: string, status: Order['status']): Promise<void> {
   const database = requireDb();
   await updateDoc(doc(database, ORDERS_COLLECTION, id), { status });
 }
@@ -598,21 +483,6 @@ export async function updatePaymentSettingsRemote(settings: Partial<PaymentSetti
   );
 }
 
-export async function updateOrderPaymentStatusRemote(
-  orderId: string,
-  paymentStatus: 'Paid' | 'Failed' | 'Pending',
-  extra?: { bankRrn?: string; customerUtr?: string },
-): Promise<void> {
-  const database = requireDb();
-  const patch: Record<string, unknown> = {
-    paymentStatus,
-    paymentVerifiedAt: paymentStatus === 'Paid' ? serverTimestamp() : null,
-  };
-  if (extra?.bankRrn !== undefined) patch.bankRrn = extra.bankRrn;
-  if (extra?.customerUtr !== undefined) patch.customerUtr = extra.customerUtr;
-  await updateDoc(doc(database, ORDERS_COLLECTION, orderId), patch);
-}
-
 // ---------------- Admin: Audit Logs ----------------
 
 export async function fetchAuditLogsRemote(): Promise<AdminAuditLog[]> {
@@ -652,4 +522,119 @@ export async function createAuditLogRemote(
     console.warn('[firestore] createAuditLogRemote failed', err);
     return `local-${Date.now()}`;
   }
+}
+
+function getPaymentWorkerUrl(): string {
+  const workerUrl = process.env.EXPO_PUBLIC_OTP_WORKER_URL?.replace(/\/+$/, '');
+  if (!workerUrl) throw new Error('EXPO_PUBLIC_OTP_WORKER_URL is not configured.');
+  return workerUrl;
+}
+
+async function postPaymentWorker<T>(path: string, input: unknown): Promise<T> {
+  const currentUser = auth?.currentUser;
+  if (!currentUser) throw new Error('You must be signed in to use payment features.');
+  const idToken = await currentUser.getIdToken();
+  const response = await fetch(`${getPaymentWorkerUrl()}${path}`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${idToken}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(input),
+  });
+  const payload = (await response.json().catch(() => null)) as
+    | (T & { error?: string })
+    | null;
+  if (!response.ok) throw new Error(payload?.error || `Payment request failed (${response.status}).`);
+  if (!payload) throw new Error('Payment service returned an empty response.');
+  return payload;
+}
+
+export async function createPaymentAttemptViaWorker(input: {
+  items: Array<{ productId: string; quantity: number; option?: string }>;
+  customerName: string;
+  customerPhone: string;
+  customerAddress: string;
+  paymentMethod: 'UPI';
+  idempotencyKey: string;
+}): Promise<PaymentAttempt> {
+  const response = await postPaymentWorker<{ success: boolean; attempt?: PaymentAttempt }>(
+    '/payment-attempts/create',
+    input,
+  );
+  if (!response.success || !response.attempt) throw new Error('Payment attempt was not created.');
+  return response.attempt;
+}
+
+export async function submitPaymentDetailsViaWorker(input: {
+  attemptId: string;
+  customerUtr: string;
+}): Promise<void> {
+  const response = await postPaymentWorker<{ success: boolean; message?: string }>(
+    '/payment-attempts/submit',
+    input,
+  );
+  if (!response.success) throw new Error(response.message || 'Payment details were not submitted.');
+}
+
+export async function confirmPaymentAttemptViaWorker(attemptId: string): Promise<void> {
+  const response = await postPaymentWorker<{ success: boolean; orderId?: string }>(
+    '/admin/payment-attempts/confirm',
+    { attemptId, actualCreditConfirmed: true },
+  );
+  if (!response.success || !response.orderId) throw new Error('Payment could not be confirmed.');
+}
+
+export async function reviewPaymentAttemptViaWorker(
+  action: 'reject' | 'cancel' | 'expire',
+  attemptId: string,
+  reason: string,
+): Promise<void> {
+  const response = await postPaymentWorker<{ success: boolean }>(
+    `/admin/payment-attempts/${action}`,
+    { attemptId, reason, adminReviewed: true },
+  );
+  if (!response.success) throw new Error('Payment attempt could not be updated.');
+}
+
+export async function confirmLegacyOrderPaymentViaWorker(
+  orderId: string,
+  customerUtr: string,
+): Promise<void> {
+  const response = await postPaymentWorker<{ success: boolean }>(
+    '/admin/legacy-orders/confirm-payment',
+    { orderId, customerUtr, actualCreditConfirmed: true },
+  );
+  if (!response.success) throw new Error('Legacy order payment could not be confirmed.');
+}
+
+export async function rejectLegacyOrderPaymentViaWorker(
+  orderId: string,
+  reason: string,
+): Promise<void> {
+  const response = await postPaymentWorker<{ success: boolean }>(
+    '/admin/legacy-orders/reject-payment',
+    { orderId, reason, adminReviewed: true },
+  );
+  if (!response.success) throw new Error('Legacy order payment could not be rejected.');
+}
+
+export function subscribeToPaymentAttempts(
+  onChange: (attempts: PaymentAttempt[]) => void,
+  onError?: (error: Error) => void,
+  uidFilter?: string,
+) {
+  const database = requireDb();
+  const constraints = uidFilter ? [where('customerUid', '==', uidFilter)] : [];
+  const q = query(collection(database, 'payment_attempts'), ...constraints);
+  return onSnapshot(
+    q,
+    (snapshot) => {
+      const attempts = snapshot.docs
+        .map((d) => ({ id: d.id, ...d.data() }) as PaymentAttempt)
+        .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+      onChange(attempts);
+    },
+    (error) => onError?.(error as Error),
+  );
 }

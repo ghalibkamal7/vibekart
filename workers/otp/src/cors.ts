@@ -19,8 +19,8 @@ export function corsHeaders(origin: string | null): Record<string, string> {
   const allowed = isAllowedOrigin(origin);
   return {
     'Access-Control-Allow-Origin': allowed ? (origin as string) : 'null',
-    'Access-Control-Allow-Methods': 'POST, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type',
+    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization',
     Vary: 'Origin',
   };
 }

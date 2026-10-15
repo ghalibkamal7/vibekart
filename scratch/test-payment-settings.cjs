@@ -1,11 +1,11 @@
 /**
- * Verification test for Self-Service UPI Payment Settings Module.
+ * Static smoke checks for the manual UPI payment-attempt workflow.
  * Tests:
  * 1. PaymentSettings default values and schema validation.
  * 2. buildUpiUri and buildUpiQrUrl URI generator functions.
  * 3. Firestore security rule constraints on /settings/payment (isSignedIn read, isAdmin write).
- * 4. Order creation with customerUtr and initial paymentStatus 'Pending'.
- * 5. Admin verification transitions (Pending -> Paid / Failed).
+ * 4. Payment attempts and admin verification use the Cloudflare Worker.
+ * 5. Clients cannot create orders or directly update payment status.
  * 6. Cloudinary usage assurance and no Firebase Storage / Blaze requirements.
  */
 
@@ -69,14 +69,19 @@ const firestoreSource = fs.readFileSync(path.join(__dirname, '../services/fireba
 assert(firestoreSource.includes('PAYMENT_SETTINGS_DOC_ID = \'payment\''), 'Missing PAYMENT_SETTINGS_DOC_ID');
 assert(firestoreSource.includes('fetchPaymentSettingsRemote'), 'Missing fetchPaymentSettingsRemote');
 assert(firestoreSource.includes('updatePaymentSettingsRemote'), 'Missing updatePaymentSettingsRemote');
-assert(firestoreSource.includes('updateOrderPaymentStatusRemote'), 'Missing updateOrderPaymentStatusRemote');
-console.log('✔ Firestore remote methods for payment settings and status updates verified.');
+assert(firestoreSource.includes('createPaymentAttemptViaWorker'), 'Missing Worker payment-attempt method');
+assert(firestoreSource.includes('confirmPaymentAttemptViaWorker'), 'Missing Worker admin-confirmation method');
+assert(!firestoreSource.includes('updateOrderPaymentStatusRemote'), 'Client payment-status writer must be removed');
+assert(!firestoreSource.includes('export async function createOrder('), 'Client order creation must be removed');
+console.log('✔ Firestore settings and trusted Worker payment methods verified.');
 
 // 5. Check Cloudflare Worker OTP handling for customerUtr
 const workerSource = fs.readFileSync(path.join(__dirname, '../workers/otp/src/index.ts'), 'utf8');
-assert(workerSource.includes('customerUtr?: string'), 'Worker schema missing customerUtr');
-assert(workerSource.includes('customerUtr ? { customerUtr }'), 'Worker publicOrderDoc missing customerUtr assignment');
-console.log('✔ Cloudflare Worker order creation accepts customerUtr.');
+assert(workerSource.includes('async function handleCreatePaymentAttempt'), 'Worker payment-attempt creation missing');
+assert(workerSource.includes("if (!/^pay-[a-f0-9]{64}$/.test(attemptId) || !customerUtr || customerUtr.length > 100)"), 'Worker must require and cap submitted UTRs');
+assert(workerSource.includes("if (url.pathname === '/create-order')"), 'Retired direct order route must be explicitly disabled');
+assert(!workerSource.includes("url.pathname === '/payment/verify'"), 'Customer verification route must not be active');
+console.log('✔ Cloudflare Worker attempt creation and UTR validation verified.');
 
 // 6. Check Admin Panel UI wiring
 const adminSource = fs.readFileSync(path.join(__dirname, '../app/admin.tsx'), 'utf8');
@@ -87,7 +92,7 @@ assert(adminSource.includes('handlePickQrImage'), 'Admin panel missing QR image 
 assert(adminSource.includes('uploadImageToCloudinary'), 'Admin panel should use uploadImageToCloudinary');
 assert(!adminSource.includes('firebase/storage'), 'Admin panel must not use Firebase Storage');
 assert(adminSource.includes('Visual Payment Prompt'), 'Admin panel missing disclaimer on QR / verification');
-assert(adminSource.includes('handleVerifyOrderPayment'), 'Admin panel missing order payment verification action');
+assert(adminSource.includes('handleVerifyPaymentAttempt'), 'Admin panel missing payment-attempt verification action');
 console.log('✔ Admin Panel Payment Settings UI and Order verification actions verified.');
 
 // 7. Check Checkout flow
@@ -95,7 +100,7 @@ const checkoutSource = fs.readFileSync(path.join(__dirname, '../app/checkout.tsx
 assert(checkoutSource.includes('paymentSettings'), 'Checkout missing paymentSettings from StoreContext');
 assert(checkoutSource.includes('manualUpiReady'), 'Checkout missing manualUpiReady check');
 assert(checkoutSource.includes('customerUtr'), 'Checkout missing customerUtr input');
-assert(checkoutSource.includes('Pending Verification'), 'Checkout missing Pending Verification disclosure');
+assert(checkoutSource.includes('awaiting verification'), 'Checkout missing verification status disclosure');
 // 8. Check StoreContext admin order subscription and caching
 const storeContextSource = fs.readFileSync(path.join(__dirname, '../context/StoreContext.tsx'), 'utf8');
 assert(storeContextSource.includes("authUser.role === 'seller' || authUser.role === 'admin'"), 'Admin not included in order subscription filter');
@@ -103,13 +108,15 @@ assert(storeContextSource.includes('await AsyncStorage.setItem(STORAGE_KEYS.paym
 console.log('✔ StoreContext admin order filter and AsyncStorage caching verified.');
 
 // 9. Check Customer cannot set paymentStatus in firestore.rules
-assert(rulesSource.includes("request.resource.data.paymentStatus in ['Selected', 'Pending']"), 'Order creation must constrain paymentStatus to Selected or Pending');
+assert(rulesSource.includes('allow create: if false;'), 'Clients must not create orders directly');
+assert(rulesSource.includes('match /payment_attempts/{attemptId}'), 'Payment attempt rules missing');
+assert(rulesSource.includes('allow create, update, delete: if false;'), 'Clients must not write payment attempts');
 assert(rulesSource.includes("request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status'])"), 'Customer update must only affect status key');
-console.log('✔ Firestore rules block customer from setting paymentStatus to Paid.');
+console.log('✔ Firestore rules block client-created orders and payment attempts.');
 
-// 10. Check Cloudflare Worker hardcoded Pending and customerUtr capping
-assert(workerSource.includes("paymentStatus: 'Pending'"), 'Worker must hardcode paymentStatus to Pending');
-assert(workerSource.includes('.slice(0, 100)'), 'Worker must cap customerUtr length');
-console.log('✔ Worker order creation hardcodes paymentStatus: Pending and caps UTR length.');
+// 10. Check that only admin confirmation marks orders paid.
+assert(workerSource.includes('body?.actualCreditConfirmed !== true'), 'Admin must explicitly confirm merchant-account credit');
+assert(workerSource.includes("paymentStatus: 'Paid'"), 'Worker must mark an order paid after authorized confirmation');
+console.log('✔ Worker requires admin-confirmed merchant credit before marking paid.');
 
 console.log('\n--- ALL PAYMENT SETTINGS TESTS PASSED SUCCESSFULLY! ---');

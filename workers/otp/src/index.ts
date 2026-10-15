@@ -1,10 +1,13 @@
 import { corsHeaders, isAllowedOrigin, jsonResponse } from './cors';
 import {
   createUserProfileDoc,
+  commitFirestoreWrites,
   getOrderDoc,
   getProductDoc,
   getProductPrivateDoc,
+  getVersionedDocument,
   saveOrderTwoDoc,
+  toFirestoreFields,
   updateOrderPaymentDoc,
   userProfileExists,
 } from './firestore';
@@ -489,6 +492,552 @@ async function handlePaymentVerify(request: Request, env: Env, origin: string | 
   }
 }
 
+type AuthenticatedCaller = {
+  sa: ReturnType<typeof parseServiceAccount>;
+  accessToken: string;
+  uid: string;
+  email?: string;
+  profile: Record<string, any>;
+};
+
+async function authenticateCaller(
+  request: Request,
+  env: Env,
+  origin: string | null,
+): Promise<AuthenticatedCaller | Response> {
+  const authorization = request.headers.get('Authorization') ?? '';
+  const idToken = authorization.startsWith('Bearer ') ? authorization.slice(7).trim() : '';
+  if (!idToken) return jsonResponse({ error: 'Authentication token required.' }, 401, origin);
+
+  try {
+    const sa = parseServiceAccount(env.FIREBASE_SERVICE_ACCOUNT_JSON);
+    const accessToken = await getGoogleAccessToken(sa);
+    const user = await verifyFirebaseIdToken(sa, accessToken, idToken);
+    if (!user) return jsonResponse({ error: 'Invalid or expired authentication token.' }, 401, origin);
+
+    const profile = await getVersionedDocument(sa, accessToken, `users/${user.uid}`);
+    if (!profile.exists || !profile.data || profile.data.status === 'suspended') {
+      return jsonResponse({ error: 'This account is not authorized to use payment features.' }, 403, origin);
+    }
+    return { sa, accessToken, uid: user.uid, email: user.email, profile: profile.data };
+  } catch (error) {
+    console.error('[payment] Caller authentication failed', error);
+    return jsonResponse({ error: 'Payment service authentication is temporarily unavailable.' }, 503, origin);
+  }
+}
+
+function isAuthenticatedCaller(value: AuthenticatedCaller | Response): value is AuthenticatedCaller {
+  return !(value instanceof Response);
+}
+
+function firestoreDocumentName(sa: ReturnType<typeof parseServiceAccount>, path: string): string {
+  return `projects/${sa.project_id}/databases/(default)/documents/${path}`;
+}
+
+async function hashValue(value: string): Promise<string> {
+  const bytes = new TextEncoder().encode(value);
+  const digest = await crypto.subtle.digest('SHA-256', bytes);
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('');
+}
+
+async function hashReference(value: string): Promise<string> {
+  return hashValue(value.trim().toLocaleUpperCase('en-US'));
+}
+
+async function handleCreatePaymentAttempt(request: Request, env: Env, origin: string | null): Promise<Response> {
+  const caller = await authenticateCaller(request, env, origin);
+  if (!isAuthenticatedCaller(caller)) return caller;
+
+  const body = (await request.json().catch(() => null)) as {
+    items?: Array<{ productId: string; quantity: number; option?: string }>;
+    customerName?: string;
+    customerPhone?: string;
+    customerAddress?: string;
+    paymentMethod?: string;
+    idempotencyKey?: string;
+  } | null;
+  if (!body || body.paymentMethod !== 'UPI') {
+    return jsonResponse({ error: 'Only UPI payment attempts are accepted.' }, 400, origin);
+  }
+  if (!Array.isArray(body.items) || body.items.length < 1 || body.items.length > 50) {
+    return jsonResponse({ error: 'Payment attempt must contain between 1 and 50 items.' }, 400, origin);
+  }
+
+  const customerName = String(body.customerName ?? '').trim();
+  const customerPhone = String(body.customerPhone ?? '').trim();
+  const customerAddress = String(body.customerAddress ?? '').trim();
+  const idempotencyKey = String(body.idempotencyKey ?? '').trim();
+  if (
+    !customerName || customerName.length > 120 ||
+    !customerPhone || customerPhone.length > 40 ||
+    !customerAddress || customerAddress.length > 1000
+  ) {
+    return jsonResponse({ error: 'Enter a valid name, phone number, and delivery address.' }, 400, origin);
+  }
+  if (idempotencyKey.length < 8 || idempotencyKey.length > 200) {
+    return jsonResponse({ error: 'A valid payment attempt idempotency key is required.' }, 400, origin);
+  }
+
+  const attemptKey = await hashValue(`${caller.uid}:${idempotencyKey}`);
+  const attemptId = `pay-${attemptKey}`;
+  const existing = await getVersionedDocument(caller.sa, caller.accessToken, `payment_attempts/${attemptId}`);
+  if (existing.exists) {
+    if (existing.data?.customerUid !== caller.uid) {
+      return jsonResponse({ error: 'Payment attempt could not be loaded.' }, 409, origin);
+    }
+    return jsonResponse({ success: true, attempt: existing.data }, 200, origin);
+  }
+
+  const publicItems: Array<Record<string, unknown>> = [];
+  const privateItems: Array<Record<string, unknown>> = [];
+  let total = 0;
+  let costTotal = 0;
+  for (const item of body.items) {
+    if (!item || typeof item.productId !== 'string' || !/^[A-Za-z0-9_-]{1,150}$/.test(item.productId)) {
+      return jsonResponse({ error: 'Invalid product item format.' }, 400, origin);
+    }
+    const quantity = Number(item.quantity);
+    if (!Number.isInteger(quantity) || quantity < 1 || quantity > 50) {
+      return jsonResponse({ error: 'Item quantity must be an integer between 1 and 50.' }, 400, origin);
+    }
+
+    const product = await getProductDoc(caller.sa, caller.accessToken, item.productId);
+    if (!product.exists || !product.data) {
+      return jsonResponse({ error: `Product ${item.productId} is no longer available.` }, 400, origin);
+    }
+    if (product.data.enabled === false || product.data.inStock === false) {
+      return jsonResponse({ error: `Product "${product.data.name || item.productId}" is unavailable or out of stock.` }, 409, origin);
+    }
+    const unitPrice = Number(product.data.price);
+    if (!Number.isSafeInteger(unitPrice) || unitPrice < 0) {
+      return jsonResponse({ error: `Product "${product.data.name || item.productId}" has an invalid price.` }, 409, origin);
+    }
+    const itemTotal = unitPrice * quantity;
+    total += itemTotal;
+    publicItems.push({
+      productId: item.productId,
+      name: String(product.data.name || 'Product').slice(0, 200),
+      ...(typeof item.option === 'string' && item.option.trim()
+        ? { option: item.option.trim().slice(0, 100) }
+        : {}),
+      quantity,
+      unitPrice,
+      itemTotal,
+    });
+
+    const privateProduct = await getProductPrivateDoc(caller.sa, caller.accessToken, item.productId);
+    const privateData = privateProduct.data || {};
+    const unitCost = Math.max(0, Math.round(Number(privateData.baseCost) || 0));
+    costTotal += unitCost * quantity;
+    privateItems.push({
+      productId: item.productId,
+      unitCost,
+      ...(privateData.sourceUrl ? { sourceUrl: String(privateData.sourceUrl) } : {}),
+      ...(privateData.sourceCode ? { sourceCode: String(privateData.sourceCode) } : {}),
+    });
+  }
+  if (!Number.isSafeInteger(total) || !Number.isSafeInteger(total * 100) || total <= 0) {
+    return jsonResponse({ error: 'The payable amount must be greater than zero.' }, 400, origin);
+  }
+
+  const createdAt = new Date().toISOString();
+  const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+  const attempt = {
+    id: attemptId,
+    customerUid: caller.uid,
+    ...(caller.email ? { customerEmail: caller.email } : {}),
+    customerName,
+    customerPhone,
+    customerAddress,
+    items: publicItems,
+    total,
+    amountPaise: total * 100,
+    currency: 'INR',
+    paymentMethod: 'UPI',
+    status: 'Pending',
+    createdAt,
+    expiresAt,
+  };
+  const privateAttempt = {
+    costTotal,
+    profitTotal: total - costTotal,
+    items: privateItems,
+    createdAt,
+  };
+  const writes = [
+    {
+      update: {
+        name: firestoreDocumentName(caller.sa, `payment_attempts/${attemptId}`),
+        fields: toFirestoreFields(attempt),
+      },
+      currentDocument: { exists: false },
+    },
+    {
+      update: {
+        name: firestoreDocumentName(caller.sa, `payment_attempts/${attemptId}/private/data`),
+        fields: toFirestoreFields(privateAttempt),
+      },
+      currentDocument: { exists: false },
+    },
+  ];
+  try {
+    await commitFirestoreWrites(caller.sa, caller.accessToken, writes);
+    return jsonResponse({ success: true, attempt }, 201, origin);
+  } catch (error) {
+    // A retry with the same idempotency key may race the first commit.
+    const retry = await getVersionedDocument(caller.sa, caller.accessToken, `payment_attempts/${attemptId}`);
+    if (retry.exists && retry.data?.customerUid === caller.uid) {
+      return jsonResponse({ success: true, attempt: retry.data }, 200, origin);
+    }
+    console.error('[payment] Failed to create payment attempt', error);
+    return jsonResponse({ error: 'Could not create the payment attempt. Please try again.' }, 500, origin);
+  }
+}
+
+async function handleSubmitPaymentDetails(request: Request, env: Env, origin: string | null): Promise<Response> {
+  const caller = await authenticateCaller(request, env, origin);
+  if (!isAuthenticatedCaller(caller)) return caller;
+  const body = (await request.json().catch(() => null)) as { attemptId?: string; customerUtr?: string } | null;
+  const attemptId = String(body?.attemptId ?? '').trim();
+  const customerUtr = String(body?.customerUtr ?? '').trim();
+  if (!/^pay-[a-f0-9]{64}$/.test(attemptId) || !customerUtr || customerUtr.length > 100) {
+    return jsonResponse({ error: 'Enter the UTR/reference number from your payment app.' }, 400, origin);
+  }
+
+  const attempt = await getVersionedDocument(caller.sa, caller.accessToken, `payment_attempts/${attemptId}`);
+  if (!attempt.exists || !attempt.data) return jsonResponse({ error: 'Payment attempt not found.' }, 404, origin);
+  if (attempt.data.customerUid !== caller.uid) return jsonResponse({ error: 'You cannot update this payment attempt.' }, 403, origin);
+  if (attempt.data.status === 'Submitted' && attempt.data.customerUtr === customerUtr) {
+    return jsonResponse({ success: true, status: 'Submitted', message: 'Payment details were already submitted.' }, 200, origin);
+  }
+  if (!['Pending', 'Submitted'].includes(String(attempt.data.status))) {
+    return jsonResponse({ error: 'This payment attempt is no longer accepting payment details.' }, 409, origin);
+  }
+  if (!attempt.updateTime) return jsonResponse({ error: 'Payment attempt version is unavailable.' }, 503, origin);
+
+  const submittedAt = new Date().toISOString();
+  const path = `payment_attempts/${attemptId}`;
+  try {
+    await commitFirestoreWrites(caller.sa, caller.accessToken, [{
+      update: {
+        name: firestoreDocumentName(caller.sa, path),
+        fields: toFirestoreFields({ customerUtr, submittedAt, status: 'Submitted' }),
+      },
+      updateMask: { fieldPaths: ['customerUtr', 'submittedAt', 'status'] },
+      currentDocument: { updateTime: attempt.updateTime },
+    }]);
+  } catch (error) {
+    const retry = await getVersionedDocument(caller.sa, caller.accessToken, path);
+    if (retry.data?.customerUid === caller.uid && retry.data.status === 'Submitted' && retry.data.customerUtr === customerUtr) {
+      return jsonResponse({ success: true, status: 'Submitted', message: 'Payment details were already submitted.' }, 200, origin);
+    }
+    console.error('[payment] Failed to submit payment details', error);
+    return jsonResponse({ error: 'Could not submit payment details. Please retry.' }, 409, origin);
+  }
+  return jsonResponse({
+    success: true,
+    status: 'Submitted',
+    message: 'Payment details submitted. Your payment is awaiting verification.',
+  }, 200, origin);
+}
+
+async function requireAdmin(
+  caller: AuthenticatedCaller,
+  origin: string | null,
+): Promise<Response | null> {
+  if (caller.profile.role !== 'admin' || caller.profile.status === 'suspended') {
+    return jsonResponse({ error: 'Only an active administrator can review payments.' }, 403, origin);
+  }
+  return null;
+}
+
+async function handleConfirmPaymentAttempt(request: Request, env: Env, origin: string | null): Promise<Response> {
+  const caller = await authenticateCaller(request, env, origin);
+  if (!isAuthenticatedCaller(caller)) return caller;
+  const denied = await requireAdmin(caller, origin);
+  if (denied) return denied;
+  const body = (await request.json().catch(() => null)) as {
+    attemptId?: string;
+    actualCreditConfirmed?: boolean;
+  } | null;
+  const attemptId = String(body?.attemptId ?? '').trim();
+  if (!/^pay-[a-f0-9]{64}$/.test(attemptId) || body?.actualCreditConfirmed !== true) {
+    return jsonResponse({ error: 'Confirm that you checked the merchant account credit before verifying.' }, 400, origin);
+  }
+
+  const attemptPath = `payment_attempts/${attemptId}`;
+  const attempt = await getVersionedDocument(caller.sa, caller.accessToken, attemptPath);
+  if (!attempt.exists || !attempt.data) return jsonResponse({ error: 'Payment attempt not found.' }, 404, origin);
+  if (attempt.data.status === 'Paid' && typeof attempt.data.orderId === 'string') {
+    return jsonResponse({ success: true, orderId: attempt.data.orderId, status: 'Paid' }, 200, origin);
+  }
+  if (attempt.data.status !== 'Submitted' || !String(attempt.data.customerUtr ?? '').trim()) {
+    return jsonResponse({ error: 'A submitted UTR is required before payment verification.' }, 409, origin);
+  }
+  if (!attempt.updateTime) return jsonResponse({ error: 'Payment attempt version is unavailable.' }, 503, origin);
+
+  const reference = String(attempt.data.customerUtr).trim();
+  const referenceHash = await hashReference(reference);
+  const claimPath = `payment_reference_claims/${referenceHash}`;
+  const claim = await getVersionedDocument(caller.sa, caller.accessToken, claimPath);
+  const orderId = `ord-${attemptId.slice(4)}`;
+  if (claim.exists && claim.data?.attemptId !== attemptId) {
+    return jsonResponse({ error: 'This transaction reference has already been used for another payment.' }, 409, origin);
+  }
+
+  const privateAttempt = await getVersionedDocument(caller.sa, caller.accessToken, `${attemptPath}/private/data`);
+  const privateData = privateAttempt.data || {};
+  const now = new Date().toISOString();
+  const order = {
+    id: orderId,
+    customerUid: attempt.data.customerUid,
+    ...(attempt.data.customerEmail ? { customerEmail: attempt.data.customerEmail } : {}),
+    customerName: attempt.data.customerName,
+    customerPhone: attempt.data.customerPhone,
+    customerAddress: attempt.data.customerAddress,
+    paymentMethod: 'UPI',
+    paymentStatus: 'Paid',
+    customerUtr: reference,
+    paymentVerifiedAt: now,
+    amountPaise: attempt.data.amountPaise,
+    currency: 'INR',
+    paymentInitiatedAt: attempt.data.createdAt,
+    status: 'Placed',
+    items: attempt.data.items,
+    total: attempt.data.total,
+    costReconciled: true,
+    date: new Date().toLocaleDateString('en-IN', { day: '2-digit', month: 'short' }),
+    createdAt: attempt.data.createdAt,
+  };
+  const privateOrder = {
+    costTotal: Number(privateData.costTotal) || 0,
+    profitTotal: Number(privateData.profitTotal) || 0,
+    items: Array.isArray(privateData.items) ? privateData.items : [],
+    reconciled: true,
+    createdAt: now,
+  };
+  const attemptUpdates = {
+    status: 'Paid',
+    orderId,
+    paymentVerifiedAt: now,
+    verifiedByUid: caller.uid,
+  };
+  const writes: Record<string, unknown>[] = [
+    {
+      update: {
+        name: firestoreDocumentName(caller.sa, attemptPath),
+        fields: toFirestoreFields(attemptUpdates),
+      },
+      updateMask: { fieldPaths: Object.keys(attemptUpdates) },
+      currentDocument: { updateTime: attempt.updateTime },
+    },
+    {
+      update: {
+        name: firestoreDocumentName(caller.sa, `orders/${orderId}`),
+        fields: toFirestoreFields(order),
+      },
+      currentDocument: { exists: false },
+    },
+    {
+      update: {
+        name: firestoreDocumentName(caller.sa, `orders/${orderId}/private/data`),
+        fields: toFirestoreFields(privateOrder),
+      },
+      currentDocument: { exists: false },
+    },
+  ];
+  if (!claim.exists) {
+    writes.push({
+      update: {
+        name: firestoreDocumentName(caller.sa, claimPath),
+        fields: toFirestoreFields({ reference, attemptId, orderId, claimedAt: now }),
+      },
+      currentDocument: { exists: false },
+    });
+  }
+
+  try {
+    await commitFirestoreWrites(caller.sa, caller.accessToken, writes);
+  } catch (error) {
+    const retry = await getVersionedDocument(caller.sa, caller.accessToken, attemptPath);
+    if (retry.data?.status === 'Paid' && typeof retry.data.orderId === 'string') {
+      return jsonResponse({ success: true, orderId: retry.data.orderId, status: 'Paid' }, 200, origin);
+    }
+    const claimed = await getVersionedDocument(caller.sa, caller.accessToken, claimPath);
+    if (claimed.exists && claimed.data?.attemptId !== attemptId) {
+      return jsonResponse({ error: 'This transaction reference has already been used for another payment.' }, 409, origin);
+    }
+    console.error('[payment] Atomic payment confirmation failed', error);
+    return jsonResponse({ error: 'Payment confirmation could not be saved. No order was finalized.' }, 409, origin);
+  }
+  return jsonResponse({ success: true, orderId, status: 'Paid' }, 200, origin);
+}
+
+async function handlePaymentAttemptAction(
+  request: Request,
+  env: Env,
+  origin: string | null,
+  action: 'reject' | 'cancel' | 'expire',
+): Promise<Response> {
+  const caller = await authenticateCaller(request, env, origin);
+  if (!isAuthenticatedCaller(caller)) return caller;
+  const denied = await requireAdmin(caller, origin);
+  if (denied) return denied;
+  const body = (await request.json().catch(() => null)) as {
+    attemptId?: string;
+    reason?: string;
+    adminReviewed?: boolean;
+  } | null;
+  const attemptId = String(body?.attemptId ?? '').trim();
+  const reason = String(body?.reason ?? '').trim();
+  if (!/^pay-[a-f0-9]{64}$/.test(attemptId) || !reason || reason.length > 300 || body?.adminReviewed !== true) {
+    return jsonResponse({ error: 'A review confirmation and reason are required.' }, 400, origin);
+  }
+  const path = `payment_attempts/${attemptId}`;
+  const attempt = await getVersionedDocument(caller.sa, caller.accessToken, path);
+  if (!attempt.exists || !attempt.data) return jsonResponse({ error: 'Payment attempt not found.' }, 404, origin);
+  if (['Paid', 'Rejected', 'Cancelled', 'Expired'].includes(String(attempt.data.status))) {
+    return jsonResponse({ success: true, status: attempt.data.status }, 200, origin);
+  }
+  if (action === 'reject' && attempt.data.status !== 'Submitted') {
+    return jsonResponse({ error: 'Only submitted payment details can be rejected.' }, 409, origin);
+  }
+  if (action === 'expire' && Date.parse(String(attempt.data.expiresAt)) > Date.now()) {
+    return jsonResponse({ error: 'This payment attempt has not reached its expiry time.' }, 409, origin);
+  }
+  if (!attempt.updateTime) return jsonResponse({ error: 'Payment attempt version is unavailable.' }, 503, origin);
+
+  const status = action === 'reject' ? 'Rejected' : action === 'expire' ? 'Expired' : 'Cancelled';
+  const now = new Date().toISOString();
+  try {
+    await commitFirestoreWrites(caller.sa, caller.accessToken, [{
+      update: {
+        name: firestoreDocumentName(caller.sa, path),
+        fields: toFirestoreFields({
+          status,
+          rejectionReason: reason,
+          reviewedAt: now,
+          reviewedByUid: caller.uid,
+        }),
+      },
+      updateMask: { fieldPaths: ['status', 'rejectionReason', 'reviewedAt', 'reviewedByUid'] },
+      currentDocument: { updateTime: attempt.updateTime },
+    }]);
+  } catch (error) {
+    const retry = await getVersionedDocument(caller.sa, caller.accessToken, path);
+    if (retry.data?.status === status) return jsonResponse({ success: true, status }, 200, origin);
+    console.error('[payment] Failed to update payment attempt status', error);
+    return jsonResponse({ error: 'Could not update payment attempt. Please refresh and retry.' }, 409, origin);
+  }
+  return jsonResponse({ success: true, status }, 200, origin);
+}
+
+async function handleConfirmLegacyOrderPayment(request: Request, env: Env, origin: string | null): Promise<Response> {
+  const caller = await authenticateCaller(request, env, origin);
+  if (!isAuthenticatedCaller(caller)) return caller;
+  const denied = await requireAdmin(caller, origin);
+  if (denied) return denied;
+  const body = (await request.json().catch(() => null)) as {
+    orderId?: string;
+    customerUtr?: string;
+    actualCreditConfirmed?: boolean;
+  } | null;
+  const orderId = String(body?.orderId ?? '').trim();
+  const reference = String(body?.customerUtr ?? '').trim();
+  if (!/^[A-Za-z0-9_-]{1,150}$/.test(orderId) || !reference || reference.length > 100 || body?.actualCreditConfirmed !== true) {
+    return jsonResponse({ error: 'A transaction reference and actual-credit confirmation are required.' }, 400, origin);
+  }
+  const orderPath = `orders/${orderId}`;
+  const order = await getVersionedDocument(caller.sa, caller.accessToken, orderPath);
+  if (!order.exists || !order.data) return jsonResponse({ error: 'Order not found.' }, 404, origin);
+  if (order.data.paymentStatus === 'Paid') return jsonResponse({ success: true, orderId, status: 'Paid' }, 200, origin);
+  if (order.data.paymentMethod !== 'UPI' || order.data.paymentStatus === 'Failed' || order.data.status === 'Cancelled') {
+    return jsonResponse({ error: 'This legacy order is not eligible for payment confirmation.' }, 409, origin);
+  }
+  if (!order.updateTime) return jsonResponse({ error: 'Order version is unavailable.' }, 503, origin);
+
+  const referenceHash = await hashReference(reference);
+  const claimPath = `payment_reference_claims/${referenceHash}`;
+  const claim = await getVersionedDocument(caller.sa, caller.accessToken, claimPath);
+  if (claim.exists && claim.data?.orderId !== orderId) {
+    return jsonResponse({ error: 'This transaction reference has already been used for another payment.' }, 409, origin);
+  }
+  const now = new Date().toISOString();
+  const updates = {
+    paymentStatus: 'Paid',
+    customerUtr: reference,
+    paymentVerifiedAt: now,
+  };
+  const writes: Record<string, unknown>[] = [{
+    update: {
+      name: firestoreDocumentName(caller.sa, orderPath),
+      fields: toFirestoreFields(updates),
+    },
+    updateMask: { fieldPaths: Object.keys(updates) },
+    currentDocument: { updateTime: order.updateTime },
+  }];
+  if (!claim.exists) {
+    writes.push({
+      update: {
+        name: firestoreDocumentName(caller.sa, claimPath),
+        fields: toFirestoreFields({ reference, orderId, claimedAt: now }),
+      },
+      currentDocument: { exists: false },
+    });
+  }
+  try {
+    await commitFirestoreWrites(caller.sa, caller.accessToken, writes);
+  } catch (error) {
+    const retry = await getVersionedDocument(caller.sa, caller.accessToken, orderPath);
+    if (retry.data?.paymentStatus === 'Paid') return jsonResponse({ success: true, orderId, status: 'Paid' }, 200, origin);
+    console.error('[payment] Failed to verify legacy order payment', error);
+    return jsonResponse({ error: 'Could not confirm legacy order payment. Please refresh and retry.' }, 409, origin);
+  }
+  return jsonResponse({ success: true, orderId, status: 'Paid' }, 200, origin);
+}
+
+async function handleRejectLegacyOrderPayment(request: Request, env: Env, origin: string | null): Promise<Response> {
+  const caller = await authenticateCaller(request, env, origin);
+  if (!isAuthenticatedCaller(caller)) return caller;
+  const denied = await requireAdmin(caller, origin);
+  if (denied) return denied;
+  const body = (await request.json().catch(() => null)) as {
+    orderId?: string;
+    reason?: string;
+    adminReviewed?: boolean;
+  } | null;
+  const orderId = String(body?.orderId ?? '').trim();
+  const reason = String(body?.reason ?? '').trim();
+  if (!/^[A-Za-z0-9_-]{1,150}$/.test(orderId) || !reason || reason.length > 300 || body?.adminReviewed !== true) {
+    return jsonResponse({ error: 'A review confirmation and reason are required.' }, 400, origin);
+  }
+  const path = `orders/${orderId}`;
+  const order = await getVersionedDocument(caller.sa, caller.accessToken, path);
+  if (!order.exists || !order.data) return jsonResponse({ error: 'Order not found.' }, 404, origin);
+  if (order.data.paymentStatus === 'Paid') {
+    return jsonResponse({ error: 'A paid order cannot be rejected from payment review.' }, 409, origin);
+  }
+  if (!order.updateTime) return jsonResponse({ error: 'Order version is unavailable.' }, 503, origin);
+  try {
+    await commitFirestoreWrites(caller.sa, caller.accessToken, [{
+      update: {
+        name: firestoreDocumentName(caller.sa, path),
+        fields: toFirestoreFields({ paymentStatus: 'Failed', status: 'Cancelled', paymentReviewReason: reason }),
+      },
+      updateMask: { fieldPaths: ['paymentStatus', 'status', 'paymentReviewReason'] },
+      currentDocument: { updateTime: order.updateTime },
+    }]);
+  } catch (error) {
+    const retry = await getVersionedDocument(caller.sa, caller.accessToken, path);
+    if (retry.data?.paymentStatus === 'Failed' && retry.data.status === 'Cancelled') {
+      return jsonResponse({ success: true, orderId, status: 'Rejected' }, 200, origin);
+    }
+    console.error('[payment] Failed to reject legacy order payment', error);
+    return jsonResponse({ error: 'Could not reject legacy order payment. Please refresh and retry.' }, 409, origin);
+  }
+  return jsonResponse({ success: true, orderId, status: 'Rejected' }, 200, origin);
+}
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const origin = request.headers.get('Origin');
@@ -501,18 +1050,32 @@ export default {
       return jsonResponse({ error: 'Origin not allowed.' }, 403, null);
     }
 
-    if (request.method === 'GET' && url.pathname === '/payment/config') {
-      return handlePaymentConfig(request, env, origin);
-    }
+    try {
+      if (request.method === 'GET' && url.pathname === '/payment/config') {
+        return handlePaymentConfig(request, env, origin);
+      }
 
-    if (request.method !== 'POST') {
-      return jsonResponse({ error: 'Method not allowed.' }, 405, origin);
-    }
+      if (request.method !== 'POST') {
+        return jsonResponse({ error: 'Method not allowed.' }, 405, origin);
+      }
 
-    if (url.pathname === '/send-otp') return handleSendOtp(request, env, origin);
-    if (url.pathname === '/verify-otp') return handleVerifyOtp(request, env, origin);
-    if (url.pathname === '/create-order') return handleCreateOrder(request, env, origin);
-    if (url.pathname === '/payment/verify') return handlePaymentVerify(request, env, origin);
-    return jsonResponse({ error: 'Not found.' }, 404, origin);
+      if (url.pathname === '/send-otp') return handleSendOtp(request, env, origin);
+      if (url.pathname === '/verify-otp') return handleVerifyOtp(request, env, origin);
+      if (url.pathname === '/payment-attempts/create') return handleCreatePaymentAttempt(request, env, origin);
+      if (url.pathname === '/create-order') {
+        return jsonResponse({ error: 'Direct order creation is disabled. Create a payment attempt instead.' }, 410, origin);
+      }
+      if (url.pathname === '/payment-attempts/submit') return handleSubmitPaymentDetails(request, env, origin);
+      if (url.pathname === '/admin/payment-attempts/confirm') return handleConfirmPaymentAttempt(request, env, origin);
+      if (url.pathname === '/admin/payment-attempts/reject') return handlePaymentAttemptAction(request, env, origin, 'reject');
+      if (url.pathname === '/admin/payment-attempts/cancel') return handlePaymentAttemptAction(request, env, origin, 'cancel');
+      if (url.pathname === '/admin/payment-attempts/expire') return handlePaymentAttemptAction(request, env, origin, 'expire');
+      if (url.pathname === '/admin/legacy-orders/confirm-payment') return handleConfirmLegacyOrderPayment(request, env, origin);
+      if (url.pathname === '/admin/legacy-orders/reject-payment') return handleRejectLegacyOrderPayment(request, env, origin);
+      return jsonResponse({ error: 'Not found.' }, 404, origin);
+    } catch (error) {
+      console.error('[worker] Unhandled request failure', error);
+      return jsonResponse({ error: 'The request could not be completed. Please retry.' }, 500, origin);
+    }
   },
 };

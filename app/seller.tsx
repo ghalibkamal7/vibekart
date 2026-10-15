@@ -33,9 +33,10 @@ export default function SellerScreen() {
   const isSeller = !isCloudMode || (authUser && !authUser.isGuest && authUser.role === 'seller');
 
   const filteredOrders = useMemo(() => {
-    if (dateFilter === 'All Time') return orders;
+    const paidOrders = orders.filter((order) => order.paymentStatus === 'Paid');
+    if (dateFilter === 'All Time') return paidOrders;
     const days = dateFilter === 'Today' ? 1 : 7;
-    return orders.filter((o) => isWithinDays(o.date, days));
+    return paidOrders.filter((o) => isWithinDays(o.date, days));
   }, [orders, dateFilter]);
 
   const filteredAnalytics = useMemo(() => {

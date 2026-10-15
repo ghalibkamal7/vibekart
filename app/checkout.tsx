@@ -1,6 +1,6 @@
 import { Feather } from '@expo/vector-icons';
 import { router } from 'expo-router';
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
@@ -19,6 +19,7 @@ import { buildUpiQrUrl, buildUpiUri, formatPrice } from '@/data/store';
 import { useColors } from '@/hooks/useColors';
 import { useStore } from '@/context/StoreContext';
 import { fetchPaymentConfigViaWorker } from '@/services/firebase/firestore';
+import { PaymentAttempt } from '@/data/store';
 
 /**
  * DIRECT GOOGLE PAY INDIA (UPI) CONFIGURATION
@@ -36,13 +37,26 @@ const MERCHANT_NAME = process.env.EXPO_PUBLIC_MERCHANT_NAME || 'VibeKart';
 export default function CheckoutScreen() {
   const colors = useColors();
   const insets = useSafeAreaInsets();
-  const { cart, cartTotal, placeOrder, authUser, paymentSettings } = useStore();
+  const {
+    cart,
+    cartTotal,
+    placeOrder,
+    submitPaymentDetails,
+    authUser,
+    isCloudMode,
+    paymentSettings,
+  } = useStore();
   const [name, setName] = useState('');
   const [address, setAddress] = useState('');
   const [phone, setPhone] = useState('');
   const [customerUtr, setCustomerUtr] = useState('');
   const [placing, setPlacing] = useState(false);
+  const [paymentAttempt, setPaymentAttempt] = useState<PaymentAttempt | null>(null);
+  const [detailsSubmitted, setDetailsSubmitted] = useState(false);
   const [copiedVpa, setCopiedVpa] = useState(false);
+  const attemptIdempotencyKey = useRef(
+    `checkout-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`,
+  );
   const [paymentConfig, setPaymentConfig] = useState<{
     gpayEnabled: boolean;
     status: string;
@@ -64,11 +78,15 @@ export default function CheckoutScreen() {
 
   // Payment is ready if manual UPI is configured or automated server PSP is configured
   const paymentReady = manualUpiReady || (paymentConfig ? paymentConfig.gpayEnabled : PAYMENT_CONFIGURED);
-  const canPlace = !placing && hasItems && allInStock && !!fieldsOk && paymentReady;
+  const canPlace =
+    !paymentAttempt && !placing && isCloudMode && hasItems && allInStock && !!fieldsOk && paymentReady;
+  const canSubmitDetails =
+    !!paymentAttempt && !detailsSubmitted && !placing && !!customerUtr.trim();
 
   const activeMerchantName = paymentSettings.merchantName?.trim() || paymentConfig?.merchantName || MERCHANT_NAME;
   const activeMerchantVpa = paymentSettings.merchantVpa?.trim() || '';
-  const qrDisplayUrl = paymentSettings.qrImageUrl || (paymentSettings.autoGenerateQr && activeMerchantVpa ? buildUpiQrUrl(activeMerchantVpa, activeMerchantName, cartTotal) : '');
+  const payableAmount = paymentAttempt?.total ?? cartTotal;
+  const qrDisplayUrl = paymentSettings.qrImageUrl || (paymentSettings.autoGenerateQr && activeMerchantVpa ? buildUpiQrUrl(activeMerchantVpa, activeMerchantName, payableAmount) : '');
 
   const handlePlaceOrder = async () => {
     if (!paymentReady) {
@@ -76,6 +94,10 @@ export default function CheckoutScreen() {
         'Payment not available',
         'Online payment setup is pending. The store owner needs to configure UPI payment settings in the Admin Panel before orders can be placed.',
       );
+      return;
+    }
+    if (!isCloudMode) {
+      Alert.alert('Sign in required', 'Sign in to create a secure payment attempt. No order will be created until an administrator confirms your payment.');
       return;
     }
     if (!hasItems) {
@@ -96,16 +118,34 @@ export default function CheckoutScreen() {
         customerPhone: phone.trim(),
         customerAddress: address.trim(),
         paymentMethod: 'UPI',
-        customerUtr: customerUtr.trim() || undefined,
+        idempotencyKey: attemptIdempotencyKey.current,
       });
       if (order) {
-        router.replace('/(tabs)/orders');
+        setPaymentAttempt(order);
       } else {
-        Alert.alert('Order failed', 'Something went wrong. Please try again.');
+        Alert.alert('Payment attempt failed', 'Something went wrong. Please try again.');
       }
     } catch (err) {
       const message = err instanceof Error ? err.message : 'An unexpected error occurred.';
-      Alert.alert('Order failed', message);
+      Alert.alert('Payment attempt failed', message);
+    } finally {
+      setPlacing(false);
+    }
+  };
+
+  const handleSubmitPaymentDetails = async () => {
+    const utr = customerUtr.trim();
+    if (!paymentAttempt || !utr) {
+      Alert.alert('UTR required', 'Enter the transaction reference from your UPI payment receipt.');
+      return;
+    }
+    setPlacing(true);
+    try {
+      await submitPaymentDetails(paymentAttempt.id, utr);
+      setDetailsSubmitted(true);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Could not submit payment details.';
+      Alert.alert('Submission failed', message);
     } finally {
       setPlacing(false);
     }
@@ -200,53 +240,81 @@ export default function CheckoutScreen() {
                 ) : null}
               </View>
 
-              {/* QR Code Display */}
-              {qrDisplayUrl ? (
-                <View style={styles.qrContainer}>
-                  <Image source={{ uri: qrDisplayUrl }} style={styles.checkoutQrImage} resizeMode="contain" />
-                  <Text style={[styles.qrScanText, { color: colors.mutedForeground }]}>
-                    Scan using Google Pay, PhonePe, Paytm, or any UPI App
-                  </Text>
-                </View>
-              ) : null}
-
-              {/* Instructions */}
-              {paymentSettings.instructions ? (
+              {paymentAttempt ? (
+                <>
+                  <View style={[styles.instructionBox, { backgroundColor: colors.background, borderColor: colors.border }]}>
+                    <Text style={[styles.instructionTitle, { color: colors.foreground }]}>
+                      Pay exactly {formatPrice(paymentAttempt.total)} to the merchant
+                    </Text>
+                    <Text style={[styles.instructionText, { color: colors.mutedForeground }]}>
+                      Complete the UPI payment first. Creating this payment attempt did not place an order. Your order will be created only after an administrator verifies the credit.
+                    </Text>
+                  </View>
+                  {qrDisplayUrl ? (
+                    <View style={styles.qrContainer}>
+                      <Image source={{ uri: qrDisplayUrl }} style={styles.checkoutQrImage} resizeMode="contain" />
+                      <Text style={[styles.qrScanText, { color: colors.mutedForeground }]}>
+                        Scan using Google Pay, PhonePe, Paytm, or any UPI app
+                      </Text>
+                    </View>
+                  ) : null}
+                  {paymentSettings.instructions ? (
+                    <Text style={[styles.instructionText, { color: colors.mutedForeground, marginTop: 8 }]}>
+                      {paymentSettings.instructions}
+                    </Text>
+                  ) : null}
+                  {detailsSubmitted ? (
+                    <View style={[styles.instructionBox, { backgroundColor: colors.mossSoft, borderColor: colors.moss }]}>
+                      <Text style={[styles.instructionTitle, { color: colors.moss }]}>
+                        Payment details submitted. Your payment is awaiting verification.
+                      </Text>
+                      <Text style={[styles.instructionText, { color: colors.moss }]}>
+                        Attempt {paymentAttempt.id}. You can check its status in Orders.
+                      </Text>
+                    </View>
+                  ) : (
+                    <View style={{ marginTop: 14 }}>
+                      <Text style={[styles.label, { color: colors.foreground, marginTop: 0 }]}>
+                        UPI transaction reference / UTR (required to submit)
+                      </Text>
+                      <TextInput
+                        value={customerUtr}
+                        onChangeText={setCustomerUtr}
+                        maxLength={100}
+                        autoCapitalize="none"
+                        placeholder="Enter the reference shown in your payment receipt"
+                        placeholderTextColor={colors.mutedForeground}
+                        style={[styles.input, { backgroundColor: colors.background, borderColor: colors.border, color: colors.foreground }]}
+                      />
+                      <Text style={[styles.pendingAdvisoryText, { color: colors.mutedForeground }]}>
+                        Find it in your payment app's transaction details (Google Pay, PhonePe, or your bank app). The reference is not proof of payment. If you cannot find it yet, leave this attempt pending and return later from Orders.
+                      </Text>
+                    </View>
+                  )}
+                </>
+              ) : (
                 <View style={[styles.instructionBox, { backgroundColor: colors.background, borderColor: colors.border }]}>
-                  <Text style={[styles.instructionTitle, { color: colors.foreground }]}>How to complete payment:</Text>
+                  <Text style={[styles.instructionTitle, { color: colors.foreground }]}>Create a pending payment attempt first</Text>
                   <Text style={[styles.instructionText, { color: colors.mutedForeground }]}>
-                    {paymentSettings.instructions}
+                    The server will check current prices and availability, then show the exact amount and QR code. No order is created at this step.
                   </Text>
                 </View>
-              ) : null}
-
-              {/* Customer UTR Input */}
-              <View style={{ marginTop: 14 }}>
-                <Text style={[styles.label, { color: colors.foreground, marginTop: 0 }]}>
-                  UPI Transaction Reference / UTR (Optional)
-                </Text>
-                <TextInput
-                  value={customerUtr}
-                  onChangeText={setCustomerUtr}
-                  maxLength={100}
-                  placeholder="e.g. UPI Ref No., UTR, or Transaction ID from receipt"
-                  placeholderTextColor={colors.mutedForeground}
-                  style={[styles.input, { backgroundColor: colors.background, borderColor: colors.border, color: colors.foreground }]}
-                />
-                <Text style={[styles.pendingAdvisoryText, { color: colors.mutedForeground }]}>
-                  Note: Payment will be placed in "Pending Verification" until the store admin verifies receipt in their bank/UPI account.
-                </Text>
-              </View>
+              )}
             </View>
           )}
+          {!isCloudMode ? (
+            <Text style={[styles.pendingAdvisoryText, { color: colors.coral, marginTop: 12 }]}>
+              Sign in to create a secure payment attempt. Guest/demo checkout cannot submit payment details.
+            </Text>
+          ) : null}
         </View>
       </ScrollView>
       <View style={[styles.bottomBar, { backgroundColor: colors.background, borderTopColor: colors.border, paddingBottom: Math.max(insets.bottom, 14) }]}>
-        <View style={styles.totalRow}><Text style={[styles.totalLabel, { color: colors.mutedForeground }]}>Payable today</Text><Text style={[styles.total, { color: colors.foreground }]}>{formatPrice(cartTotal)}</Text></View>
+        <View style={styles.totalRow}><Text style={[styles.totalLabel, { color: colors.mutedForeground }]}>{paymentAttempt ? 'Exact payable amount' : 'Estimated total'}</Text><Text style={[styles.total, { color: colors.foreground }]}>{formatPrice(payableAmount)}</Text></View>
         <Pressable
-          disabled={!canPlace}
-          onPress={handlePlaceOrder}
-          style={[styles.placeButton, { backgroundColor: canPlace ? colors.coral : colors.muted }]}
+          disabled={paymentAttempt ? !canSubmitDetails : !canPlace}
+          onPress={paymentAttempt ? handleSubmitPaymentDetails : handlePlaceOrder}
+          style={[styles.placeButton, { backgroundColor: (paymentAttempt ? canSubmitDetails : canPlace) ? colors.coral : colors.muted }]}
           testID="place-order"
         >
           {placing ? (
@@ -254,9 +322,17 @@ export default function CheckoutScreen() {
           ) : (
             <>
               <Text style={[styles.placeText, { color: canPlace ? '#FFFFFF' : colors.mutedForeground }]}>
-                {paymentReady ? 'Place order & pay' : 'Payment setup pending'}
+                {paymentAttempt
+                  ? detailsSubmitted
+                    ? 'Awaiting verification'
+                    : 'Submit payment details'
+                  : !paymentReady
+                    ? 'Payment setup pending'
+                    : !isCloudMode
+                      ? 'Sign in to continue'
+                      : 'Create payment attempt'}
               </Text>
-              {paymentReady ? <Feather name="arrow-right" size={18} color={canPlace ? '#FFFFFF' : colors.mutedForeground} /> : null}
+              {!detailsSubmitted ? <Feather name="arrow-right" size={18} color={(paymentAttempt ? canSubmitDetails : canPlace) ? '#FFFFFF' : colors.mutedForeground} /> : null}
             </>
           )}
         </Pressable>

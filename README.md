@@ -37,26 +37,29 @@ useful for UI work without a Firebase project set up yet.
 5. Create a free [Cloudinary](https://cloudinary.com) account and set up an
    **unsigned upload preset** — see "Product images (Cloudinary)" below for the
    exact settings. Copy the **Cloud name** and the **preset name** into `.env`.
-6. Deploy the **OTP Cloudflare Worker** — see `workers/otp/README.md` for the
-   full walkthrough (Cloudflare account, KV namespace, secrets, deploy). Copy
-   the Worker's URL into `.env` as `EXPO_PUBLIC_OTP_WORKER_URL`. This is what
-   makes mobile OTP login work; it needs no Firebase billing plan at all.
-7. Deploy the Firestore rules (works on Spark, no Blaze needed):
+6. Configure and deploy the **Cloudflare Worker** — see `workers/otp/README.md`
+   for the full walkthrough (Cloudflare account, KV namespace, secrets, deploy).
+   Copy the Worker's URL into `.env` as `EXPO_PUBLIC_OTP_WORKER_URL`. The
+   Worker handles mobile OTP and the authenticated manual-payment workflow; it
+   needs no Firebase billing plan.
+7. Review and deploy the Firestore rules (works on Spark, no Blaze needed):
 ```bash
    npm install -g firebase-tools     # once
    firebase login
    firebase use --add                # pick your project
    firebase deploy --only firestore:rules
 ```
+   The current rules deny client-side order creation/payment-status changes
+   and allow customers to read only their own payment attempts. Deploy the
+   matching rules before enabling the updated app; this repository change does
+   not apply rules to any live Firebase project.
 8. **Important — this project intentionally stays on Firebase's free Spark
    plan.** Cloud Functions of any kind (secrets or not) require the Blaze
    (pay-as-you-go) plan to deploy at all. `functions/index.js` now contains
-   only `reconcileOrderCost` (automatic order profit calculation) — mobile OTP
-   and Cloudinary no longer use Cloud Functions, so they're unaffected. Unless
-   you enable Blaze, skip `firebase deploy --only functions` entirely; orders
-   will keep `costTotal`/`profitTotal` at their client-computed placeholder (0)
-   instead of the server-reconciled value — fine for demo/testing, not accurate
-   for real seller analytics.
+   only `reconcileOrderCost` (automatic order profit calculation). New UPI
+   orders receive server-priced cost/profit snapshots from the Cloudflare Worker,
+   so this optional function is not required for checkout or seller analytics.
+   Unless you enable Blaze, skip `firebase deploy --only functions` entirely.
 9. **Create your first seller account.** Sign up once from the app (mobile OTP or
    email both create a normal `customer`-role account), then in the Firebase
    console open **Firestore → users → `<that uid>`** and change `role` from
@@ -64,6 +67,19 @@ useful for UI work without a Firebase project set up yet.
    deliberately never let a client set its own role to `seller` (see
    `firestore.rules`), so nobody can just grant themselves seller access from the
    app.
+
+## Manual UPI payment lifecycle
+
+Checkout creates a server-priced payment attempt, not an order. The customer
+can scan the existing merchant QR and submit a trimmed UTR/reference later;
+submitting that reference does not mark the payment as paid. Payment attempts
+remain separate from confirmed orders and seller fulfillment. Only an active
+administrator, authenticated through the Cloudflare Worker, can confirm after
+checking the actual credit in the merchant's payment/bank history. The Worker
+atomically creates the paid order and reserves the transaction reference to
+prevent duplicate confirmations. Payment attempts are not automatically
+expired, so a customer who paid but has not yet found their UTR can return to
+submit it for review.
 
 ## How mobile OTP login works
 
@@ -204,21 +220,20 @@ signed-in user's own profile has `role == 'seller'`. A customer's client genuine
 cannot fetch that document, no matter what the app code does.
 
 The same reasoning applies to order profit: a customer's client can never read
-`baseCost`, so it can't compute a trustworthy `costTotal`/`profitTotal` when placing
-an order. `functions/index.js` is a Cloud Function that reconciles this server-side
-(with Admin SDK privileges) right after an order is created — see the comments in
-that file and in `services/firebase/firestore.ts`.
+`baseCost`, so it can't compute a trustworthy `costTotal`/`profitTotal`. The
+Cloudflare Worker reads private costs when creating a payment attempt and writes
+them to the seller-only `orders/{id}/private/data` document only after an admin
+confirms the merchant-account credit. No Cloud Function is required for new UPI
+orders.
 
 ## Project structure
 
 ## Known limitations / follow-ups
 
-- **`reconcileOrderCost` needs the Blaze plan to deploy at all** — this project
-  is intentionally on Spark, so this one remaining Cloud Function is present in
-  the code but not deployed unless Blaze is enabled. Order `costTotal`/
-  `profitTotal` stay at the client-side placeholder (0) rather than being
-  server-reconciled. Mobile OTP (via the Cloudflare Worker) and Cloudinary are
-  both unaffected — neither uses Cloud Functions anymore.
+- **`reconcileOrderCost` needs the Blaze plan to deploy at all**, but it is
+  optional for the current UPI flow: the Worker writes trusted cost/profit
+  snapshots when it finalizes a paid order. Mobile OTP and Cloudinary also do
+  not use Cloud Functions.
 - **The OTP Worker is a separate deployable** from the Firebase project — it
   has its own `wrangler deploy` and its own secrets (`workers/otp/README.md`).
   Forgetting to redeploy it after an edit, or letting `EXPO_PUBLIC_OTP_WORKER_URL`
@@ -237,12 +252,6 @@ that file and in `services/firebase/firestore.ts`.
   `workers/otp/src/otp-store.ts`). Fine for an MVP; worth hardening (e.g. a real
   WAF rule, or Durable Objects for stronger per-phone-number locking) before
   high-volume production use.
-- **Order cost/profit fields are on the same document the customer owns.** Unlike
-  products, orders aren't split into public/private documents, so while no screen
-  in this app ever renders `costTotal`/`profitTotal`/`unitCost` to a customer, a
-  customer inspecting raw network traffic could technically see those fields on
-  their own order. Closing this fully would mean the same public/private doc split
-  used for products, applied to orders too.
 - **Meesho product import is manual, not scraped.** The seller "Add product" form
   lets you paste a Meesho URL for your own reference, but does not auto-fetch
   title/price/images from it — see the note in `app/seller-add-product.tsx` for why
