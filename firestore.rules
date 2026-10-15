@@ -15,6 +15,13 @@ service cloud.firestore {
          get(/databases/$(database)/documents/users/$(request.auth.uid)).data.status != 'suspended');
     }
 
+    function isActiveAccount() {
+      return isSignedIn() &&
+        exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+        (!('status' in get(/databases/$(database)/documents/users/$(request.auth.uid)).data) ||
+         get(/databases/$(database)/documents/users/$(request.auth.uid)).data.status != 'suspended');
+    }
+
     function isSeller() {
       return isSignedIn() &&
         exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
@@ -22,6 +29,24 @@ service cloud.firestore {
          get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin') &&
         (!('status' in get(/databases/$(database)/documents/users/$(request.auth.uid)).data) ||
          get(/databases/$(database)/documents/users/$(request.auth.uid)).data.status != 'suspended');
+    }
+
+    function isSellerStatusTransition() {
+      return (resource.data.status == 'Placed' &&
+          request.resource.data.status in ['Confirmed', 'Processing']) ||
+        (resource.data.status == 'Confirmed' &&
+          request.resource.data.status == 'Processing') ||
+        (resource.data.status == 'Processing' &&
+          request.resource.data.status == 'Shipped') ||
+        (resource.data.status == 'Shipped' &&
+          request.resource.data.status == 'Delivered');
+    }
+
+    function hasValidCancellationMetadata() {
+      return request.resource.data.cancelledAt == request.time &&
+        request.resource.data.cancellationReason is string &&
+        request.resource.data.cancellationReason.size() > 0 &&
+        request.resource.data.cancellationReason.size() <= 120;
     }
 
     // ---------------- otp_requests ----------------
@@ -81,7 +106,14 @@ service cloud.firestore {
     // Write: only active sellers or admins.
     match /products/{productId} {
       allow read: if isSignedIn();
-      allow create, update, delete: if isSeller();
+      allow create: if isSeller() &&
+        request.resource.data.createdByUid == request.auth.uid;
+      allow update: if isSeller() &&
+        request.resource.data.get('createdByUid', null) == resource.data.get('createdByUid', null) &&
+        (isAdmin() || resource.data.get('createdByUid', null) == request.auth.uid);
+      // Deletion is routed through the Worker so Cloudinary cleanup and both
+      // Firestore product documents are handled together.
+      allow delete: if false;
 
       // ---------------- products/{id}/private/data (cost & source fields) ----------------
       // Customer read denied completely; only active sellers/admins can read or write.
@@ -92,28 +124,82 @@ service cloud.firestore {
 
     // ---------------- orders ----------------
     match /orders/{orderId} {
-      // Orders are created by the authenticated Cloudflare Worker only after
-      // an administrator verifies the merchant-account credit. Service-account
-      // writes bypass rules; direct client creation is intentionally disabled.
+      // The trusted Worker prices and creates manual UPI orders; client writes
+      // cannot establish or alter the authoritative order price.
       allow create: if false;
 
-      allow read: if isSignedIn() &&
-        (resource.data.customerUid == request.auth.uid || isSeller());
+      allow read: if isSignedIn() && (
+        !exists(/databases/$(database)/documents/orders/$(orderId)) ||
+        resource.data.customerUid == request.auth.uid ||
+        isSeller()
+      );
 
-      // Client updates may only advance fulfillment metadata on a paid order.
-      // Payment status, references, and customer-submitted details are written
-      // only by the trusted Worker.
+      // Customers may submit an unverified UTR on their own pending order;
+      // only active admins can change payment status or reserve a reference.
       allow update: if (
+        isAdmin() &&
+        resource.data.paymentMethod == 'UPI' &&
+        resource.data.get('paymentStatus', 'Selected') in ['Pending', 'Selected'] &&
+        request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly(['paymentStatus', 'customerUtr', 'paymentReference', 'paymentVerifiedAt', 'paymentReviewReason', 'status']) &&
+        (
+          (
+            request.resource.data.paymentStatus == 'Paid' &&
+            request.resource.data.status == resource.data.status &&
+            request.resource.data.paymentReference is string &&
+            request.resource.data.paymentReference.size() > 0 &&
+            request.resource.data.paymentReference.size() <= 100 &&
+            request.resource.data.paymentVerifiedAt == request.time
+          ) ||
+          (
+            request.resource.data.paymentStatus == 'Failed' &&
+            request.resource.data.status == 'Cancelled' &&
+            request.resource.data.paymentReviewReason is string &&
+            request.resource.data.paymentReviewReason.size() > 0 &&
+            request.resource.data.paymentReviewReason.size() <= 300
+          )
+        )
+      ) || (
+        isActiveAccount() &&
+        resource.data.customerUid == request.auth.uid &&
+        resource.data.paymentMethod == 'UPI' &&
+        resource.data.get('paymentStatus', 'Selected') in ['Pending', 'Selected'] &&
+        request.resource.data.get('paymentStatus', 'Selected') ==
+          resource.data.get('paymentStatus', 'Selected') &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['customerUtr']) &&
+        request.resource.data.customerUtr is string &&
+        request.resource.data.customerUtr.size() > 0 &&
+        request.resource.data.customerUtr.size() <= 100
+      ) || (
         isSeller() &&
         resource.data.paymentStatus == 'Paid' &&
-        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'trackingId'])
+        (
+          (
+            request.resource.data.diff(resource.data).affectedKeys().hasOnly(['trackingId']) &&
+            request.resource.data.status == resource.data.status
+          ) ||
+          (
+            request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status']) &&
+            isSellerStatusTransition()
+          ) ||
+          (
+            request.resource.data.status == 'Cancelled' &&
+            resource.data.status in ['Placed', 'Confirmed', 'Processing'] &&
+            request.resource.data.diff(resource.data).affectedKeys()
+              .hasOnly(['status', 'cancelledAt', 'cancellationReason']) &&
+            hasValidCancellationMetadata()
+          )
+        )
       ) || (
         isSignedIn() &&
         resource.data.customerUid == request.auth.uid &&
         resource.data.paymentStatus == 'Paid' &&
         (resource.data.status == 'Placed' || resource.data.status == 'Confirmed') &&
         request.resource.data.status == 'Cancelled' &&
-        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status'])
+        request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly(['status', 'cancelledAt', 'cancellationReason']) &&
+        request.resource.data.cancellationReason == 'Customer requested cancellation' &&
+        hasValidCancellationMetadata()
       );
 
       allow delete: if false;
@@ -137,7 +223,14 @@ service cloud.firestore {
     // A unique claim document prevents a submitted transaction reference from
     // being used to confirm more than one payment/order.
     match /payment_reference_claims/{referenceHash} {
-      allow read, write: if false;
+      allow read: if isAdmin();
+      allow create: if isAdmin() &&
+        request.resource.data.keys().hasOnly(['orderId', 'reference', 'createdAt']) &&
+        request.resource.data.orderId is string &&
+        request.resource.data.reference is string &&
+        request.resource.data.reference.size() > 0 &&
+        request.resource.data.createdAt == request.time;
+      allow update, delete: if false;
     }
 
     // ---------------- settings ----------------

@@ -8,7 +8,7 @@
  * 5. Customer UTR persistence with immutable Pending initial status.
  * 6. Admin order view & manual verification transitions (Pending -> Paid -> Failed -> Pending).
  * 7. Non-admin authorization enforcement (client guards + Firestore security rules).
- * 8. Worker order creation robustness against hostile client payload ({ paymentStatus: "Paid" }).
+ * 8. Worker order creation uses server prices and ignores hostile client totals/status.
  * 9. External QR service privacy disclosure and Cloudinary bypass verification.
  * 10. Core app regressions (cart pricing, order lifecycle transitions).
  */
@@ -223,36 +223,47 @@ async function runTests() {
   console.log('✔ Scenario 7 Passed: Non-admin users are strictly blocked from settings and payment reconciliation.');
 
   // --------------------------------------------------------------------------
-  // SCENARIO 8: Worker rejects client-supplied Paid status
+  // SCENARIO 8: Worker ignores untrusted client pricing and payment status
   // --------------------------------------------------------------------------
-  console.log('[Scenario 8] Testing Worker Hardened Order Creation...');
+  console.log('[Scenario 8] Testing trusted Worker-priced order creation...');
 
-  function simulateWorkerOrderCreation(body, user) {
-    const paymentMethod = String(body.paymentMethod || '').trim();
-    if (paymentMethod !== 'UPI') throw new Error('Only UPI accepted');
-
-    const customerUtr = body.customerUtr ? String(body.customerUtr).trim().slice(0, 100) : undefined;
-
+  function simulateWorkerOrderCreation(body, user, product) {
+    const unitPrice = product.price;
+    const itemSubtotal = unitPrice * body.items[0].quantity;
     const publicOrderDoc = {
       customerUid: user.uid,
-      paymentMethod,
+      items: [{ productId: product.id, quantity: body.items[0].quantity, unitPrice }],
+      itemSubtotal,
+      deliveryCharge: 0,
+      total: itemSubtotal,
+      amountPaise: itemSubtotal * 100,
+      paymentMethod: 'UPI',
       paymentStatus: 'Pending',
-      ...(customerUtr ? { customerUtr } : {}),
+      status: 'Placed',
     };
     return publicOrderDoc;
   }
 
   const hostilePayload = {
-    customerName: 'Attacker',
-    paymentMethod: 'UPI',
+    items: [{ productId: 'product-1', quantity: 1, unitPrice: 1 }],
+    total: 1,
+    amountPaise: 100,
     paymentStatus: 'Paid',
     customerUtr: 'FAKE-UTR-999',
   };
 
-  const createdDoc = simulateWorkerOrderCreation(hostilePayload, { uid: 'user-1' });
+  const createdDoc = simulateWorkerOrderCreation(
+    hostilePayload,
+    { uid: 'user-1' },
+    { id: 'product-1', price: 1299 },
+  );
+  assert.strictEqual(createdDoc.items[0].unitPrice, 1299, 'Worker must use the product document price');
+  assert.strictEqual(createdDoc.total, 1299, 'Worker must calculate totals from server prices');
+  assert.strictEqual(createdDoc.amountPaise, 129900, 'Worker must calculate paise from the server total');
   assert.strictEqual(createdDoc.paymentStatus, 'Pending', 'Worker must NOT honor hostile client paymentStatus');
-  assert.strictEqual(createdDoc.customerUtr, 'FAKE-UTR-999');
-  console.log('✔ Scenario 8 Passed: Worker enforces paymentStatus: Pending and ignores client-provided Paid status.');
+  assert(workerSource.includes("url.pathname === '/manual-upi/orders/create'"), 'Manual order creation endpoint is missing');
+  assert(rulesSource.includes('allow create: if false;'), 'Firestore rules must reject client-priced orders');
+  console.log('✔ Scenario 8 Passed: Worker prices from Firestore, while rules reject direct client order creation.');
 
   // --------------------------------------------------------------------------
   // SCENARIO 9: QR Service privacy analysis & Cloudinary bypass

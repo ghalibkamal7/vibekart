@@ -13,6 +13,8 @@ let worker;
 let originalFetch;
 let updateCounter = 0;
 let failNextCommitStatus = null;
+let cloudinaryStatus = 200;
+let cloudinaryAssets = new Set();
 
 const privateKey = generateKeyPairSync('rsa', { modulusLength: 2048 })
   .privateKey.export({ type: 'pkcs8', format: 'pem' });
@@ -22,6 +24,9 @@ const env = {
     client_email: 'worker-test@example.iam.gserviceaccount.com',
     private_key: privateKey,
   }),
+  CLOUDINARY_CLOUD_NAME: 'vibekart-test',
+  CLOUDINARY_API_KEY: 'test-api-key',
+  CLOUDINARY_API_SECRET: 'test-api-secret',
   OTP_KV: {
     async get() { return null; },
     async put() {},
@@ -83,16 +88,41 @@ function resetStore() {
   records.clear();
   updateCounter = 0;
   failNextCommitStatus = null;
+  cloudinaryStatus = 200;
+  cloudinaryAssets = new Set(['vibekart/products/product-1/test-image']);
   seed('users/customer-1', { uid: 'customer-1', role: 'customer', status: 'active', phone: '+911234567890' });
   seed('users/admin-1', { uid: 'admin-1', role: 'admin', status: 'active' });
   seed('users/seller-1', { uid: 'seller-1', role: 'seller', status: 'active' });
+  seed('users/seller-2', { uid: 'seller-2', role: 'seller', status: 'active' });
   seed('users/suspended-admin', { uid: 'suspended-admin', role: 'admin', status: 'suspended' });
-  seed('products/product-1', { name: 'Test Lamp', price: 1250, inStock: true, enabled: true });
+  seed('settings/payment', { enabled: true, merchantVpa: 'vibekart@upi' });
+  seed('products/product-1', {
+    name: 'Test Lamp',
+    price: 1250,
+    inStock: true,
+    enabled: true,
+    createdByUid: 'seller-1',
+    imagePublicIds: ['vibekart/products/product-1/test-image'],
+  });
   seed('products/product-1/private/data', { baseCost: 700, sourceUrl: 'https://supplier.invalid/item' });
 }
 
 async function mockedFetch(input, init = {}) {
   const url = new URL(input);
+  if (url.hostname === 'api.cloudinary.com') {
+    assert.equal(url.pathname, '/v1_1/vibekart-test/resources/image/upload');
+    assert.equal(init.method, 'DELETE');
+    assert.equal(init.headers.Authorization, `Basic ${Buffer.from('test-api-key:test-api-secret').toString('base64')}`);
+    assert.equal(init.headers['Content-Type'], 'application/x-www-form-urlencoded');
+    const publicIds = [...new URLSearchParams(init.body).getAll('public_ids[]')];
+    assert.deepEqual(publicIds, ['vibekart/products/product-1/test-image']);
+    if (cloudinaryStatus !== 200) return response({ error: { message: 'simulated Cloudinary failure' } }, cloudinaryStatus);
+    const deleted = {};
+    for (const id of publicIds) {
+      deleted[id] = cloudinaryAssets.delete(id) ? 'deleted' : 'not_found';
+    }
+    return response({ deleted });
+  }
   if (url.hostname === 'oauth2.googleapis.com') {
     return response({ access_token: 'test-access-token' });
   }
@@ -102,6 +132,7 @@ async function mockedFetch(input, init = {}) {
       'customer-token': { localId: 'customer-1', email: 'buyer@example.test' },
       'admin-token': { localId: 'admin-1', email: 'admin@example.test' },
       'seller-token': { localId: 'seller-1', email: 'seller@example.test' },
+      'seller-2-token': { localId: 'seller-2', email: 'seller-2@example.test' },
       'suspended-token': { localId: 'suspended-admin', email: 'suspended@example.test' },
     };
     return response({ users: users[requestBody.idToken] ? [users[requestBody.idToken]] : [] });
@@ -115,11 +146,11 @@ async function mockedFetch(input, init = {}) {
     }
 
     const writes = JSON.parse(init.body || '{}').writes || [];
-    const resolved = writes.map((write) => ({
-      write,
-      path: documentPathFromName(write.update.name),
-      current: records.get(documentPathFromName(write.update.name)),
-    }));
+    const resolved = writes.map((write) => {
+      const name = write.update?.name ?? write.delete;
+      const documentPath = documentPathFromName(name);
+      return { write, path: documentPath, current: records.get(documentPath) };
+    });
     for (const { write, current } of resolved) {
       const precondition = write.currentDocument;
       if (precondition?.exists === false && current) return response({ error: 'already exists' }, 409);
@@ -129,6 +160,10 @@ async function mockedFetch(input, init = {}) {
       }
     }
     for (const { write, path: documentPath, current } of resolved) {
+      if (write.delete) {
+        records.delete(documentPath);
+        continue;
+      }
       const fields = decodeFields(write.update.fields || {});
       let data = fields;
       if (write.updateMask?.fieldPaths && current) {
@@ -192,6 +227,19 @@ async function createAttempt(idempotencyKey, token = 'customer-token', options) 
   return call('/payment-attempts/create', token, attemptRequest(idempotencyKey, options));
 }
 
+function manualOrderRequest(idempotencyKey, overrides = {}) {
+  return {
+    items: [{ productId: 'product-1', quantity: 2, option: 'Sand', unitPrice: 1 }],
+    customerName: 'Buyer',
+    customerPhone: '+911234567890',
+    customerAddress: 'Test address',
+    idempotencyKey,
+    total: 2,
+    amountPaise: 200,
+    ...overrides,
+  };
+}
+
 before(() => {
   originalFetch = global.fetch;
   const tsc = path.join(workerRoot, 'node_modules', '.bin', 'tsc');
@@ -203,6 +251,16 @@ before(() => {
     '--noEmit', 'false',
   ], { cwd: workerRoot, stdio: 'inherit' });
   worker = require(path.join(buildDir, 'index.js')).default;
+});
+
+test('CORS allows the configured Vercel origin and rejects lookalike origins', () => {
+  const { corsHeaders, isAllowedOrigin } = require(path.join(buildDir, 'cors.js'));
+  const allowedOrigin = 'https://vibekaart.vercel.app';
+  assert.equal(isAllowedOrigin(allowedOrigin), true);
+  assert.equal(corsHeaders(allowedOrigin)['Access-Control-Allow-Origin'], allowedOrigin);
+  assert.equal(isAllowedOrigin('https://vibekaart.vercel.app.attacker.test'), false);
+  assert.equal(isAllowedOrigin('http://vibekaart.vercel.app'), false);
+  assert.equal(isAllowedOrigin(null), false);
 });
 
 beforeEach(() => {
@@ -226,6 +284,168 @@ test('checkout creates only an authoritative, idempotent payment attempt', async
   assert.equal([...records.keys()].filter((key) => key.startsWith('orders/')).length, 0);
 });
 
+test('payment attempts calculate delivery charges and free-delivery thresholds on the server', async () => {
+  seed('settings/store', {
+    deliveryCharge: 45,
+    freeDeliveryThreshold: 2500,
+    freeDeliveryEnabled: true,
+  });
+  const atThreshold = await createAttempt('delivery-at-threshold');
+  assert.equal(atThreshold.status, 201);
+  assert.equal(atThreshold.body.attempt.itemSubtotal, 2500);
+  assert.equal(atThreshold.body.attempt.deliveryCharge, 0);
+  assert.equal(atThreshold.body.attempt.deliveryMinDays, 4);
+  assert.equal(atThreshold.body.attempt.deliveryMaxDays, 6);
+  assert.equal(atThreshold.body.attempt.total, 2500);
+  assert.equal(atThreshold.body.attempt.amountPaise, 250000);
+
+  seed('settings/store', {
+    deliveryCharge: 45,
+    freeDeliveryThreshold: 2501,
+    freeDeliveryEnabled: true,
+  });
+  const charged = await createAttempt('delivery-charge-applied');
+  assert.equal(charged.status, 201);
+  assert.equal(charged.body.attempt.deliveryCharge, 45);
+  assert.equal(charged.body.attempt.total, 2545);
+  assert.equal(charged.body.attempt.amountPaise, 254500);
+});
+
+test('manual UPI order creation uses server product prices and is idempotent', async () => {
+  seed('settings/store', {
+    deliveryCharge: 45,
+    freeDeliveryThreshold: 2500,
+    freeDeliveryEnabled: false,
+    deliveryMinDays: 7,
+    deliveryMaxDays: 9,
+  });
+
+  const first = await call(
+    '/manual-upi/orders/create',
+    'customer-token',
+    manualOrderRequest('manual-order-request-001'),
+  );
+  const retry = await call(
+    '/manual-upi/orders/create',
+    'customer-token',
+    manualOrderRequest('manual-order-request-001', {
+      items: [{ productId: 'product-1', quantity: 2, unitPrice: 999999 }],
+      total: 1,
+      amountPaise: 100,
+    }),
+  );
+
+  assert.equal(first.status, 201);
+  assert.equal(first.body.order.items[0].unitPrice, 1250);
+  assert.equal(first.body.order.itemSubtotal, 2500);
+  assert.equal(first.body.order.deliveryCharge, 45);
+  assert.equal(first.body.order.total, 2545);
+  assert.equal(first.body.order.amountPaise, 254500);
+  assert.equal(first.body.order.paymentStatus, 'Pending');
+  assert.equal(retry.status, 200);
+  assert.equal(retry.body.order.id, first.body.order.id);
+  assert.equal(retry.body.order.total, 2545);
+  assert.equal(records.get(`orders/${first.body.order.id}/private/data`).data.costTotal, 1400);
+});
+
+test('manual UPI order creation rejects unavailable products and invalid quantities', async () => {
+  const invalidQuantity = await call(
+    '/manual-upi/orders/create',
+    'customer-token',
+    manualOrderRequest('manual-order-request-002', {
+      items: [{ productId: 'product-1', quantity: 0 }],
+    }),
+  );
+  assert.equal(invalidQuantity.status, 400);
+
+  seed('products/product-1', { name: 'Test Lamp', price: 1250, inStock: false });
+  const unavailable = await call(
+    '/manual-upi/orders/create',
+    'customer-token',
+    manualOrderRequest('manual-order-request-003'),
+  );
+  assert.equal(unavailable.status, 409);
+  assert.equal([...records.keys()].filter((key) => key.startsWith('orders/')).length, 0);
+});
+
+test('manual UPI order creation fails closed when payment is disabled or merchant details are missing', async () => {
+  seed('settings/payment', { enabled: false, merchantVpa: 'vibekart@upi' });
+  const disabled = await call(
+    '/manual-upi/orders/create',
+    'customer-token',
+    manualOrderRequest('manual-order-disabled'),
+  );
+  assert.equal(disabled.status, 409);
+  assert.equal([...records.keys()].filter((key) => key.startsWith('orders/')).length, 0);
+
+  seed('settings/payment', { enabled: true, merchantVpa: '  ' });
+  const missingVpa = await call(
+    '/manual-upi/orders/create',
+    'customer-token',
+    manualOrderRequest('manual-order-no-vpa'),
+  );
+  assert.equal(missingVpa.status, 409);
+  assert.equal([...records.keys()].filter((key) => key.startsWith('orders/')).length, 0);
+});
+
+test('product deletion requires an authorized owner and removes stored images and product documents', async () => {
+  const forbidden = await call('/seller/products/delete', 'customer-token', { productId: 'product-1' });
+  assert.equal(forbidden.status, 403);
+  const anotherSeller = await call('/seller/products/delete', 'seller-2-token', { productId: 'product-1' });
+  assert.equal(anotherSeller.status, 403);
+  assert.equal(records.has('products/product-1'), true);
+
+  const deleted = await call('/seller/products/delete', 'seller-token', { productId: 'product-1' });
+  assert.equal(deleted.status, 200);
+  assert.equal(records.has('products/product-1'), false);
+  assert.equal(records.has('products/product-1/private/data'), false);
+});
+
+test('an administrator can delete a legacy product without an owner UID', async () => {
+  seed('products/legacy-product', { name: 'Legacy', imagePublicIds: [] });
+  const deleted = await call('/seller/products/delete', 'admin-token', { productId: 'legacy-product' });
+  assert.equal(deleted.status, 200);
+  assert.equal(records.has('products/legacy-product'), false);
+});
+
+test('product deletion fails closed when Cloudinary credentials are missing', async () => {
+  const secret = env.CLOUDINARY_API_SECRET;
+  env.CLOUDINARY_API_SECRET = undefined;
+  try {
+    const result = await call('/seller/products/delete', 'seller-token', { productId: 'product-1' });
+    assert.equal(result.status, 503);
+    assert.equal(records.has('products/product-1'), true);
+  } finally {
+    env.CLOUDINARY_API_SECRET = secret;
+  }
+});
+
+test('failed image deletion preserves product documents so deletion can be retried', async () => {
+  cloudinaryStatus = 503;
+  const failed = await call('/seller/products/delete', 'seller-token', { productId: 'product-1' });
+  assert.equal(failed.status, 502);
+  assert.equal(records.has('products/product-1'), true);
+  assert.equal(records.has('products/product-1/private/data'), true);
+
+  cloudinaryStatus = 200;
+  const retry = await call('/seller/products/delete', 'seller-token', { productId: 'product-1' });
+  assert.equal(retry.status, 200);
+  assert.equal(records.has('products/product-1'), false);
+});
+
+test('product documents remain intact when the Firestore delete fails after Cloudinary cleanup', async () => {
+  failNextCommitStatus = 409;
+  const failed = await call('/seller/products/delete', 'seller-token', { productId: 'product-1' });
+  assert.equal(failed.status, 409);
+  assert.match(failed.body.error, /Images were deleted/i);
+  assert.equal(records.has('products/product-1'), true);
+  assert.equal(records.has('products/product-1/private/data'), true);
+
+  const retry = await call('/seller/products/delete', 'seller-token', { productId: 'product-1' });
+  assert.equal(retry.status, 200);
+  assert.equal(records.has('products/product-1'), false);
+});
+
 test('whitespace UTR is rejected and a submitted UTR does not create an order', async () => {
   const created = await createAttempt('checkout-request-002');
   const attemptId = created.body.attempt.id;
@@ -242,8 +462,15 @@ test('whitespace UTR is rejected and a submitted UTR does not create an order', 
 });
 
 test('only an active admin can confirm a payment; confirmation is atomic and idempotent', async () => {
+  seed('settings/store', {
+    deliveryCharge: 45,
+    freeDeliveryEnabled: false,
+    deliveryMinDays: 7,
+    deliveryMaxDays: 9,
+  });
   const created = await createAttempt('checkout-request-003');
   const attemptId = created.body.attempt.id;
+  assert.equal(created.body.attempt.total, 2545);
   await call('/payment-attempts/submit', 'customer-token', { attemptId, customerUtr: 'Reference-ABC' });
 
   const customerConfirm = await call('/admin/payment-attempts/confirm', 'customer-token', {
@@ -269,7 +496,14 @@ test('only an active admin can confirm a payment; confirmation is atomic and ide
   assert.equal(retry.status, 200);
   assert.equal(retry.body.orderId, confirmed.body.orderId);
   assert.equal(records.get(`orders/${confirmed.body.orderId}`).data.paymentStatus, 'Paid');
+  assert.equal(records.get(`orders/${confirmed.body.orderId}`).data.itemSubtotal, 2500);
+  assert.equal(records.get(`orders/${confirmed.body.orderId}`).data.deliveryCharge, 45);
+  assert.equal(records.get(`orders/${confirmed.body.orderId}`).data.deliveryMinDays, 7);
+  assert.equal(records.get(`orders/${confirmed.body.orderId}`).data.deliveryMaxDays, 9);
+  assert.equal(records.get(`orders/${confirmed.body.orderId}`).data.total, 2545);
   assert.equal(records.get(`payment_attempts/${attemptId}`).data.status, 'Paid');
+  const sharedClaim = `payment_reference_claims/ref-${encodeURIComponent('REFERENCE-ABC')}`;
+  assert.equal(records.get(sharedClaim).data.orderId, confirmed.body.orderId);
   assert.equal([...records.keys()].filter((key) => key.startsWith('orders/') && !key.includes('/private/')).length, 1);
 });
 
@@ -302,6 +536,25 @@ test('confirmation requires submitted details and rejects a reused transaction r
   });
   assert.equal(duplicate.status, 409);
   assert.equal(records.get(`payment_attempts/${second.body.attempt.id}`).data.status, 'Submitted');
+});
+
+test('future Worker verification honors the shared manual-UPI reference claim', async () => {
+  const created = await createAttempt('shared-reference-claim');
+  const attemptId = created.body.attempt.id;
+  const reference = 'shared-upi-reference';
+  await call('/payment-attempts/submit', 'customer-token', { attemptId, customerUtr: reference });
+  seed(`payment_reference_claims/ref-${encodeURIComponent(reference.toLocaleUpperCase('en-US'))}`, {
+    orderId: 'manual-order-1',
+    reference,
+  });
+
+  const result = await call('/admin/payment-attempts/confirm', 'admin-token', {
+    attemptId,
+    actualCreditConfirmed: true,
+  });
+  assert.equal(result.status, 409);
+  assert.equal(records.get(`payment_attempts/${attemptId}`).data.status, 'Submitted');
+  assert.equal([...records.keys()].filter((key) => key.startsWith('orders/')).length, 0);
 });
 
 test('expired attempts remain submittable until manually expired after review', async () => {
@@ -382,17 +635,30 @@ test('legacy paid records remain unchanged and unpaid legacy payments require ad
   });
   assert.equal(confirmed.status, 200);
   assert.equal(records.get('orders/legacy-pending').data.paymentStatus, 'Paid');
+  assert.equal(
+    records.get(`payment_reference_claims/ref-${encodeURIComponent('LEGACY-NEW-REF')}`).data.orderId,
+    'legacy-pending',
+  );
   assert.deepEqual(records.get('orders/existing-paid').data, original);
 });
 
 test('preflight permits the authenticated cross-origin Worker requests', async () => {
+  const origin = 'https://vibekaart.vercel.app';
   const result = await worker.fetch(new Request('https://worker.test/payment-attempts/submit', {
     method: 'OPTIONS',
-    headers: { Origin: 'https://vibekart-f27b5.web.app' },
+    headers: { Origin: origin },
   }), env);
   assert.equal(result.status, 204);
+  assert.equal(result.headers.get('Access-Control-Allow-Origin'), origin);
   assert.match(result.headers.get('Access-Control-Allow-Headers'), /Authorization/);
   assert.match(result.headers.get('Access-Control-Allow-Methods'), /POST/);
+
+  const deniedOrigin = await worker.fetch(new Request('https://worker.test/payment-attempts/submit', {
+    method: 'OPTIONS',
+    headers: { Origin: 'https://vibekaart.vercel.app.attacker.test' },
+  }), env);
+  assert.equal(deniedOrigin.status, 204);
+  assert.equal(deniedOrigin.headers.get('Access-Control-Allow-Origin'), 'null');
 });
 
 test('retired direct order and customer verification endpoints are unavailable', async () => {

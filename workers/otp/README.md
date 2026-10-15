@@ -14,7 +14,9 @@ The Worker securely handles:
 * Firestore profile creation/repair
 * Firebase custom-token generation
 * Server-priced payment-attempt creation and UTR submission
+* Trusted manual-UPI order creation from current Firestore product prices and delivery settings
 * Admin-only payment verification and atomic paid-order creation
+* Seller/admin-authorized product deletion with server-side Cloudinary cleanup
 
 The Expo app never receives or stores the MSG91 authentication key or Firebase service-account credentials. UPI payment confirmation uses the same Worker and does not require a payment gateway, Firebase Cloud Functions, or a billing-plan upgrade.
 
@@ -252,6 +254,22 @@ When prompted, paste the complete contents of the Firebase service-account JSON.
 
 The secret is stored by Cloudflare and is not written into the repository.
 
+Product deletion also requires the Cloudinary Admin API credentials. Create
+these as Worker secrets (not app environment variables):
+
+```bash
+npx wrangler secret put CLOUDINARY_CLOUD_NAME
+npx wrangler secret put CLOUDINARY_API_KEY
+npx wrangler secret put CLOUDINARY_API_SECRET
+```
+
+The cloud name and API key identify the Cloudinary account; the API secret
+authorizes destructive Admin API operations. Keep all three out of Expo
+variables and source control. When a product has no Cloudinary image IDs, the
+Worker can remove its Firestore documents without these secrets. When it does
+have stored image IDs and the credentials are missing, deletion fails closed
+and preserves the product.
+
 Never put the service-account JSON into:
 
 ```text
@@ -281,7 +299,7 @@ OTP_KV
 
 ## API endpoints
 
-The Worker exposes OTP and payment endpoints.
+The Worker exposes OTP, payment, and product-management endpoints.
 
 ### Send OTP
 
@@ -407,6 +425,35 @@ The Expo client can read an attempt only when it belongs to the signed-in user.
 Direct client creates/updates/deletes of payment attempts and direct order
 creation/payment-status updates are denied by `firestore.rules`. Deploy the
 matching rules after review before enabling the updated app.
+
+## Product deletion
+
+```text
+POST /seller/products/delete
+Authorization: Bearer <Firebase ID token>
+```
+
+Request:
+
+```json
+{
+  "productId": "product-id"
+}
+```
+
+The Worker checks that the caller has an active seller or admin profile. A
+seller may delete only a product whose `createdByUid` matches their UID;
+administrators may also delete legacy products without an owner UID. Before
+deleting Firestore documents, it removes every validated `imagePublicIds`
+asset through the Cloudinary Admin API. It then conditionally deletes both the
+public product document and its private data in one Firestore commit. Direct
+client product deletion is denied by `firestore.rules`.
+
+Cloudinary and Firestore cannot participate in one distributed transaction. If
+the Cloudinary request succeeds but the Firestore commit fails because the
+product changed, the Worker returns a conflict and leaves the product record
+intact. A retry safely accepts Cloudinary's `not_found` result for an image
+already removed.
 
 ## OTP storage
 
@@ -611,30 +658,20 @@ The Worker handles CORS through:
 workers/otp/src/cors.ts
 ```
 
-Local development origins should be allowed.
-
-When the Vibekart web application is deployed, add the production origin to the allowed origins configuration.
+The allowlist includes local development, Firebase Hosting, and the current
+Vercel production origin (`https://vibekaart.vercel.app`). Add any new
+production domain as an exact origin in `workers/otp/src/cors.ts`.
 
 Do not use unrestricted CORS with credentials.
 
 Native Expo requests do not have the same browser CORS restrictions, but keeping correct CORS handling is still necessary for Expo Web.
 
-## Production origin
+## Vercel configuration
 
-Once Vibekart Web has a stable production domain, add that domain to the Worker CORS configuration.
-
-The relevant file is:
-
-```text
-workers/otp/src/cors.ts
-```
-
-After changing the allowed origins, redeploy the Worker:
-
-```bash
-cd workers/otp
-npx wrangler deploy
-```
+The Vercel project must set `EXPO_PUBLIC_OTP_WORKER_URL` to the deployed
+Cloudflare Worker URL and rebuild the web app. CORS allowlisting alone does not
+configure the app to call the Worker. Never put Worker secrets in Vercel's
+`EXPO_PUBLIC_*` variables.
 
 ## Troubleshooting
 

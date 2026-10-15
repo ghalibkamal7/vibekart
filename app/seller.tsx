@@ -1,11 +1,12 @@
 import { Feather } from '@expo/vector-icons';
 import { router } from 'expo-router';
 import React, { useMemo, useState } from 'react';
-import { Alert, Image, Pressable, ScrollView, StyleSheet, Switch, Text, View } from 'react-native';
+import { ActivityIndicator, Image, Pressable, ScrollView, StyleSheet, Switch, Text, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { formatPrice, getProductImages } from '@/data/store';
 import { useColors } from '@/hooks/useColors';
 import { useStore } from '@/context/StoreContext';
+import { confirmPlatformAction, showPlatformAlert } from '@/utils/platformDialogs';
 
 type DateFilter = 'Today' | 'Last 7 Days' | 'All Time';
 const DATE_FILTERS: DateFilter[] = ['Today', 'Last 7 Days', 'All Time'];
@@ -25,7 +26,7 @@ function isWithinDays(dateStr: string, days: number): boolean {
 export default function SellerScreen() {
   const colors = useColors();
   const insets = useSafeAreaInsets();
-  const { products, orders, analytics, toggleStock, toggleEnabled, deleteProduct, authUser, isCloudMode } = useStore();
+  const { products, orders, analytics, toggleStock, toggleEnabled, deleteProduct, deletingProductId, authUser, isCloudMode } = useStore();
   const [dateFilter, setDateFilter] = useState<DateFilter>('All Time');
 
   // Client-side route guard — computed before any early return so hooks
@@ -56,10 +57,21 @@ export default function SellerScreen() {
   }, [filteredOrders]);
 
   const confirmDelete = (id: string, name: string) => {
-    Alert.alert('Delete product?', `"${name}" will be permanently removed from your catalogue.`, [
-      { text: 'Cancel', style: 'cancel' },
-      { text: 'Delete', style: 'destructive', onPress: () => deleteProduct(id) },
-    ]);
+    confirmPlatformAction(
+      'Delete product?',
+      `"${name}" will be permanently removed from your catalogue.`,
+      'Delete',
+      async () => {
+        if (deletingProductId) return;
+        try {
+          await deleteProduct(id);
+          showPlatformAlert('Product deleted', `"${name}" and any stored images were removed.`);
+        } catch (error) {
+          showPlatformAlert('Deletion failed', error instanceof Error ? error.message : 'Product could not be deleted. Retry after checking your connection and permissions.');
+        }
+      },
+      true,
+    );
   };
 
   // Access-denied screen — rendered after all hooks so hook order stays stable.
@@ -258,8 +270,15 @@ export default function SellerScreen() {
               <Pressable onPress={() => router.push({ pathname: '/seller-add-product', params: { id: product.id } })} hitSlop={8} style={{ marginTop: 8 }}>
                 <Feather name="edit-3" size={16} color={colors.moss} />
               </Pressable>
-              <Pressable onPress={() => confirmDelete(product.id, product.name)} hitSlop={8} style={{ marginTop: 10 }}>
-                <Feather name="trash-2" size={16} color={colors.destructive} />
+              <Pressable
+                disabled={!!deletingProductId}
+                onPress={() => confirmDelete(product.id, product.name)}
+                hitSlop={8}
+                style={{ marginTop: 10, opacity: deletingProductId ? 0.5 : 1 }}
+              >
+                {deletingProductId === product.id
+                  ? <ActivityIndicator size="small" color={colors.destructive} />
+                  : <Feather name="trash-2" size={16} color={colors.destructive} />}
               </Pressable>
             </View>
           </View>

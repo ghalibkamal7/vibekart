@@ -45,6 +45,9 @@ export interface Env {
   BANK_PSP_API_URL?: string;
   BANK_PSP_API_KEY?: string;
   BANK_PSP_MERCHANT_ID?: string;
+  CLOUDINARY_CLOUD_NAME?: string;
+  CLOUDINARY_API_KEY?: string;
+  CLOUDINARY_API_SECRET?: string;
 }
 
 async function handleSendOtp(request: Request, env: Env, origin: string | null): Promise<Response> {
@@ -332,6 +335,195 @@ async function handleCreateOrder(request: Request, env: Env, origin: string | nu
   return jsonResponse({ success: true, order: publicOrderDoc }, 201, origin);
 }
 
+async function handleCreateManualUpiOrder(request: Request, env: Env, origin: string | null): Promise<Response> {
+  const caller = await authenticateCaller(request, env, origin);
+  if (!isAuthenticatedCaller(caller)) return caller;
+
+  const body = (await request.json().catch(() => null)) as {
+    items?: Array<{ productId: string; quantity: number; option?: string }>;
+    customerName?: string;
+    customerPhone?: string;
+    customerAddress?: string;
+    idempotencyKey?: string;
+  } | null;
+  if (!body || !Array.isArray(body.items) || body.items.length < 1 || body.items.length > 50) {
+    return jsonResponse({ error: 'An order must contain between 1 and 50 items.' }, 400, origin);
+  }
+
+  const customerName = String(body.customerName ?? '').trim();
+  const customerPhone = String(body.customerPhone ?? '').trim();
+  const customerAddress = String(body.customerAddress ?? '').trim();
+  const idempotencyKey = String(body.idempotencyKey ?? '').trim();
+  if (
+    !customerName || customerName.length > 120 ||
+    !customerPhone || customerPhone.length > 40 ||
+    !customerAddress || customerAddress.length > 1000
+  ) {
+    return jsonResponse({ error: 'Enter a valid name, phone number, and delivery address.' }, 400, origin);
+  }
+  if (idempotencyKey.length < 8 || idempotencyKey.length > 200) {
+    return jsonResponse({ error: 'A valid order idempotency key is required.' }, 400, origin);
+  }
+
+  const orderId = `ord-${await hashValue(`${caller.uid}:${idempotencyKey}`)}`;
+  const orderPath = `orders/${orderId}`;
+  const existing = await getVersionedDocument(caller.sa, caller.accessToken, orderPath);
+  if (existing.exists) {
+    if (existing.data?.customerUid !== caller.uid) {
+      return jsonResponse({ error: 'Order request could not be loaded.' }, 409, origin);
+    }
+    return jsonResponse({ success: true, order: existing.data }, 200, origin);
+  }
+
+  const paymentSettings = await getVersionedDocument(caller.sa, caller.accessToken, 'settings/payment');
+  if (
+    paymentSettings.data?.enabled !== true ||
+    typeof paymentSettings.data.merchantVpa !== 'string' ||
+    !paymentSettings.data.merchantVpa.trim()
+  ) {
+    return jsonResponse({ error: 'Manual UPI checkout is not enabled or merchant details are incomplete.' }, 409, origin);
+  }
+
+  const publicItems: Array<Record<string, unknown>> = [];
+  const privateItems: Array<Record<string, unknown>> = [];
+  let itemSubtotal = 0;
+  let costTotal = 0;
+  for (const item of body.items) {
+    if (!item || typeof item.productId !== 'string' || !/^[A-Za-z0-9_-]{1,150}$/.test(item.productId)) {
+      return jsonResponse({ error: 'Invalid product item format.' }, 400, origin);
+    }
+    if (!Number.isInteger(item.quantity) || item.quantity < 1 || item.quantity > 99) {
+      return jsonResponse({ error: 'Order quantities must be between 1 and 99.' }, 400, origin);
+    }
+
+    const product = await getProductDoc(caller.sa, caller.accessToken, item.productId);
+    if (!product.exists || !product.data) {
+      return jsonResponse({ error: `Product ${item.productId} is no longer available.` }, 409, origin);
+    }
+    if (product.data.enabled === false || product.data.inStock === false) {
+      return jsonResponse({ error: `Product "${product.data.name || item.productId}" is unavailable or out of stock.` }, 409, origin);
+    }
+    const unitPrice = Number(product.data.price);
+    if (!Number.isSafeInteger(unitPrice) || unitPrice <= 0) {
+      return jsonResponse({ error: `Product "${product.data.name || item.productId}" has an invalid price.` }, 409, origin);
+    }
+    const itemTotal = unitPrice * item.quantity;
+    itemSubtotal += itemTotal;
+    if (!Number.isSafeInteger(itemTotal) || !Number.isSafeInteger(itemSubtotal)) {
+      return jsonResponse({ error: 'The order subtotal is outside the supported range.' }, 400, origin);
+    }
+    publicItems.push({
+      productId: item.productId,
+      name: String(product.data.name || 'Product').slice(0, 200),
+      ...(typeof item.option === 'string' && item.option.trim()
+        ? { option: item.option.trim().slice(0, 100) }
+        : {}),
+      quantity: item.quantity,
+      unitPrice,
+      itemTotal,
+    });
+
+    const privateProduct = await getProductPrivateDoc(caller.sa, caller.accessToken, item.productId);
+    const privateData = privateProduct.data || {};
+    const unitCost = Number.isSafeInteger(privateData.baseCost) && privateData.baseCost >= 0
+      ? privateData.baseCost
+      : 0;
+    costTotal += unitCost * item.quantity;
+    if (!Number.isSafeInteger(costTotal)) {
+      return jsonResponse({ error: 'The order cost is outside the supported range.' }, 400, origin);
+    }
+    privateItems.push({
+      productId: item.productId,
+      unitCost,
+      ...(typeof privateData.sourceUrl === 'string' ? { sourceUrl: privateData.sourceUrl.slice(0, 2000) } : {}),
+      ...(typeof privateData.sourceCode === 'string' ? { sourceCode: privateData.sourceCode.slice(0, 500) } : {}),
+    });
+  }
+  if (itemSubtotal <= 0) {
+    return jsonResponse({ error: 'The order subtotal must be greater than zero.' }, 400, origin);
+  }
+
+  const settingsSnapshot = await getVersionedDocument(caller.sa, caller.accessToken, 'settings/store');
+  const settings = settingsSnapshot.data || {};
+  const threshold = Number.isSafeInteger(settings.freeDeliveryThreshold) && settings.freeDeliveryThreshold >= 0
+    ? settings.freeDeliveryThreshold
+    : 499;
+  const configuredCharge = Number.isSafeInteger(settings.deliveryCharge) && settings.deliveryCharge >= 0
+    ? settings.deliveryCharge
+    : 0;
+  const deliveryMinDays = Number.isInteger(settings.deliveryMinDays) &&
+    settings.deliveryMinDays >= 1 && settings.deliveryMinDays <= 60
+    ? settings.deliveryMinDays
+    : 4;
+  const deliveryMaxDays = Number.isInteger(settings.deliveryMaxDays) &&
+    settings.deliveryMaxDays >= deliveryMinDays && settings.deliveryMaxDays <= 60
+    ? settings.deliveryMaxDays
+    : Math.max(deliveryMinDays, 6);
+  const deliveryCharge = settings.freeDeliveryEnabled === true && itemSubtotal >= threshold
+    ? 0
+    : configuredCharge;
+  const total = itemSubtotal + deliveryCharge;
+  if (!Number.isSafeInteger(total) || total <= 0 || !Number.isSafeInteger(total * 100)) {
+    return jsonResponse({ error: 'The payable amount is outside the supported range.' }, 400, origin);
+  }
+
+  const now = new Date().toISOString();
+  const order = {
+    id: orderId,
+    customerUid: caller.uid,
+    items: publicItems,
+    itemSubtotal,
+    deliveryCharge,
+    deliveryMinDays,
+    deliveryMaxDays,
+    total,
+    amountPaise: total * 100,
+    currency: 'INR',
+    paymentMethod: 'UPI',
+    paymentStatus: 'Pending',
+    paymentInitiatedAt: now,
+    status: 'Placed',
+    date: new Date().toLocaleDateString('en-IN', { day: '2-digit', month: 'short' }),
+    customerName,
+    customerPhone,
+    customerAddress,
+    createdAt: now,
+  };
+  const privateOrder = {
+    costTotal,
+    profitTotal: total - costTotal,
+    items: privateItems,
+    reconciled: true,
+    createdAt: now,
+  };
+  try {
+    await commitFirestoreWrites(caller.sa, caller.accessToken, [
+      {
+        update: {
+          name: firestoreDocumentName(caller.sa, orderPath),
+          fields: toFirestoreFields(order),
+        },
+        currentDocument: { exists: false },
+      },
+      {
+        update: {
+          name: firestoreDocumentName(caller.sa, `${orderPath}/private/data`),
+          fields: toFirestoreFields(privateOrder),
+        },
+        currentDocument: { exists: false },
+      },
+    ]);
+    return jsonResponse({ success: true, order }, 201, origin);
+  } catch (error) {
+    const retry = await getVersionedDocument(caller.sa, caller.accessToken, orderPath);
+    if (retry.exists && retry.data?.customerUid === caller.uid) {
+      return jsonResponse({ success: true, order: retry.data }, 200, origin);
+    }
+    console.error('[order] Failed to create manual UPI order', error);
+    return jsonResponse({ error: 'Could not create the order. Please retry.' }, 500, origin);
+  }
+}
+
 async function handlePaymentConfig(request: Request, env: Env, origin: string | null): Promise<Response> {
   const isMerchantConfigured = Boolean(env.MERCHANT_VPA && env.MERCHANT_NAME);
   const isBankConfigured = Boolean(env.BANK_PSP_API_URL);
@@ -534,6 +726,104 @@ function firestoreDocumentName(sa: ReturnType<typeof parseServiceAccount>, path:
   return `projects/${sa.project_id}/databases/(default)/documents/${path}`;
 }
 
+async function handleDeleteProduct(request: Request, env: Env, origin: string | null): Promise<Response> {
+  const caller = await authenticateCaller(request, env, origin);
+  if (!isAuthenticatedCaller(caller)) return caller;
+  if (!['seller', 'admin'].includes(String(caller.profile.role))) {
+    return jsonResponse({ error: 'Only an authorized seller or administrator can delete products.' }, 403, origin);
+  }
+
+  const body = (await request.json().catch(() => null)) as { productId?: string } | null;
+  const productId = String(body?.productId ?? '').trim();
+  if (!/^[A-Za-z0-9_-]{1,150}$/.test(productId)) {
+    return jsonResponse({ error: 'A valid product ID is required.' }, 400, origin);
+  }
+
+  const productPath = `products/${productId}`;
+  const product = await getVersionedDocument(caller.sa, caller.accessToken, productPath);
+  if (!product.exists || !product.data || !product.updateTime) {
+    return jsonResponse({ error: 'Product was not found or has already been deleted.' }, 404, origin);
+  }
+  if (caller.profile.role !== 'admin' && product.data.createdByUid !== caller.uid) {
+    return jsonResponse({ error: 'Sellers may delete only products they created.' }, 403, origin);
+  }
+
+  const publicIds = Array.isArray(product.data.imagePublicIds)
+    ? product.data.imagePublicIds.filter((id): id is string =>
+        typeof id === 'string' && id.length > 0 && id.length <= 255 && /^[A-Za-z0-9_./-]+$/.test(id),
+      )
+    : [];
+  if (publicIds.length !== (Array.isArray(product.data.imagePublicIds) ? product.data.imagePublicIds.length : 0)) {
+    return jsonResponse({ error: 'Product contains invalid image references; deletion was stopped for review.' }, 409, origin);
+  }
+
+  if (publicIds.length > 0) {
+    if (!env.CLOUDINARY_CLOUD_NAME || !env.CLOUDINARY_API_KEY || !env.CLOUDINARY_API_SECRET) {
+      return jsonResponse({ error: 'Cloudinary deletion is not configured. The product was not deleted.' }, 503, origin);
+    }
+    const form = new URLSearchParams();
+    for (const publicId of publicIds) form.append('public_ids[]', publicId);
+    let cloudinaryResponse: Response;
+    try {
+      cloudinaryResponse = await fetch(
+        `https://api.cloudinary.com/v1_1/${encodeURIComponent(env.CLOUDINARY_CLOUD_NAME)}/resources/image/upload`,
+        {
+          method: 'DELETE',
+          headers: {
+            Authorization: `Basic ${btoa(`${env.CLOUDINARY_API_KEY}:${env.CLOUDINARY_API_SECRET}`)}`,
+            'Content-Type': 'application/x-www-form-urlencoded',
+          },
+          body: form.toString(),
+        },
+      );
+    } catch (error) {
+      console.error('[product] Cloudinary deletion request failed', error);
+      return jsonResponse({ error: 'Could not delete the product images. The product was not deleted.' }, 502, origin);
+    }
+    const cloudinaryResult = (await cloudinaryResponse.json().catch(() => null)) as {
+      deleted?: Record<string, string>;
+    } | null;
+    const deleted = cloudinaryResult?.deleted ?? {};
+    const allHandled = cloudinaryResponse.ok && publicIds.every(
+      (publicId) => deleted[publicId] === 'deleted' || deleted[publicId] === 'not_found',
+    );
+    if (!allHandled) {
+      console.error('[product] Cloudinary did not delete every product image', {
+        status: cloudinaryResponse.status,
+        outcomes: deleted,
+      });
+      return jsonResponse({ error: 'Could not delete all product images. The product was not deleted; retry after checking Cloudinary.' }, 502, origin);
+    }
+  }
+
+  const privatePath = `${productPath}/private/data`;
+  const privateDocument = await getVersionedDocument(caller.sa, caller.accessToken, privatePath);
+  const writes: Record<string, unknown>[] = [
+    {
+      delete: firestoreDocumentName(caller.sa, productPath),
+      currentDocument: { updateTime: product.updateTime },
+    },
+  ];
+  if (privateDocument.exists && privateDocument.updateTime) {
+    writes.push({
+      delete: firestoreDocumentName(caller.sa, privatePath),
+      currentDocument: { updateTime: privateDocument.updateTime },
+    });
+  }
+
+  try {
+    await commitFirestoreWrites(caller.sa, caller.accessToken, writes);
+  } catch (error) {
+    console.error('[product] Product documents could not be deleted atomically', error);
+    return jsonResponse({
+      error: publicIds.length
+        ? 'Images were deleted, but the product record changed before it could be removed. Refresh and retry.'
+        : 'Product could not be deleted because its record changed. Refresh and retry.',
+    }, 409, origin);
+  }
+  return jsonResponse({ success: true, productId }, 200, origin);
+}
+
 async function hashValue(value: string): Promise<string> {
   const bytes = new TextEncoder().encode(value);
   const digest = await crypto.subtle.digest('SHA-256', bytes);
@@ -542,6 +832,10 @@ async function hashValue(value: string): Promise<string> {
 
 async function hashReference(value: string): Promise<string> {
   return hashValue(value.trim().toLocaleUpperCase('en-US'));
+}
+
+function referenceClaimPath(value: string): string {
+  return `payment_reference_claims/ref-${encodeURIComponent(value.trim().toLocaleUpperCase('en-US'))}`;
 }
 
 async function handleCreatePaymentAttempt(request: Request, env: Env, origin: string | null): Promise<Response> {
@@ -590,7 +884,7 @@ async function handleCreatePaymentAttempt(request: Request, env: Env, origin: st
 
   const publicItems: Array<Record<string, unknown>> = [];
   const privateItems: Array<Record<string, unknown>> = [];
-  let total = 0;
+  let itemSubtotal = 0;
   let costTotal = 0;
   for (const item of body.items) {
     if (!item || typeof item.productId !== 'string' || !/^[A-Za-z0-9_-]{1,150}$/.test(item.productId)) {
@@ -613,7 +907,7 @@ async function handleCreatePaymentAttempt(request: Request, env: Env, origin: st
       return jsonResponse({ error: `Product "${product.data.name || item.productId}" has an invalid price.` }, 409, origin);
     }
     const itemTotal = unitPrice * quantity;
-    total += itemTotal;
+    itemSubtotal += itemTotal;
     publicItems.push({
       productId: item.productId,
       name: String(product.data.name || 'Product').slice(0, 200),
@@ -636,8 +930,31 @@ async function handleCreatePaymentAttempt(request: Request, env: Env, origin: st
       ...(privateData.sourceCode ? { sourceCode: String(privateData.sourceCode) } : {}),
     });
   }
-  if (!Number.isSafeInteger(total) || !Number.isSafeInteger(total * 100) || total <= 0) {
+  if (!Number.isSafeInteger(itemSubtotal) || itemSubtotal <= 0) {
     return jsonResponse({ error: 'The payable amount must be greater than zero.' }, 400, origin);
+  }
+
+  const deliverySettings = await getVersionedDocument(caller.sa, caller.accessToken, 'settings/store');
+  const settings = deliverySettings.data || {};
+  const threshold = Number.isSafeInteger(settings.freeDeliveryThreshold) && settings.freeDeliveryThreshold >= 0
+    ? settings.freeDeliveryThreshold
+    : 499;
+  const configuredCharge = Number.isSafeInteger(settings.deliveryCharge) && settings.deliveryCharge >= 0
+    ? settings.deliveryCharge
+    : 0;
+  const deliveryMinDays = Number.isInteger(settings.deliveryMinDays) &&
+    settings.deliveryMinDays >= 1 && settings.deliveryMinDays <= 60
+    ? settings.deliveryMinDays
+    : 4;
+  const deliveryMaxDays = Number.isInteger(settings.deliveryMaxDays) &&
+    settings.deliveryMaxDays >= deliveryMinDays && settings.deliveryMaxDays <= 60
+    ? settings.deliveryMaxDays
+    : Math.max(deliveryMinDays, 6);
+  const freeDeliveryEnabled = settings.freeDeliveryEnabled === true;
+  const deliveryCharge = freeDeliveryEnabled && itemSubtotal >= threshold ? 0 : configuredCharge;
+  const total = itemSubtotal + deliveryCharge;
+  if (!Number.isSafeInteger(total) || !Number.isSafeInteger(total * 100) || total <= 0) {
+    return jsonResponse({ error: 'The payable amount is outside the supported range.' }, 400, origin);
   }
 
   const createdAt = new Date().toISOString();
@@ -650,6 +967,10 @@ async function handleCreatePaymentAttempt(request: Request, env: Env, origin: st
     customerPhone,
     customerAddress,
     items: publicItems,
+    itemSubtotal,
+    deliveryCharge,
+    deliveryMinDays,
+    deliveryMaxDays,
     total,
     amountPaise: total * 100,
     currency: 'INR',
@@ -779,9 +1100,14 @@ async function handleConfirmPaymentAttempt(request: Request, env: Env, origin: s
   const reference = String(attempt.data.customerUtr).trim();
   const referenceHash = await hashReference(reference);
   const claimPath = `payment_reference_claims/${referenceHash}`;
+  const sharedClaimPath = referenceClaimPath(reference);
   const claim = await getVersionedDocument(caller.sa, caller.accessToken, claimPath);
+  const sharedClaim = await getVersionedDocument(caller.sa, caller.accessToken, sharedClaimPath);
   const orderId = `ord-${attemptId.slice(4)}`;
-  if (claim.exists && claim.data?.attemptId !== attemptId) {
+  if (
+    (claim.exists && claim.data?.attemptId !== attemptId) ||
+    (sharedClaim.exists && sharedClaim.data?.orderId !== orderId)
+  ) {
     return jsonResponse({ error: 'This transaction reference has already been used for another payment.' }, 409, origin);
   }
 
@@ -804,6 +1130,14 @@ async function handleConfirmPaymentAttempt(request: Request, env: Env, origin: s
     paymentInitiatedAt: attempt.data.createdAt,
     status: 'Placed',
     items: attempt.data.items,
+    itemSubtotal: attempt.data.itemSubtotal ?? attempt.data.total,
+    deliveryCharge: attempt.data.deliveryCharge ?? 0,
+    ...(attempt.data.deliveryMinDays !== undefined
+      ? { deliveryMinDays: attempt.data.deliveryMinDays }
+      : {}),
+    ...(attempt.data.deliveryMaxDays !== undefined
+      ? { deliveryMaxDays: attempt.data.deliveryMaxDays }
+      : {}),
     total: attempt.data.total,
     costReconciled: true,
     date: new Date().toLocaleDateString('en-IN', { day: '2-digit', month: 'short' }),
@@ -855,6 +1189,15 @@ async function handleConfirmPaymentAttempt(request: Request, env: Env, origin: s
       currentDocument: { exists: false },
     });
   }
+  if (!sharedClaim.exists) {
+    writes.push({
+      update: {
+        name: firestoreDocumentName(caller.sa, sharedClaimPath),
+        fields: toFirestoreFields({ reference, attemptId, orderId, claimedAt: now }),
+      },
+      currentDocument: { exists: false },
+    });
+  }
 
   try {
     await commitFirestoreWrites(caller.sa, caller.accessToken, writes);
@@ -864,7 +1207,11 @@ async function handleConfirmPaymentAttempt(request: Request, env: Env, origin: s
       return jsonResponse({ success: true, orderId: retry.data.orderId, status: 'Paid' }, 200, origin);
     }
     const claimed = await getVersionedDocument(caller.sa, caller.accessToken, claimPath);
-    if (claimed.exists && claimed.data?.attemptId !== attemptId) {
+    const sharedClaimed = await getVersionedDocument(caller.sa, caller.accessToken, sharedClaimPath);
+    if (
+      (claimed.exists && claimed.data?.attemptId !== attemptId) ||
+      (sharedClaimed.exists && sharedClaimed.data?.orderId !== orderId)
+    ) {
       return jsonResponse({ error: 'This transaction reference has already been used for another payment.' }, 409, origin);
     }
     console.error('[payment] Atomic payment confirmation failed', error);
@@ -958,8 +1305,13 @@ async function handleConfirmLegacyOrderPayment(request: Request, env: Env, origi
 
   const referenceHash = await hashReference(reference);
   const claimPath = `payment_reference_claims/${referenceHash}`;
+  const sharedClaimPath = referenceClaimPath(reference);
   const claim = await getVersionedDocument(caller.sa, caller.accessToken, claimPath);
-  if (claim.exists && claim.data?.orderId !== orderId) {
+  const sharedClaim = await getVersionedDocument(caller.sa, caller.accessToken, sharedClaimPath);
+  if (
+    (claim.exists && claim.data?.orderId !== orderId) ||
+    (sharedClaim.exists && sharedClaim.data?.orderId !== orderId)
+  ) {
     return jsonResponse({ error: 'This transaction reference has already been used for another payment.' }, 409, origin);
   }
   const now = new Date().toISOString();
@@ -980,6 +1332,15 @@ async function handleConfirmLegacyOrderPayment(request: Request, env: Env, origi
     writes.push({
       update: {
         name: firestoreDocumentName(caller.sa, claimPath),
+        fields: toFirestoreFields({ reference, orderId, claimedAt: now }),
+      },
+      currentDocument: { exists: false },
+    });
+  }
+  if (!sharedClaim.exists) {
+    writes.push({
+      update: {
+        name: firestoreDocumentName(caller.sa, sharedClaimPath),
         fields: toFirestoreFields({ reference, orderId, claimedAt: now }),
       },
       currentDocument: { exists: false },
@@ -1061,6 +1422,8 @@ export default {
 
       if (url.pathname === '/send-otp') return handleSendOtp(request, env, origin);
       if (url.pathname === '/verify-otp') return handleVerifyOtp(request, env, origin);
+      if (url.pathname === '/seller/products/delete') return handleDeleteProduct(request, env, origin);
+      if (url.pathname === '/manual-upi/orders/create') return handleCreateManualUpiOrder(request, env, origin);
       if (url.pathname === '/payment-attempts/create') return handleCreatePaymentAttempt(request, env, origin);
       if (url.pathname === '/create-order') {
         return jsonResponse({ error: 'Direct order creation is disabled. Create a payment attempt instead.' }, 410, origin);

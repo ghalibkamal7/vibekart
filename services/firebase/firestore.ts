@@ -10,6 +10,7 @@ import {
   onSnapshot,
   orderBy,
   query,
+  runTransaction,
   serverTimestamp,
   setDoc,
   updateDoc,
@@ -143,6 +144,8 @@ export async function fetchSellerProducts(): Promise<Product[]> {
 
 export async function createProduct(input: NewProductInput): Promise<string> {
   const database = requireDb();
+  const currentUser = auth?.currentUser;
+  if (!currentUser) throw new Error('Sign in as a seller to create products.');
   const price = computeDisplayPrice(input.baseCost, input.markupType, input.markupValue, input.manualPrice);
   const { pub, priv } = splitProductInput(input);
   const docRef = await addDoc(collection(database, PRODUCTS_COLLECTION), {
@@ -152,8 +155,7 @@ export async function createProduct(input: NewProductInput): Promise<string> {
     enabled: input.enabled ?? true,
     featured: input.featured ?? false,
     isNew: input.isNew ?? false,
-    rating: 4.5,
-    reviews: 0,
+    createdByUid: currentUser.uid,
     createdAt: serverTimestamp(),
   });
   await setDoc(doc(database, PRODUCTS_COLLECTION, docRef.id, PRIVATE_SUBCOLLECTION, PRIVATE_DOC_ID), priv);
@@ -184,12 +186,6 @@ export async function editProduct(id: string, patch: Partial<NewProductInput>): 
   }
 }
 
-export async function removeProduct(id: string): Promise<void> {
-  const database = requireDb();
-  await deleteDoc(doc(database, PRODUCTS_COLLECTION, id, PRIVATE_SUBCOLLECTION, PRIVATE_DOC_ID));
-  await deleteDoc(doc(database, PRODUCTS_COLLECTION, id));
-}
-
 export async function setProductStock(id: string, inStock: boolean): Promise<void> {
   const database = requireDb();
   await updateDoc(doc(database, PRODUCTS_COLLECTION, id), { inStock });
@@ -206,7 +202,131 @@ export async function setProductFeatured(id: string, featured: boolean): Promise
 }
 
 // ---------------- Orders ----------------
-// The Worker creates orders only after an administrator verifies the UPI credit.
+
+export async function createManualUpiOrderRemote(input: {
+  idempotencyKey: string;
+  customerName: string;
+  customerPhone: string;
+  customerAddress: string;
+  items: Array<{ productId: string; quantity: number; option?: string }>;
+}): Promise<Order> {
+  const response = await postPaymentWorker<{ success: boolean; order?: Order }>(
+    '/manual-upi/orders/create',
+    input,
+  );
+  if (!response.success || !response.order) {
+    throw new Error('The payment service could not confirm the order. Please retry.');
+  }
+  return response.order;
+}
+
+export async function submitManualUpiOrderUtrRemote(orderId: string, customerUtr: string): Promise<void> {
+  const database = requireDb();
+  const reference = customerUtr.trim();
+  if (!reference || reference.length > 100) throw new Error('Enter a valid UPI transaction reference.');
+  const currentUser = auth?.currentUser;
+  if (!currentUser) throw new Error('Sign in to submit your payment reference.');
+  const orderRef = doc(database, ORDERS_COLLECTION, orderId);
+  await runTransaction(database, async (transaction) => {
+    const orderSnapshot = await transaction.get(orderRef);
+    if (!orderSnapshot.exists()) throw new Error('Order not found.');
+    const order = orderSnapshot.data();
+    if (order.customerUid !== currentUser.uid) throw new Error('You can submit payment details only for your own order.');
+    if (
+      order.paymentMethod !== 'UPI' ||
+      !['Pending', 'Selected', undefined].includes(order.paymentStatus)
+    ) {
+      throw new Error('This order is no longer awaiting payment details.');
+    }
+    transaction.update(orderRef, { customerUtr: reference });
+  });
+}
+
+function manualUpiReferenceClaimId(reference: string): string {
+  return `ref-${encodeURIComponent(reference.trim().toLocaleUpperCase('en-US'))}`;
+}
+
+export async function confirmManualUpiOrderPaymentRemote(
+  orderId: string,
+  customerUtr: string,
+  actualCreditConfirmed: boolean,
+): Promise<void> {
+  const database = requireDb();
+  const reference = customerUtr.trim();
+  if (!reference || reference.length > 100 || actualCreditConfirmed !== true) {
+    throw new Error('A transaction reference and actual-credit confirmation are required.');
+  }
+  const orderRef = doc(database, ORDERS_COLLECTION, orderId);
+  const claimRef = doc(database, 'payment_reference_claims', manualUpiReferenceClaimId(reference));
+  const existingClaims = await getDocs(query(
+    collection(database, 'payment_reference_claims'),
+    where('reference', '==', reference),
+  ));
+  if (existingClaims.docs.some((claim) => claim.data().orderId !== orderId)) {
+    throw new Error('This transaction reference has already been used for another order.');
+  }
+  await runTransaction(database, async (transaction) => {
+    const [orderSnapshot, claimSnapshot] = await Promise.all([
+      transaction.get(orderRef),
+      transaction.get(claimRef),
+    ]);
+    if (!orderSnapshot.exists()) throw new Error('Order not found.');
+    const order = orderSnapshot.data();
+    if (order.paymentStatus === 'Paid') {
+      if (
+        String(order.paymentReference ?? order.customerUtr ?? '')
+          .trim()
+          .toLocaleUpperCase('en-US') !== reference.toLocaleUpperCase('en-US')
+      ) {
+        throw new Error('This order was already verified with a different transaction reference.');
+      }
+      return;
+    }
+    if (
+      order.paymentMethod !== 'UPI' ||
+      !['Pending', 'Selected', undefined].includes(order.paymentStatus) ||
+      order.status === 'Cancelled'
+    ) {
+      throw new Error('This order is not eligible for payment verification.');
+    }
+    if (claimSnapshot.exists() && claimSnapshot.data().orderId !== orderId) {
+      throw new Error('This transaction reference has already been used for another order.');
+    }
+    transaction.update(orderRef, {
+      paymentStatus: 'Paid',
+      paymentReference: reference,
+      paymentVerifiedAt: serverTimestamp(),
+    });
+    if (!claimSnapshot.exists()) {
+      transaction.set(claimRef, { orderId, reference, createdAt: serverTimestamp() });
+    }
+  });
+}
+
+export async function rejectManualUpiOrderPaymentRemote(orderId: string, reason: string): Promise<void> {
+  const database = requireDb();
+  const reviewReason = reason.trim();
+  if (!reviewReason || reviewReason.length > 300) throw new Error('A payment review reason is required.');
+  const orderRef = doc(database, ORDERS_COLLECTION, orderId);
+  await runTransaction(database, async (transaction) => {
+    const orderSnapshot = await transaction.get(orderRef);
+    if (!orderSnapshot.exists()) throw new Error('Order not found.');
+    const order = orderSnapshot.data();
+    if (order.paymentStatus === 'Paid') throw new Error('A paid order cannot be rejected.');
+    if (
+      order.paymentMethod !== 'UPI' ||
+      !['Pending', 'Selected', undefined].includes(order.paymentStatus) ||
+      order.status === 'Cancelled'
+    ) {
+      throw new Error('This order is not eligible for payment review.');
+    }
+    transaction.update(orderRef, {
+      paymentStatus: 'Failed',
+      status: 'Cancelled',
+      paymentReviewReason: reviewReason,
+    });
+  });
+}
 
 export async function fetchPaymentConfigViaWorker(): Promise<{
   gpayEnabled: boolean;
@@ -286,9 +406,18 @@ export function subscribeToOrders(
   );
 }
 
-export async function updateOrderStatusRemote(id: string, status: Order['status']): Promise<void> {
+export async function updateOrderStatusRemote(
+  id: string,
+  status: Order['status'],
+  cancellationReason?: string,
+): Promise<void> {
   const database = requireDb();
-  await updateDoc(doc(database, ORDERS_COLLECTION, id), { status });
+  await updateDoc(doc(database, ORDERS_COLLECTION, id), {
+    status,
+    ...(status === 'Cancelled'
+      ? { cancellationReason: cancellationReason || 'Cancelled by store staff', cancelledAt: serverTimestamp() }
+      : {}),
+  });
 }
 
 export async function setOrderTrackingId(id: string, trackingId: string): Promise<void> {
@@ -548,6 +677,16 @@ async function postPaymentWorker<T>(path: string, input: unknown): Promise<T> {
   if (!response.ok) throw new Error(payload?.error || `Payment request failed (${response.status}).`);
   if (!payload) throw new Error('Payment service returned an empty response.');
   return payload;
+}
+
+export async function deleteProductViaWorker(productId: string): Promise<void> {
+  const response = await postPaymentWorker<{ success: boolean; productId?: string }>(
+    '/seller/products/delete',
+    { productId },
+  );
+  if (!response.success || response.productId !== productId) {
+    throw new Error('Product deletion could not be confirmed. Refresh the catalogue and retry.');
+  }
 }
 
 export async function createPaymentAttemptViaWorker(input: {

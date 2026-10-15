@@ -12,7 +12,7 @@ export default function ProductDetailScreen() {
   const { id } = useLocalSearchParams<{ id: string }>();
   const colors = useColors();
   const insets = useSafeAreaInsets();
-  const { products, categories, addToCart, isFavorite, toggleFavorite, authUser, isCloudMode } = useStore();
+  const { products, categories, addToCart, isFavorite, toggleFavorite, storeSettings, authUser, isCloudMode } = useStore();
   const isSeller = !isCloudMode || (authUser && !authUser.isGuest && authUser.role === 'seller');
   const product = products.find((item) => item.id === id);
   const isUnavailable = !product || (product.enabled === false && !isSeller);
@@ -125,16 +125,12 @@ export default function ProductDetailScreen() {
               <Text style={[styles.title, { color: colors.foreground }]}>{product.name}</Text>
               <Text style={[styles.subtitle, { color: colors.mutedForeground }]}>{product.subtitle}</Text>
             </View>
-            <View style={styles.rating}>
-              <Feather name="star" size={14} color={colors.butter} fill={colors.butter} />
-              <Text style={[styles.ratingText, { color: colors.foreground }]}>{product.rating}</Text>
-            </View>
           </View>
           <View style={styles.priceRow}>
             <Text style={[styles.price, { color: colors.foreground }]}>{formatPrice(product.price)}</Text>
             {product.originalPrice ? <Text style={[styles.originalPrice, { color: colors.mutedForeground }]}>{formatPrice(product.originalPrice)}</Text> : null}
             <View style={[styles.reviews, { backgroundColor: colors.mossSoft }]}>
-              <Text style={[styles.reviewsText, { color: colors.moss }]}>{product.reviews} reviews</Text>
+              <Text style={[styles.reviewsText, { color: colors.moss }]}>No reviews yet</Text>
             </View>
           </View>
           <Text style={[styles.description, { color: colors.inkSoft }]}>{product.description}</Text>
@@ -171,9 +167,24 @@ export default function ProductDetailScreen() {
           ) : null}
           <View style={[styles.delivery, { backgroundColor: colors.card, borderColor: colors.border }]}>
             <Feather name="truck" size={18} color={colors.moss} />
-            <View>
-              <Text style={[styles.deliveryTitle, { color: colors.foreground }]}>Free delivery on this pick</Text>
-              <Text style={[styles.deliveryBody, { color: colors.mutedForeground }]}>Arrives in 4–6 working days</Text>
+            <View style={{ flex: 1 }}>
+              <Text style={[styles.deliveryTitle, { color: colors.foreground }]}>
+                {storeSettings.freeDeliveryEnabled && storeSettings.deliveryPromotionActive
+                  ? `${storeSettings.deliveryPromotionText} ${
+                      storeSettings.freeDeliveryThreshold > 0
+                        ? `on orders over ${formatPrice(storeSettings.freeDeliveryThreshold)}`
+                        : 'on all orders'
+                    }`
+                  : 'Delivery charge shown at checkout'}
+              </Text>
+              <Text style={[styles.deliveryBody, { color: colors.mutedForeground }]}>
+                Estimated delivery: {storeSettings.deliveryMinDays}–{storeSettings.deliveryMaxDays} working days
+              </Text>
+              {storeSettings.deliveryInstructions ? (
+                <Text style={[styles.deliveryBody, { color: colors.mutedForeground }]}>
+                  {storeSettings.deliveryInstructions}
+                </Text>
+              ) : null}
             </View>
           </View>
         </View>
@@ -214,8 +225,6 @@ const styles = StyleSheet.create({
   category: { fontSize: 10, fontFamily: 'Inter_700Bold', letterSpacing: 1.4 },
   title: { fontSize: 27, lineHeight: 31, fontFamily: 'Inter_700Bold', letterSpacing: -1, marginTop: 8 },
   subtitle: { fontSize: 13, fontFamily: 'Inter_400Regular', marginTop: 6 },
-  rating: { flexDirection: 'row', alignItems: 'center', gap: 4, paddingTop: 5 },
-  ratingText: { fontSize: 13, fontFamily: 'Inter_700Bold' },
   priceRow: { flexDirection: 'row', alignItems: 'center', gap: 9, marginTop: 19 },
   price: { fontSize: 23, fontFamily: 'Inter_700Bold' },
   originalPrice: { fontSize: 12, fontFamily: 'Inter_400Regular', textDecorationLine: 'line-through' },
@@ -230,7 +239,7 @@ const styles = StyleSheet.create({
   qtyControls: { flexDirection: 'row', alignItems: 'center', gap: 14 },
   qtyBtn: { width: 36, height: 36, borderRadius: 12, borderWidth: 1, alignItems: 'center', justifyContent: 'center' },
   qtyValue: { fontSize: 18, fontFamily: 'Inter_700Bold', minWidth: 28, textAlign: 'center' },
-  delivery: { flexDirection: 'row', alignItems: 'center', gap: 11, padding: 13, borderRadius: 15, borderWidth: 1, marginTop: 26 },
+  delivery: { flexDirection: 'row', alignItems: 'flex-start', gap: 11, padding: 13, borderRadius: 15, borderWidth: 1, marginTop: 26 },
   deliveryTitle: { fontSize: 12, fontFamily: 'Inter_700Bold' },
   deliveryBody: { fontSize: 11, fontFamily: 'Inter_400Regular', marginTop: 3 },
   bottomBar: { position: 'absolute', bottom: 0, left: 0, right: 0, paddingHorizontal: 18, paddingTop: 12, borderTopWidth: 1 },

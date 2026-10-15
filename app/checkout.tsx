@@ -1,9 +1,9 @@
 import { Feather } from '@expo/vector-icons';
 import { router } from 'expo-router';
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useRef, useState } from 'react';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import {
   ActivityIndicator,
-  Alert,
   Image,
   Linking,
   Platform,
@@ -15,23 +15,12 @@ import {
   View,
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
-import { buildUpiQrUrl, buildUpiUri, formatPrice } from '@/data/store';
+import { buildUpiQrUrl, calculateDeliveryCharge, formatPrice } from '@/data/store';
+import { showPlatformAlert } from '@/utils/platformDialogs';
 import { useColors } from '@/hooks/useColors';
 import { useStore } from '@/context/StoreContext';
-import { fetchPaymentConfigViaWorker } from '@/services/firebase/firestore';
-import { PaymentAttempt } from '@/data/store';
+import { Order } from '@/data/store';
 
-/**
- * DIRECT GOOGLE PAY INDIA (UPI) CONFIGURATION
- *
- * Supports both:
- * 1. Admin self-service UPI configuration (via Admin Panel "Payment Settings")
- * 2. Server-authoritative automated acquiring bank PSP API integration
- *
- * If neither is configured, checkout gracefully displays a clear "Payment setup pending"
- * state and disables order placement.
- */
-const PAYMENT_CONFIGURED = process.env.EXPO_PUBLIC_PAYMENT_GATEWAY_CONFIGURED === 'true';
 const MERCHANT_NAME = process.env.EXPO_PUBLIC_MERCHANT_NAME || 'VibeKart';
 
 export default function CheckoutScreen() {
@@ -41,34 +30,21 @@ export default function CheckoutScreen() {
     cart,
     cartTotal,
     placeOrder,
-    submitPaymentDetails,
+    submitManualOrderUtr,
     authUser,
     isCloudMode,
     paymentSettings,
+    storeSettings,
   } = useStore();
   const [name, setName] = useState('');
   const [address, setAddress] = useState('');
   const [phone, setPhone] = useState('');
   const [customerUtr, setCustomerUtr] = useState('');
   const [placing, setPlacing] = useState(false);
-  const [paymentAttempt, setPaymentAttempt] = useState<PaymentAttempt | null>(null);
+  const [pendingOrder, setPendingOrder] = useState<Order | null>(null);
   const [detailsSubmitted, setDetailsSubmitted] = useState(false);
   const [copiedVpa, setCopiedVpa] = useState(false);
-  const attemptIdempotencyKey = useRef(
-    `checkout-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`,
-  );
-  const [paymentConfig, setPaymentConfig] = useState<{
-    gpayEnabled: boolean;
-    status: string;
-    merchantName?: string;
-  } | null>(null);
-
-  useEffect(() => {
-    fetchPaymentConfigViaWorker()
-      .then((cfg) => setPaymentConfig(cfg))
-      .catch(() => {});
-  }, []);
-
+  const orderIdempotencyKey = useRef<{ uid: string; key: string } | null>(null);
   const hasItems = cart.length > 0;
   const allInStock = cart.every((line) => line.product.inStock && (line.product.enabled ?? true));
   const fieldsOk = name.trim() && address.trim() && phone.trim();
@@ -76,36 +52,45 @@ export default function CheckoutScreen() {
   // Self-service manual UPI readiness from Admin Panel
   const manualUpiReady = Boolean(paymentSettings.enabled && paymentSettings.merchantVpa?.trim());
 
-  // Payment is ready if manual UPI is configured or automated server PSP is configured
-  const paymentReady = manualUpiReady || (paymentConfig ? paymentConfig.gpayEnabled : PAYMENT_CONFIGURED);
+  const paymentReady = manualUpiReady;
   const canPlace =
-    !paymentAttempt && !placing && isCloudMode && hasItems && allInStock && !!fieldsOk && paymentReady;
+    !pendingOrder && !placing && isCloudMode && !!authUser && !authUser.isGuest &&
+    hasItems && allInStock && !!fieldsOk && paymentReady;
   const canSubmitDetails =
-    !!paymentAttempt && !detailsSubmitted && !placing && !!customerUtr.trim();
+    !!pendingOrder && pendingOrder.paymentStatus === 'Pending' &&
+    !detailsSubmitted && !placing && !!customerUtr.trim();
 
-  const activeMerchantName = paymentSettings.merchantName?.trim() || paymentConfig?.merchantName || MERCHANT_NAME;
+  const activeMerchantName = paymentSettings.merchantName?.trim() || MERCHANT_NAME;
   const activeMerchantVpa = paymentSettings.merchantVpa?.trim() || '';
-  const payableAmount = paymentAttempt?.total ?? cartTotal;
-  const qrDisplayUrl = paymentSettings.qrImageUrl || (paymentSettings.autoGenerateQr && activeMerchantVpa ? buildUpiQrUrl(activeMerchantVpa, activeMerchantName, payableAmount) : '');
+  const estimatedDeliveryCharge = calculateDeliveryCharge(cartTotal, storeSettings);
+  const estimatedTotal = cartTotal + estimatedDeliveryCharge;
+  const payableAmount = pendingOrder?.total ?? estimatedTotal;
+  const qrDisplayUrl = paymentSettings.autoGenerateQr && activeMerchantVpa
+    ? buildUpiQrUrl(activeMerchantVpa, activeMerchantName, payableAmount)
+    : paymentSettings.qrImageUrl || '';
 
   const handlePlaceOrder = async () => {
     if (!paymentReady) {
-      Alert.alert(
+      showPlatformAlert(
         'Payment not available',
         'Online payment setup is pending. The store owner needs to configure UPI payment settings in the Admin Panel before orders can be placed.',
       );
       return;
     }
     if (!isCloudMode) {
-      Alert.alert('Sign in required', 'Sign in to create a secure payment attempt. No order will be created until an administrator confirms your payment.');
+      showPlatformAlert('Sign in required', 'Sign in to place a manual UPI order.');
+      return;
+    }
+    if (!authUser || authUser.isGuest) {
+      showPlatformAlert('Sign in required', 'Sign in with a customer account before placing an order.');
       return;
     }
     if (!hasItems) {
-      Alert.alert('Empty cart', 'Your cart is empty. Add items before placing an order.');
+      showPlatformAlert('Empty cart', 'Your cart is empty. Add items before placing an order.');
       return;
     }
     if (!allInStock) {
-      Alert.alert(
+      showPlatformAlert(
         'Item unavailable',
         'One or more items in your cart are out of stock or no longer available. Please remove them and try again.',
       );
@@ -113,21 +98,32 @@ export default function CheckoutScreen() {
     }
     setPlacing(true);
     try {
+      const idempotencyStorageKey = `vibekart:checkout-idempotency:${authUser.uid}`;
+      let idempotencyKey = orderIdempotencyKey.current?.uid === authUser.uid
+        ? orderIdempotencyKey.current.key
+        : await AsyncStorage.getItem(idempotencyStorageKey);
+      if (!idempotencyKey) {
+        idempotencyKey = `checkout-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+        await AsyncStorage.setItem(idempotencyStorageKey, idempotencyKey);
+      }
+      orderIdempotencyKey.current = { uid: authUser.uid, key: idempotencyKey };
       const order = await placeOrder({
         customerName: name.trim(),
         customerPhone: phone.trim(),
         customerAddress: address.trim(),
         paymentMethod: 'UPI',
-        idempotencyKey: attemptIdempotencyKey.current,
+        idempotencyKey,
       });
       if (order) {
-        setPaymentAttempt(order);
+        await AsyncStorage.removeItem(idempotencyStorageKey);
+        orderIdempotencyKey.current = null;
+        setPendingOrder(order);
       } else {
-        Alert.alert('Payment attempt failed', 'Something went wrong. Please try again.');
+        showPlatformAlert('Order failed', 'Something went wrong. Please try again.');
       }
     } catch (err) {
       const message = err instanceof Error ? err.message : 'An unexpected error occurred.';
-      Alert.alert('Payment attempt failed', message);
+      showPlatformAlert('Order failed', message);
     } finally {
       setPlacing(false);
     }
@@ -135,17 +131,17 @@ export default function CheckoutScreen() {
 
   const handleSubmitPaymentDetails = async () => {
     const utr = customerUtr.trim();
-    if (!paymentAttempt || !utr) {
-      Alert.alert('UTR required', 'Enter the transaction reference from your UPI payment receipt.');
+    if (!pendingOrder || !utr) {
+      showPlatformAlert('UTR required', 'Enter the transaction reference from your UPI payment receipt.');
       return;
     }
     setPlacing(true);
     try {
-      await submitPaymentDetails(paymentAttempt.id, utr);
+      await submitManualOrderUtr(pendingOrder.id, utr);
       setDetailsSubmitted(true);
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Could not submit payment details.';
-      Alert.alert('Submission failed', message);
+      showPlatformAlert('Submission failed', message);
     } finally {
       setPlacing(false);
     }
@@ -153,13 +149,20 @@ export default function CheckoutScreen() {
 
   const handleCopyVpa = async () => {
     if (!activeMerchantVpa) return;
-    if (Platform.OS === 'web' && typeof navigator !== 'undefined' && navigator.clipboard) {
-      await navigator.clipboard.writeText(activeMerchantVpa);
-      setCopiedVpa(true);
-      setTimeout(() => setCopiedVpa(false), 2500);
-    } else {
-      Alert.alert('UPI VPA', activeMerchantVpa);
+    if (Platform.OS === 'web') {
+      try {
+        if (typeof navigator === 'undefined' || !navigator.clipboard) {
+          throw new Error('Clipboard access is unavailable in this browser.');
+        }
+        await navigator.clipboard.writeText(activeMerchantVpa);
+        setCopiedVpa(true);
+        setTimeout(() => setCopiedVpa(false), 2500);
+      } catch {
+        showPlatformAlert('Copy unavailable', `Copy this UPI ID manually: ${activeMerchantVpa}`);
+      }
+      return;
     }
+    showPlatformAlert('UPI VPA', activeMerchantVpa);
   };
 
   return (
@@ -240,17 +243,17 @@ export default function CheckoutScreen() {
                 ) : null}
               </View>
 
-              {paymentAttempt ? (
+              {pendingOrder ? (
                 <>
                   <View style={[styles.instructionBox, { backgroundColor: colors.background, borderColor: colors.border }]}>
                     <Text style={[styles.instructionTitle, { color: colors.foreground }]}>
-                      Pay exactly {formatPrice(paymentAttempt.total)} to the merchant
+                      Pay exactly {formatPrice(pendingOrder.total)} to the merchant
                     </Text>
                     <Text style={[styles.instructionText, { color: colors.mutedForeground }]}>
-                      Complete the UPI payment first. Creating this payment attempt did not place an order. Your order will be created only after an administrator verifies the credit.
+                      Complete the UPI payment first. Your order remains pending while payment is reviewed. Submitting a UTR does not confirm payment; an administrator must verify the actual merchant-account credit.
                     </Text>
                   </View>
-                  {qrDisplayUrl ? (
+                  {pendingOrder && qrDisplayUrl ? (
                     <View style={styles.qrContainer}>
                       <Image source={{ uri: qrDisplayUrl }} style={styles.checkoutQrImage} resizeMode="contain" />
                       <Text style={[styles.qrScanText, { color: colors.mutedForeground }]}>
@@ -269,7 +272,7 @@ export default function CheckoutScreen() {
                         Payment details submitted. Your payment is awaiting verification.
                       </Text>
                       <Text style={[styles.instructionText, { color: colors.moss }]}>
-                        Attempt {paymentAttempt.id}. You can check its status in Orders.
+                        Order {pendingOrder.id}. You can check its status in Orders.
                       </Text>
                     </View>
                   ) : (
@@ -287,16 +290,16 @@ export default function CheckoutScreen() {
                         style={[styles.input, { backgroundColor: colors.background, borderColor: colors.border, color: colors.foreground }]}
                       />
                       <Text style={[styles.pendingAdvisoryText, { color: colors.mutedForeground }]}>
-                        Find it in your payment app's transaction details (Google Pay, PhonePe, or your bank app). The reference is not proof of payment. If you cannot find it yet, leave this attempt pending and return later from Orders.
+                        Find it in your payment app's transaction details (Google Pay, PhonePe, or your bank app). The reference is not proof of payment. If you cannot find it yet, leave the order pending and return later from Orders.
                       </Text>
                     </View>
                   )}
                 </>
               ) : (
                 <View style={[styles.instructionBox, { backgroundColor: colors.background, borderColor: colors.border }]}>
-                  <Text style={[styles.instructionTitle, { color: colors.foreground }]}>Create a pending payment attempt first</Text>
+                  <Text style={[styles.instructionTitle, { color: colors.foreground }]}>Create your pending order first</Text>
                   <Text style={[styles.instructionText, { color: colors.mutedForeground }]}>
-                    The server will check current prices and availability, then show the exact amount and QR code. No order is created at this step.
+                    Current product prices and delivery settings are refreshed before the pending order is saved. Payment stays pending until an administrator verifies the actual credit.
                   </Text>
                 </View>
               )}
@@ -304,35 +307,70 @@ export default function CheckoutScreen() {
           )}
           {!isCloudMode ? (
             <Text style={[styles.pendingAdvisoryText, { color: colors.coral, marginTop: 12 }]}>
-              Sign in to create a secure payment attempt. Guest/demo checkout cannot submit payment details.
+              Sign in to place a manual UPI order. Guest/demo checkout cannot submit payment details.
             </Text>
           ) : null}
+          <View style={[styles.deliverySummary, { backgroundColor: colors.card, borderColor: colors.border }]}>
+            <View style={styles.deliverySummaryRow}>
+              <Text style={[styles.deliverySummaryLabel, { color: colors.mutedForeground }]}>Estimated delivery</Text>
+              <Text style={[styles.deliverySummaryValue, { color: colors.foreground }]}>
+                {pendingOrder
+                  ? `${pendingOrder.deliveryMinDays ?? storeSettings.deliveryMinDays}–${pendingOrder.deliveryMaxDays ?? storeSettings.deliveryMaxDays} working days`
+                  : `${storeSettings.deliveryMinDays}–${storeSettings.deliveryMaxDays} working days`}
+              </Text>
+            </View>
+            {pendingOrder ? (
+              <View style={styles.deliverySummaryRow}>
+                <Text style={[styles.deliverySummaryLabel, { color: colors.mutedForeground }]}>Delivery charge</Text>
+                <Text style={[styles.deliverySummaryValue, { color: colors.foreground }]}>
+                  {pendingOrder.deliveryCharge ? formatPrice(pendingOrder.deliveryCharge) : 'No charge'}
+                </Text>
+              </View>
+            ) : (
+              <>
+                <View style={styles.deliverySummaryRow}>
+                  <Text style={[styles.deliverySummaryLabel, { color: colors.mutedForeground }]}>Delivery charge</Text>
+                  <Text style={[styles.deliverySummaryValue, { color: estimatedDeliveryCharge ? colors.foreground : colors.moss }]}>
+                    {estimatedDeliveryCharge ? formatPrice(estimatedDeliveryCharge) : 'No charge'}
+                  </Text>
+                </View>
+                {storeSettings.freeDeliveryEnabled && storeSettings.deliveryPromotionActive && estimatedDeliveryCharge > 0 ? (
+                  <Text style={[styles.deliveryInstructions, { color: colors.mutedForeground }]}>
+                    {storeSettings.deliveryPromotionText} on orders over {formatPrice(storeSettings.freeDeliveryThreshold)}.
+                  </Text>
+                ) : null}
+              </>
+            )}
+            {storeSettings.deliveryInstructions ? (
+              <Text style={[styles.deliveryInstructions, { color: colors.mutedForeground }]}>{storeSettings.deliveryInstructions}</Text>
+            ) : null}
+          </View>
         </View>
       </ScrollView>
       <View style={[styles.bottomBar, { backgroundColor: colors.background, borderTopColor: colors.border, paddingBottom: Math.max(insets.bottom, 14) }]}>
-        <View style={styles.totalRow}><Text style={[styles.totalLabel, { color: colors.mutedForeground }]}>{paymentAttempt ? 'Exact payable amount' : 'Estimated total'}</Text><Text style={[styles.total, { color: colors.foreground }]}>{formatPrice(payableAmount)}</Text></View>
+        <View style={styles.totalRow}><Text style={[styles.totalLabel, { color: colors.mutedForeground }]}>{pendingOrder ? 'Order total' : 'Estimated total'}</Text><Text style={[styles.total, { color: colors.foreground }]}>{formatPrice(payableAmount)}</Text></View>
         <Pressable
-          disabled={paymentAttempt ? !canSubmitDetails : !canPlace}
-          onPress={paymentAttempt ? handleSubmitPaymentDetails : handlePlaceOrder}
-          style={[styles.placeButton, { backgroundColor: (paymentAttempt ? canSubmitDetails : canPlace) ? colors.coral : colors.muted }]}
+          disabled={pendingOrder ? !canSubmitDetails : !canPlace}
+          onPress={pendingOrder ? handleSubmitPaymentDetails : handlePlaceOrder}
+          style={[styles.placeButton, { backgroundColor: (pendingOrder ? canSubmitDetails : canPlace) ? colors.coral : colors.muted }]}
           testID="place-order"
         >
           {placing ? (
             <ActivityIndicator color="#FFFFFF" size="small" />
           ) : (
             <>
-              <Text style={[styles.placeText, { color: canPlace ? '#FFFFFF' : colors.mutedForeground }]}>
-                {paymentAttempt
+              <Text style={[styles.placeText, { color: (pendingOrder ? canSubmitDetails : canPlace) ? '#FFFFFF' : colors.mutedForeground }]}>
+                {pendingOrder
                   ? detailsSubmitted
                     ? 'Awaiting verification'
                     : 'Submit payment details'
                   : !paymentReady
                     ? 'Payment setup pending'
-                    : !isCloudMode
+                    : !isCloudMode || !authUser || authUser.isGuest
                       ? 'Sign in to continue'
-                      : 'Create payment attempt'}
+                      : 'Create pending order'}
               </Text>
-              {!detailsSubmitted ? <Feather name="arrow-right" size={18} color={(paymentAttempt ? canSubmitDetails : canPlace) ? '#FFFFFF' : colors.mutedForeground} /> : null}
+              {!detailsSubmitted ? <Feather name="arrow-right" size={18} color={(pendingOrder ? canSubmitDetails : canPlace) ? '#FFFFFF' : colors.mutedForeground} /> : null}
             </>
           )}
         </Pressable>
@@ -360,6 +398,11 @@ const styles = StyleSheet.create({
   paymentPendingBox: { flexDirection: 'row', alignItems: 'flex-start', gap: 10, padding: 14, borderRadius: 14, borderWidth: 1, marginTop: 12 },
   paymentPendingTitle: { fontSize: 12, fontFamily: 'Inter_700Bold', marginBottom: 4 },
   paymentPendingText: { fontSize: 11, fontFamily: 'Inter_400Regular', lineHeight: 16 },
+  deliverySummary: { marginTop: 16, padding: 13, borderWidth: 1, borderRadius: 14, gap: 8 },
+  deliverySummaryRow: { flexDirection: 'row', justifyContent: 'space-between', gap: 12 },
+  deliverySummaryLabel: { fontSize: 11, fontFamily: 'Inter_400Regular' },
+  deliverySummaryValue: { fontSize: 11, fontFamily: 'Inter_600SemiBold' },
+  deliveryInstructions: { fontSize: 11, fontFamily: 'Inter_400Regular', lineHeight: 16 },
   upiPaymentCard: { padding: 14, borderRadius: 16, borderWidth: 1, marginTop: 12 },
   payeeRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
   payeeLabel: { fontSize: 10, fontFamily: 'Inter_400Regular' },

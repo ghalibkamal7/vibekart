@@ -8,7 +8,8 @@
     "android": "expo start --android",
     "ios": "expo start --ios",
     "web": "expo start --web",
-    "typecheck": "tsc -p tsconfig.json --noEmit"
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test:rules": "node --test scratch/firestore-rules.test.cjs"
   },
   "dependencies": {
     "@expo-google-fonts/inter": "^0.4.0",
@@ -50,6 +51,7 @@
   },
   "devDependencies": {
     "@babel/core": "^7.25.2",
+    "@firebase/rules-unit-testing": "^4.0.1",
     "@types/react": "~19.2.2",
     "@types/react-dom": "~19.2.2",
     "babel-plugin-react-compiler": "^19.0.0-beta-e993439-20250117",

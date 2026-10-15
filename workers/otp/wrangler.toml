@@ -27,3 +27,6 @@ GPAY_ENV = "TEST"
 # - BANK_PSP_API_URL (`wrangler secret put BANK_PSP_API_URL`) - Bank UPI status inquiry endpoint
 # - BANK_PSP_API_KEY (`wrangler secret put BANK_PSP_API_KEY`) - Bank authorization token
 # - BANK_PSP_MERCHANT_ID (`wrangler secret put BANK_PSP_MERCHANT_ID`) - Acquiring bank merchant ID
+# - CLOUDINARY_CLOUD_NAME (`wrangler secret put CLOUDINARY_CLOUD_NAME`)
+# - CLOUDINARY_API_KEY (`wrangler secret put CLOUDINARY_API_KEY`)
+# - CLOUDINARY_API_SECRET (`wrangler secret put CLOUDINARY_API_SECRET`) - Server-only image deletion credential

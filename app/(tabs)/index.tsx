@@ -104,7 +104,7 @@ export default function HomeScreen() {
   // selectedId is a category id/slug or 'all'. Default to 'all'.
   const [selectedId, setSelectedId] = useState<string>(params.category ?? 'all');
   const [query, setQuery] = useState('');
-  const [sortBy, setSortBy] = useState<'default' | 'price_asc' | 'price_desc' | 'rating'>('default');
+  const [sortBy, setSortBy] = useState<'default' | 'price_asc' | 'price_desc'>('default');
   const [showSort, setShowSort] = useState(false);
 
   // Sync if navigated from Explore with a category param
@@ -134,7 +134,6 @@ export default function HomeScreen() {
 
     if (sortBy === 'price_asc') return [...base].sort((a, b) => a.price - b.price);
     if (sortBy === 'price_desc') return [...base].sort((a, b) => b.price - a.price);
-    if (sortBy === 'rating') return [...base].sort((a, b) => b.rating - a.rating);
     return base;
   }, [selectedId, query, sortBy, products, enabledCategories]);
 
@@ -263,8 +262,8 @@ export default function HomeScreen() {
             </View>
             {showSort ? (
               <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ gap: 8, paddingBottom: 10 }}>
-                {(['default', 'price_asc', 'price_desc', 'rating'] as const).map((s) => {
-                  const label = s === 'default' ? 'Default' : s === 'price_asc' ? 'Price ↑' : s === 'price_desc' ? 'Price ↓' : 'Top rated';
+                {(['default', 'price_asc', 'price_desc'] as const).map((s) => {
+                  const label = s === 'default' ? 'Default' : s === 'price_asc' ? 'Price ↑' : 'Price ↓';
                   const active = sortBy === s;
                   return (
                     <Pressable

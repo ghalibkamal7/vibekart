@@ -1,10 +1,11 @@
 import { Feather } from '@expo/vector-icons';
 import React, { useState } from 'react';
-import { ActivityIndicator, Alert, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
+import { ActivityIndicator, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { canCancelOrder, formatPrice, OrderStatus } from '@/data/store';
 import { useColors } from '@/hooks/useColors';
 import { useStore } from '@/context/StoreContext';
+import { confirmPlatformAction, showPlatformAlert } from '@/utils/platformDialogs';
 
 function statusStyle(
   status: OrderStatus,
@@ -29,48 +30,73 @@ function statusStyle(
 export default function OrdersScreen() {
   const colors = useColors();
   const insets = useSafeAreaInsets();
-  const { orders, paymentAttempts, submitPaymentDetails, cancelOrder } = useStore();
+  const { orders, paymentAttempts, submitPaymentDetails, submitManualOrderUtr, cancelOrder } = useStore();
   const [utrInputs, setUtrInputs] = useState<Record<string, string>>({});
   const [submittingAttemptId, setSubmittingAttemptId] = useState<string | null>(null);
+  const [submittingOrderId, setSubmittingOrderId] = useState<string | null>(null);
+  const [cancellingOrderId, setCancellingOrderId] = useState<string | null>(null);
   const paidOrders = orders.filter((order) => order.paymentStatus === 'Paid');
+  const pendingManualOrders = orders.filter(
+    (order) =>
+      order.paymentMethod === 'UPI' &&
+      !['Paid', 'Failed'].includes(order.paymentStatus ?? 'Selected') &&
+      order.status !== 'Cancelled',
+  );
   const unresolvedAttempts = paymentAttempts.filter((attempt) => attempt.status !== 'Paid');
 
   const handleCancel = (orderId: string) => {
-    Alert.alert(
+    confirmPlatformAction(
       'Cancel order?',
       'This action cannot be undone. Are you sure you want to cancel this order?',
-      [
-        { text: 'Keep order', style: 'cancel' },
-        {
-          text: 'Yes, cancel',
-          style: 'destructive',
-          onPress: async () => {
-            try {
-              await cancelOrder(orderId);
-            } catch (err) {
-              const msg = err instanceof Error ? err.message : 'Failed to cancel order.';
-              Alert.alert('Cannot cancel', msg);
-            }
-          },
-        },
-      ],
+      'Yes, cancel',
+      async () => {
+        if (cancellingOrderId) return;
+        setCancellingOrderId(orderId);
+        try {
+          await cancelOrder(orderId);
+          showPlatformAlert('Order cancelled', 'Your order has been cancelled. No refund is implied by this status.');
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : 'Failed to cancel order.';
+          showPlatformAlert('Cannot cancel', msg);
+        } finally {
+          setCancellingOrderId(null);
+        }
+      },
+      true,
     );
   };
 
   const handleSubmitPaymentDetails = async (attemptId: string, existingUtr?: string) => {
     const customerUtr = (utrInputs[attemptId] ?? existingUtr ?? '').trim();
     if (!customerUtr) {
-      Alert.alert('UTR required', 'Enter the UTR/reference number from your payment app. You can leave the attempt pending until you find it.');
+      showPlatformAlert('UTR required', 'Enter the UTR/reference number from your payment app. You can leave the attempt pending until you find it.');
       return;
     }
     setSubmittingAttemptId(attemptId);
     try {
       await submitPaymentDetails(attemptId, customerUtr);
-      Alert.alert('Submitted', 'Payment details submitted. Your payment is awaiting verification.');
+      showPlatformAlert('Submitted', 'Payment details submitted. Your payment is awaiting verification.');
     } catch (err) {
-      Alert.alert('Submission failed', err instanceof Error ? err.message : 'Could not submit payment details.');
+      showPlatformAlert('Submission failed', err instanceof Error ? err.message : 'Could not submit payment details.');
     } finally {
       setSubmittingAttemptId(null);
+    }
+  };
+
+  const handleSubmitOrderUtr = async (orderId: string, existingUtr?: string) => {
+    const customerUtr = (utrInputs[orderId] ?? existingUtr ?? '').trim();
+    if (!customerUtr) {
+      showPlatformAlert('UTR required', 'Enter the UTR/reference number from your UPI payment receipt.');
+      return;
+    }
+    setSubmittingOrderId(orderId);
+    try {
+      await submitManualOrderUtr(orderId, customerUtr);
+      showPlatformAlert('Submitted', 'Your UTR is saved as unverified. Payment remains pending until an administrator checks the merchant account.');
+    } catch (err) {
+      showPlatformAlert('Submission failed', err instanceof Error ? err.message : 'Could not submit the UTR.');
+    } finally {
+      setSubmittingOrderId(null);
     }
   };
 
@@ -79,6 +105,56 @@ export default function OrdersScreen() {
       <Text style={[styles.kicker, { color: colors.coral }]}>YOUR VIBES, ON THE WAY</Text>
       <Text style={[styles.title, { color: colors.foreground }]}>Orders</Text>
       <Text style={[styles.subtitle, { color: colors.mutedForeground }]}>A calm little place to keep an eye on your deliveries.</Text>
+      {pendingManualOrders.length > 0 ? (
+        <View style={styles.attemptSection}>
+          <Text style={[styles.sectionTitle, { color: colors.foreground }]}>Pending UPI Orders ({pendingManualOrders.length})</Text>
+          <Text style={[styles.attemptHelp, { color: colors.mutedForeground }]}>
+            Orders stay unpaid until an administrator verifies the actual merchant-account credit. A submitted UTR is not proof of payment.
+          </Text>
+          {pendingManualOrders.map((order) => {
+            const value = utrInputs[order.id] ?? order.customerUtr ?? '';
+            return (
+              <View key={order.id} style={[styles.orderCard, { backgroundColor: colors.card, borderColor: colors.border }]}>
+                <View style={styles.orderTop}>
+                  <View style={{ flex: 1 }}>
+                    <Text style={[styles.orderId, { color: colors.foreground }]}>{order.id}</Text>
+                    <Text style={[styles.orderDate, { color: colors.mutedForeground }]}>{order.date} · {order.items.length} item{order.items.length === 1 ? '' : 's'}</Text>
+                  </View>
+                  <View style={[styles.status, { backgroundColor: '#FFF8E1' }]}>
+                    <Text style={[styles.statusText, { color: '#D97706' }]}>Awaiting payment review</Text>
+                  </View>
+                </View>
+                <Text style={[styles.orderProduct, { color: colors.foreground }]} numberOfLines={2}>
+                  {order.items.map((item) => `${item.name} × ${item.quantity}`).join(' · ')}
+                </Text>
+                <Text style={[styles.orderTotal, { color: colors.foreground, marginTop: 12 }]}>{formatPrice(order.total)}</Text>
+                <TextInput
+                  value={value}
+                  onChangeText={(text) => setUtrInputs((current) => ({ ...current, [order.id]: text }))}
+                  placeholder="UPI transaction reference / UTR"
+                  placeholderTextColor={colors.mutedForeground}
+                  autoCapitalize="none"
+                  maxLength={100}
+                  style={[styles.utrInput, { backgroundColor: colors.background, borderColor: colors.border, color: colors.foreground }]}
+                />
+                <Pressable
+                  disabled={!value.trim() || submittingOrderId === order.id}
+                  onPress={() => handleSubmitOrderUtr(order.id, order.customerUtr)}
+                  style={[styles.submitButton, { backgroundColor: value.trim() ? colors.moss : colors.muted }]}
+                >
+                  {submittingOrderId === order.id ? (
+                    <ActivityIndicator color="#FFFFFF" size="small" />
+                  ) : (
+                    <Text style={styles.submitButtonText}>
+                      {order.customerUtr ? 'Update unverified UTR' : 'Submit UTR'}
+                    </Text>
+                  )}
+                </Pressable>
+              </View>
+            );
+          })}
+        </View>
+      ) : null}
       {unresolvedAttempts.length > 0 ? (
         <View style={styles.attemptSection}>
           <Text style={[styles.sectionTitle, { color: colors.foreground }]}>Pending Payments ({unresolvedAttempts.length})</Text>
@@ -107,7 +183,19 @@ export default function OrdersScreen() {
                   {attempt.items.map((item) => `${item.name} × ${item.quantity}`).join(' · ')}
                 </Text>
                 <View style={[styles.orderBottom, { borderTopColor: colors.border }]}>
-                  <Text style={[styles.orderTotal, { color: colors.foreground }]}>{formatPrice(attempt.total)}</Text>
+                  <View>
+                    <Text style={[styles.orderTotal, { color: colors.foreground }]}>{formatPrice(attempt.total)}</Text>
+                    {attempt.deliveryCharge !== undefined ? (
+                      <Text style={[styles.refText, { color: colors.mutedForeground }]}>
+                        Delivery: {attempt.deliveryCharge ? formatPrice(attempt.deliveryCharge) : 'No charge'}
+                      </Text>
+                    ) : null}
+                    {attempt.deliveryMinDays !== undefined && attempt.deliveryMaxDays !== undefined ? (
+                      <Text style={[styles.refText, { color: colors.mutedForeground }]}>
+                        Estimated delivery: {attempt.deliveryMinDays}–{attempt.deliveryMaxDays} working days
+                      </Text>
+                    ) : null}
+                  </View>
                   <Text style={[styles.paymentTag, { color: colors.mutedForeground }]}>UPI · {attempt.id.slice(-8)}</Text>
                 </View>
                 {canSubmit ? (
@@ -148,13 +236,13 @@ export default function OrdersScreen() {
           })}
         </View>
       ) : null}
-      {!paidOrders.length && !unresolvedAttempts.length ? (
+      {!paidOrders.length && !pendingManualOrders.length && !unresolvedAttempts.length ? (
         <View style={[styles.empty, { backgroundColor: colors.card, borderColor: colors.border }]}>
           <View style={[styles.emptyIcon, { backgroundColor: colors.mossSoft }]}>
             <Feather name="package" size={25} color={colors.moss} />
           </View>
-          <Text style={[styles.emptyTitle, { color: colors.foreground }]}>No confirmed orders yet</Text>
-          <Text style={[styles.emptyBody, { color: colors.mutedForeground }]}>Payment attempts will stay separate until an administrator verifies the payment.</Text>
+          <Text style={[styles.emptyTitle, { color: colors.foreground }]}>No orders yet</Text>
+          <Text style={[styles.emptyBody, { color: colors.mutedForeground }]}>Manual UPI orders appear here while payment is awaiting administrator verification.</Text>
         </View>
       ) : (
         paidOrders.map((order) => {
@@ -178,9 +266,26 @@ export default function OrdersScreen() {
                   <Text style={[styles.trackingText, { color: colors.moss }]}>Tracking ID: {order.trackingId}</Text>
                 </View>
               ) : null}
+              {order.status === 'Cancelled' && order.cancellationReason ? (
+                <Text style={[styles.attemptHelp, { color: colors.mutedForeground }]}>
+                  Cancellation: {order.cancellationReason}
+                </Text>
+              ) : null}
               <View style={[styles.orderBottom, { borderTopColor: colors.border }]}>
                 <View>
-                  <Text style={[styles.orderTotal, { color: colors.foreground }]}>{formatPrice(order.total)}</Text>
+                  <View>
+                    <Text style={[styles.orderTotal, { color: colors.foreground }]}>{formatPrice(order.total)}</Text>
+                    {order.deliveryCharge !== undefined ? (
+                      <Text style={[styles.refText, { color: colors.mutedForeground }]}>
+                        Delivery: {order.deliveryCharge ? formatPrice(order.deliveryCharge) : 'No charge'}
+                      </Text>
+                    ) : null}
+                    {order.deliveryMinDays !== undefined && order.deliveryMaxDays !== undefined ? (
+                      <Text style={[styles.refText, { color: colors.mutedForeground }]}>
+                        Estimated delivery: {order.deliveryMinDays}–{order.deliveryMaxDays} working days
+                      </Text>
+                    ) : null}
+                  </View>
                   {order.paymentReference ? (
                     <Text style={[styles.refText, { color: colors.mutedForeground }]}>UPI Ref: {order.paymentReference}</Text>
                   ) : null}
@@ -216,11 +321,16 @@ export default function OrdersScreen() {
               </View>
               {cancellable ? (
                 <Pressable
+                  disabled={!!cancellingOrderId}
                   onPress={() => handleCancel(order.id)}
-                  style={[styles.cancelButton, { borderColor: colors.coral }]}
+                  style={[styles.cancelButton, { borderColor: colors.coral, opacity: cancellingOrderId ? 0.5 : 1 }]}
                 >
-                  <Feather name="x-circle" size={14} color={colors.coral} />
-                  <Text style={[styles.cancelText, { color: colors.coral }]}>Cancel order</Text>
+                  {cancellingOrderId === order.id
+                    ? <ActivityIndicator size="small" color={colors.coral} />
+                    : <Feather name="x-circle" size={14} color={colors.coral} />}
+                  <Text style={[styles.cancelText, { color: colors.coral }]}>
+                    {cancellingOrderId === order.id ? 'Cancelling…' : 'Cancel order'}
+                  </Text>
                 </Pressable>
               ) : null}
             </View>

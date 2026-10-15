@@ -1,12 +1,13 @@
 import { Feather } from '@expo/vector-icons';
 import { router } from 'expo-router';
 import React, { useState } from 'react';
-import { Alert, Linking, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
+import { ActivityIndicator, Linking, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { ALLOWED_STATUS_TRANSITIONS, formatPrice, Order, OrderStatus } from '@/data/store';
 import { useColors } from '@/hooks/useColors';
 import { useStore } from '@/context/StoreContext';
 import { fetchSellerOrderPrivateData } from '@/services/firebase/firestore';
+import { confirmPlatformAction, showPlatformAlert } from '@/utils/platformDialogs';
 
 type FilterGroup = 'All' | 'Active' | 'Delivered' | 'Cancelled';
 
@@ -40,9 +41,10 @@ function statusPillColors(
 
 function OrderCard({ orderId }: { orderId: string }) {
   const colors = useColors();
-  const { orders, updateOrderStatus, setTrackingId } = useStore();
+  const { orders, updateOrderStatus, setTrackingId, cancelOrder } = useStore();
   const order = orders.find((o) => o.id === orderId)!;
   const [tracking, setTracking] = useState(order.trackingId ?? '');
+  const [busyAction, setBusyAction] = useState(false);
   const [privateData, setPrivateData] = useState<{
     costTotal?: number;
     profitTotal?: number;
@@ -65,39 +67,57 @@ function OrderCard({ orderId }: { orderId: string }) {
   );
 
   const handleAdvance = async (nextStatus: OrderStatus) => {
+    if (busyAction) return;
+    setBusyAction(true);
     try {
       await updateOrderStatus(order.id, nextStatus);
+      showPlatformAlert('Order updated', `Order is now ${nextStatus}.`);
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Failed to update status.';
-      Alert.alert('Error', msg);
+      showPlatformAlert('Error', msg);
+    } finally {
+      setBusyAction(false);
     }
   };
 
-  const handleSellerCancel = async () => {
+  const handleSellerCancel = () => {
     const allowed = ALLOWED_STATUS_TRANSITIONS[order.status]?.includes('Cancelled');
     if (!allowed) {
-      Alert.alert('Cannot cancel', `Orders in "${order.status}" status cannot be cancelled.`);
+      showPlatformAlert('Cannot cancel', `Orders in "${order.status}" status cannot be cancelled.`);
       return;
     }
-    Alert.alert(
+    confirmPlatformAction(
       'Cancel this order?',
-      `Mark order ${order.id} as Cancelled? This will notify the customer and cannot be undone.`,
-      [
-        { text: 'Keep', style: 'cancel' },
-        {
-          text: 'Cancel order',
-          style: 'destructive',
-          onPress: async () => {
-            try {
-              await updateOrderStatus(order.id, 'Cancelled');
-            } catch (err) {
-              const msg = err instanceof Error ? err.message : 'Failed to cancel order.';
-              Alert.alert('Error', msg);
-            }
-          },
-        },
-      ],
+      `Mark order ${order.id} as Cancelled? This cannot be undone here and does not issue a refund.`,
+      'Cancel order',
+      async () => {
+        if (busyAction) return;
+        setBusyAction(true);
+        try {
+          await cancelOrder(order.id);
+          showPlatformAlert('Order cancelled', 'The order was cancelled. No refund is implied by this status.');
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : 'Failed to cancel order.';
+          showPlatformAlert('Error', msg);
+        } finally {
+          setBusyAction(false);
+        }
+      },
+      true,
     );
+  };
+
+  const handleSaveTracking = async () => {
+    if (busyAction) return;
+    setBusyAction(true);
+    try {
+      await setTrackingId(order.id, tracking.trim());
+      showPlatformAlert('Tracking saved', 'Tracking information was updated.');
+    } catch (error) {
+      showPlatformAlert('Could not save tracking', error instanceof Error ? error.message : 'Retry after checking your connection.');
+    } finally {
+      setBusyAction(false);
+    }
   };
 
   const itemUrls = order.items.map((item) => item.sourceUrl).filter(Boolean) as string[];
@@ -120,6 +140,11 @@ function OrderCard({ orderId }: { orderId: string }) {
         <Text style={[styles.customerName, { color: colors.foreground }]}>{order.customerName}</Text>
         <Text style={[styles.customerDetail, { color: colors.mutedForeground }]}>{order.customerPhone}</Text>
         <Text style={[styles.customerDetail, { color: colors.mutedForeground }]}>{order.customerAddress}</Text>
+        {order.status === 'Cancelled' && order.cancellationReason ? (
+          <Text style={[styles.customerDetail, { color: colors.mutedForeground }]}>
+            Cancellation: {order.cancellationReason}
+          </Text>
+        ) : null}
       </View>
 
       {order.items.map((item, i) => (
@@ -127,6 +152,16 @@ function OrderCard({ orderId }: { orderId: string }) {
           • {item.name} {item.option ? `(${item.option})` : ''} × {item.quantity} — {formatPrice(item.unitPrice * item.quantity)}
         </Text>
       ))}
+      {order.deliveryCharge !== undefined ? (
+        <Text style={[styles.itemLine, { color: colors.mutedForeground }]}>
+          Delivery charge · {order.deliveryCharge ? formatPrice(order.deliveryCharge) : 'No charge'}
+        </Text>
+      ) : null}
+      {order.deliveryMinDays !== undefined && order.deliveryMaxDays !== undefined ? (
+        <Text style={[styles.itemLine, { color: colors.mutedForeground }]}>
+          Estimated delivery · {order.deliveryMinDays}–{order.deliveryMaxDays} working days
+        </Text>
+      ) : null}
 
       <View style={[styles.moneyRow, { borderTopColor: colors.border }]}>
         <View>
@@ -166,8 +201,8 @@ function OrderCard({ orderId }: { orderId: string }) {
           placeholderTextColor={colors.mutedForeground}
           style={[styles.trackingInput, { backgroundColor: colors.background, borderColor: colors.border, color: colors.foreground }]}
         />
-        <Pressable onPress={() => setTrackingId(order.id, tracking.trim())} style={[styles.trackingSave, { backgroundColor: colors.mossSoft }]}>
-          <Feather name="check" size={15} color={colors.moss} />
+        <Pressable disabled={busyAction} onPress={handleSaveTracking} style={[styles.trackingSave, { backgroundColor: colors.mossSoft, opacity: busyAction ? 0.5 : 1 }]}>
+          {busyAction ? <ActivityIndicator size="small" color={colors.moss} /> : <Feather name="check" size={15} color={colors.moss} />}
         </Pressable>
       </View>
 
@@ -175,19 +210,20 @@ function OrderCard({ orderId }: { orderId: string }) {
       {nextStatuses.map((nextStatus) => (
         <Pressable
           key={nextStatus}
+          disabled={busyAction}
           onPress={() => handleAdvance(nextStatus)}
-          style={[styles.advanceButton, { backgroundColor: colors.moss }]}
+          style={[styles.advanceButton, { backgroundColor: colors.moss, opacity: busyAction ? 0.5 : 1 }]}
         >
-          <Text style={styles.advanceText}>Mark as {nextStatus}</Text>
-          <Feather name="arrow-right" size={15} color="#FFFFFF" />
+          {busyAction ? <ActivityIndicator size="small" color="#FFFFFF" /> : <Text style={styles.advanceText}>Mark as {nextStatus}</Text>}
+          {!busyAction ? <Feather name="arrow-right" size={15} color="#FFFFFF" /> : null}
         </Pressable>
       ))}
 
       {/* Seller cancel — only if Cancelled is a valid transition */}
       {ALLOWED_STATUS_TRANSITIONS[order.status]?.includes('Cancelled') ? (
-        <Pressable onPress={handleSellerCancel} style={[styles.cancelButton, { borderColor: colors.coral }]}>
-          <Feather name="x-circle" size={13} color={colors.coral} />
-          <Text style={[styles.cancelText, { color: colors.coral }]}>Cancel order</Text>
+        <Pressable disabled={busyAction} onPress={handleSellerCancel} style={[styles.cancelButton, { borderColor: colors.coral, opacity: busyAction ? 0.5 : 1 }]}>
+          {busyAction ? <ActivityIndicator size="small" color={colors.coral} /> : <Feather name="x-circle" size={13} color={colors.coral} />}
+          <Text style={[styles.cancelText, { color: colors.coral }]}>{busyAction ? 'Updating…' : 'Cancel order'}</Text>
         </Pressable>
       ) : null}
     </View>

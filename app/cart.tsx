@@ -3,7 +3,7 @@ import { router } from 'expo-router';
 import React from 'react';
 import { Image, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
-import { formatPrice, getProductImages } from '@/data/store';
+import { calculateDeliveryCharge, formatPrice, getProductImages } from '@/data/store';
 import { ProductImagePlaceholder } from '@/components/ProductImagePlaceholder';
 import { useColors } from '@/hooks/useColors';
 import { useStore } from '@/context/StoreContext';
@@ -11,7 +11,8 @@ import { useStore } from '@/context/StoreContext';
 export default function CartScreen() {
   const colors = useColors();
   const insets = useSafeAreaInsets();
-  const { cart, cartTotal, removeFromCart } = useStore();
+  const { cart, cartTotal, removeFromCart, storeSettings } = useStore();
+  const deliveryCharge = calculateDeliveryCharge(cartTotal, storeSettings);
   return (
     <View style={[styles.screen, { backgroundColor: colors.background }]}>
       <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={{ paddingTop: insets.top + 14, paddingBottom: 150 }}>
@@ -58,8 +59,18 @@ export default function CartScreen() {
             })}
             <View style={[styles.summary, { borderTopColor: colors.border }]}>
               <View style={styles.summaryRow}><Text style={[styles.summaryLabel, { color: colors.mutedForeground }]}>Subtotal</Text><Text style={[styles.summaryValue, { color: colors.foreground }]}>{formatPrice(cartTotal)}</Text></View>
-              <View style={styles.summaryRow}><Text style={[styles.summaryLabel, { color: colors.mutedForeground }]}>Delivery</Text><Text style={[styles.free, { color: colors.moss }]}>FREE</Text></View>
-              <View style={[styles.summaryRow, { marginTop: 14 }]}><Text style={[styles.totalLabel, { color: colors.foreground }]}>Total</Text><Text style={[styles.totalValue, { color: colors.foreground }]}>{formatPrice(cartTotal)}</Text></View>
+              <View style={styles.summaryRow}>
+                <Text style={[styles.summaryLabel, { color: colors.mutedForeground }]}>Delivery</Text>
+                <Text style={[styles.summaryValue, { color: deliveryCharge ? colors.foreground : colors.moss }]}>
+                  {deliveryCharge ? formatPrice(deliveryCharge) : 'No charge'}
+                </Text>
+              </View>
+              {storeSettings.freeDeliveryEnabled && storeSettings.deliveryPromotionActive && deliveryCharge > 0 ? (
+                <Text style={[styles.deliveryPromo, { color: colors.mutedForeground }]}>
+                  {storeSettings.deliveryPromotionText} on orders over {formatPrice(storeSettings.freeDeliveryThreshold)}.
+                </Text>
+              ) : null}
+              <View style={[styles.summaryRow, { marginTop: 14 }]}><Text style={[styles.totalLabel, { color: colors.foreground }]}>Estimated total</Text><Text style={[styles.totalValue, { color: colors.foreground }]}>{formatPrice(cartTotal + deliveryCharge)}</Text></View>
             </View>
           </>
         )}
@@ -92,6 +103,7 @@ const styles = StyleSheet.create({
   summaryLabel: { fontSize: 12, fontFamily: 'Inter_400Regular' },
   summaryValue: { fontSize: 12, fontFamily: 'Inter_600SemiBold' },
   free: { fontSize: 11, fontFamily: 'Inter_700Bold' },
+  deliveryPromo: { fontSize: 11, fontFamily: 'Inter_400Regular', marginTop: -6 },
   totalLabel: { fontSize: 16, fontFamily: 'Inter_700Bold' },
   totalValue: { fontSize: 19, fontFamily: 'Inter_700Bold' },
   empty: { alignItems: 'center', paddingHorizontal: 26, paddingTop: 100 },

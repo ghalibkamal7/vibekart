@@ -112,8 +112,8 @@ export type Product = {
   image: ImageSourcePropType; // legacy single-image field (local demo mode, older products)
   imageUrls?: string[]; // Cloudinary URLs, ordered — imageUrls[0] is the primary image
   imagePublicIds?: string[]; // parallel array of Cloudinary public IDs, for deletion
-  rating: number;
-  reviews: number;
+  rating?: number;
+  reviews?: number;
   colors: string[];
   sizes?: string[];
   isNew?: boolean;
@@ -180,6 +180,10 @@ export type PaymentAttempt = {
   customerAddress: string;
   items: OrderItem[];
   total: number;
+  itemSubtotal?: number;
+  deliveryCharge?: number;
+  deliveryMinDays?: number;
+  deliveryMaxDays?: number;
   amountPaise?: number;
   currency?: string;
   paymentMethod: 'UPI';
@@ -197,6 +201,12 @@ export type Order = {
   id: string;
   items: OrderItem[];
   total: number; // revenue collected from customer
+  itemSubtotal?: number;
+  deliveryCharge?: number;
+  deliveryMinDays?: number;
+  deliveryMaxDays?: number;
+  cancellationReason?: string;
+  cancelledAt?: string;
   costTotal?: number; // admin-only: total supplier cost (stored in orders/{id}/private/data)
   profitTotal?: number; // admin-only: total - costTotal
   status: OrderStatus;
@@ -253,8 +263,6 @@ export const defaultProducts: Product[] = (
       originalPrice: 1999,
       category: 'Home',
       image: require('../assets/images/lamp.jpg'),
-      rating: 4.8,
-      reviews: 128,
       colors: ['Clay', 'Sand'],
       isNew: true,
       featured: true,
@@ -275,8 +283,6 @@ export const defaultProducts: Product[] = (
       originalPrice: 1699,
       category: 'Style',
       image: require('../assets/images/overshirt.jpg'),
-      rating: 4.7,
-      reviews: 94,
       colors: ['Sage', 'Oat'],
       sizes: ['S', 'M', 'L', 'XL'],
       isNew: false,
@@ -298,8 +304,6 @@ export const defaultProducts: Product[] = (
       originalPrice: 1199,
       category: 'Beauty',
       image: require('../assets/images/lamp.jpg'),
-      rating: 4.9,
-      reviews: 203,
       colors: ['30 ml'],
       isNew: true,
       featured: false,
@@ -319,8 +323,6 @@ export const defaultProducts: Product[] = (
       markupValue: 35,
       category: 'Style',
       image: require('../assets/images/overshirt.jpg'),
-      rating: 4.6,
-      reviews: 67,
       colors: ['Olive', 'Natural'],
       isNew: false,
       featured: false,
@@ -341,8 +343,6 @@ export const defaultProducts: Product[] = (
       originalPrice: 1399,
       category: 'Wellness',
       image: require('../assets/images/lamp.jpg'),
-      rating: 4.8,
-      reviews: 51,
       colors: ['Dune'],
       isNew: false,
       featured: true,
@@ -362,8 +362,6 @@ export const defaultProducts: Product[] = (
       markupValue: 30,
       category: 'Home',
       image: require('../assets/images/overshirt.jpg'),
-      rating: 4.7,
-      reviews: 39,
       colors: ['Moss', 'Cream'],
       isNew: false,
       featured: false,
@@ -434,7 +432,14 @@ export type StoreSettings = {
   announcement: string;
   announcementActive: boolean;
   maintenanceMode: boolean;
-  freeDeliveryThreshold?: number;
+  freeDeliveryEnabled: boolean;
+  freeDeliveryThreshold: number;
+  deliveryCharge: number;
+  deliveryMinDays: number;
+  deliveryMaxDays: number;
+  deliveryInstructions: string;
+  deliveryPromotionActive: boolean;
+  deliveryPromotionText: string;
 };
 
 export const defaultStoreSettings: StoreSettings = {
@@ -444,8 +449,56 @@ export const defaultStoreSettings: StoreSettings = {
   announcement: 'Welcome to VibeKart — Handpicked, honest aesthetic picks for your space.',
   announcementActive: true,
   maintenanceMode: false,
+  freeDeliveryEnabled: false,
   freeDeliveryThreshold: 499,
+  deliveryCharge: 0,
+  deliveryMinDays: 4,
+  deliveryMaxDays: 6,
+  deliveryInstructions: '',
+  deliveryPromotionActive: true,
+  deliveryPromotionText: 'Enjoy free delivery',
 };
+
+export function validateStoreSettings(settings: StoreSettings): string | null {
+  if (!settings.storeName.trim() || settings.storeName.trim().length > 100) {
+    return 'Store name must be between 1 and 100 characters.';
+  }
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(settings.supportEmail.trim())) {
+    return 'Enter a valid support email address.';
+  }
+  if (!Number.isSafeInteger(settings.freeDeliveryThreshold) || settings.freeDeliveryThreshold < 0) {
+    return 'Free-delivery minimum must be a non-negative whole amount.';
+  }
+  if (!Number.isSafeInteger(settings.deliveryCharge) || settings.deliveryCharge < 0) {
+    return 'Delivery charge must be a non-negative whole amount.';
+  }
+  if (
+    !Number.isInteger(settings.deliveryMinDays) ||
+    !Number.isInteger(settings.deliveryMaxDays) ||
+    settings.deliveryMinDays < 1 ||
+    settings.deliveryMaxDays < settings.deliveryMinDays ||
+    settings.deliveryMaxDays > 60
+  ) {
+    return 'Estimated delivery days must be between 1 and 60, with the maximum not below the minimum.';
+  }
+  if (settings.deliveryInstructions.length > 500) {
+    return 'Delivery instructions must be 500 characters or fewer.';
+  }
+  if (!settings.deliveryPromotionText.trim() || settings.deliveryPromotionText.trim().length > 100) {
+    return 'Delivery promotion text must be between 1 and 100 characters.';
+  }
+  return null;
+}
+
+export function calculateDeliveryCharge(subtotal: number, settings: StoreSettings): number {
+  if (
+    settings.freeDeliveryEnabled &&
+    subtotal >= settings.freeDeliveryThreshold
+  ) {
+    return 0;
+  }
+  return settings.deliveryCharge;
+}
 
 export type AdminAuditLog = {
   id: string;

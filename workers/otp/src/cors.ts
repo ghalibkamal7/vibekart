@@ -1,13 +1,13 @@
 /**
  * Same allowlist approach the old Cloud Function used: dev localhost (any
  * port — Expo picks a new one whenever the default is busy) plus this
- * project's real hosting domains. Add a production domain here once you
- * have one (e.g. your Expo web build's URL).
+ * project's hosting domains.
  */
 const ALLOWED_ORIGIN_PATTERNS = [
   /^http:\/\/localhost:\d+$/,
   /^http:\/\/127\.0\.0\.1:\d+$/,
   /^https:\/\/vibekart-f27b5\.(web\.app|firebaseapp\.com)$/,
+  /^https:\/\/vibekaart\.vercel\.app$/,
 ];
 
 export function isAllowedOrigin(origin: string | null): boolean {

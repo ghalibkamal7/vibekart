@@ -4,7 +4,6 @@ import { router } from 'expo-router';
 import React, { useMemo, useState } from 'react';
 import {
   ActivityIndicator,
-  Alert,
   Image,
   Linking,
   Platform,
@@ -35,9 +34,11 @@ import {
   PaymentSettings,
   Product,
   StoreSettings,
+  validateStoreSettings,
   validateCategoryName,
 } from '@/data/store';
 import { useColors } from '@/hooks/useColors';
+import { confirmPlatformAction, showPlatformAlert } from '@/utils/platformDialogs';
 import { useStore } from '@/context/StoreContext';
 import { fetchSellerOrderPrivateData } from '@/services/firebase/firestore';
 import { uploadImageToCloudinary } from '@/services/cloudinary/upload';
@@ -55,6 +56,7 @@ export default function AdminScreen() {
     analytics,
     isAdmin,
     isCloudMode,
+    deletingProductId,
     authUser,
     toggleStock,
     toggleEnabled,
@@ -67,8 +69,8 @@ export default function AdminScreen() {
     updateOrderStatus,
     verifyPaymentAttempt,
     reviewPaymentAttempt,
-    verifyLegacyOrderPayment,
-    rejectLegacyOrderPayment,
+    verifyManualUpiOrderPayment,
+    rejectManualUpiOrderPayment,
     setTrackingId,
     cancelOrder,
     usersList,
@@ -93,13 +95,15 @@ export default function AdminScreen() {
   const [newCatIcon, setNewCatIcon] = useState('tag');
   const [addingCat, setAddingCat] = useState(false);
   const [catError, setCatError] = useState('');
+  const [catSuccess, setCatSuccess] = useState('');
+  const [updatingCategoryId, setUpdatingCategoryId] = useState<string | null>(null);
 
   // Orders Tab State
   const [orderSearch, setOrderSearch] = useState('');
   const [orderStatusFilter, setOrderStatusFilter] = useState<'All' | OrderStatus>('All');
   const [expandedOrderId, setExpandedOrderId] = useState<string | null>(null);
   const [orderTrackingInputs, setOrderTrackingInputs] = useState<Record<string, string>>({});
-  const [legacyUtrInputs, setLegacyUtrInputs] = useState<Record<string, string>>({});
+  const [manualUtrInputs, setManualUtrInputs] = useState<Record<string, string>>({});
   const [reviewingPaymentId, setReviewingPaymentId] = useState<string | null>(null);
   const [paymentView, setPaymentView] = useState<'Open' | 'History'>('Open');
   const [orderPrivates, setOrderPrivates] = useState<
@@ -114,6 +118,7 @@ export default function AdminScreen() {
   const [settingsForm, setSettingsForm] = useState<StoreSettings>(storeSettings);
   const [savingSettings, setSavingSettings] = useState(false);
   const [settingsSuccess, setSettingsSuccess] = useState(false);
+  const [cancellingOrderId, setCancellingOrderId] = useState<string | null>(null);
 
   // Payment Settings Tab State
   const [paymentForm, setPaymentForm] = useState<PaymentSettings>(paymentSettings);
@@ -201,13 +206,13 @@ export default function AdminScreen() {
   const paymentAttemptHistory = paymentAttempts.filter((attempt) =>
     ['Rejected', 'Cancelled', 'Expired'].includes(attempt.status),
   );
-  const legacyPendingOrders = orders.filter((order) =>
+  const pendingManualUpiOrders = orders.filter((order) =>
     order.paymentMethod === 'UPI' &&
     order.paymentStatus !== 'Paid' &&
     order.paymentStatus !== 'Failed' &&
     order.status !== 'Cancelled',
   );
-  const legacyClosedOrders = orders.filter((order) =>
+  const closedManualUpiOrders = orders.filter((order) =>
     order.paymentMethod === 'UPI' &&
     order.paymentStatus !== 'Paid' &&
     (order.paymentStatus === 'Failed' || order.status === 'Cancelled'),
@@ -228,7 +233,9 @@ export default function AdminScreen() {
 
   // Handle Add Category
   const handleAddCategory = async () => {
+    if (addingCat) return;
     setCatError('');
+    setCatSuccess('');
     const validation = validateCategoryName(newCatName, categories);
     if (!validation.valid) {
       setCatError(validation.error || 'Invalid category name.');
@@ -236,9 +243,15 @@ export default function AdminScreen() {
     }
     setAddingCat(true);
     try {
-      await addCategory({ name: newCatName.trim(), icon: newCatIcon });
-      await logAdminActivity('Add Category', `Created category "${newCatName.trim()}"`);
+      const categoryName = newCatName.trim();
+      await addCategory({ name: categoryName, icon: newCatIcon });
       setNewCatName('');
+      setCatSuccess(`"${categoryName}" was added.`);
+      try {
+        await logAdminActivity('Add Category', `Created category "${categoryName}"`);
+      } catch (err) {
+        setCatError(`Category was added, but its audit entry could not be saved: ${err instanceof Error ? err.message : 'Unknown error.'}`);
+      }
     } catch (err: any) {
       setCatError(err?.message || 'Failed to add category.');
     } finally {
@@ -250,53 +263,59 @@ export default function AdminScreen() {
   const handleDeleteCategory = (cat: CategoryItem) => {
     const assigned = getAssignedProductCount(cat, products);
     if (assigned > 0) {
-      Alert.alert(
+      showPlatformAlert(
         'Cannot Delete Category',
         `"${cat.name}" has ${assigned} product${assigned > 1 ? 's' : ''} assigned to it. Please reassign or delete those products before removing this category.`,
       );
       return;
     }
-    Alert.alert(
+    confirmPlatformAction(
       'Delete Category?',
       `Are you sure you want to permanently delete "${cat.name}"?`,
-      [
-        { text: 'Cancel', style: 'cancel' },
-        {
-          text: 'Delete',
-          style: 'destructive',
-          onPress: async () => {
-            try {
-              await deleteCategory(cat.id);
-              await logAdminActivity('Delete Category', `Deleted category "${cat.name}" (${cat.id})`, cat.id);
-            } catch (err: any) {
-              Alert.alert('Error', err?.message || 'Failed to delete category.');
-            }
-          },
-        },
-      ],
+      'Delete',
+      async () => {
+        try {
+          await deleteCategory(cat.id);
+          await logAdminActivity('Delete Category', `Deleted category "${cat.name}" (${cat.id})`, cat.id);
+        } catch (err: any) {
+          showPlatformAlert('Error', err?.message || 'Failed to delete category.');
+        }
+      },
+      true,
     );
+  };
+
+  const handleToggleCategoryEnabled = async (category: CategoryItem) => {
+    if (updatingCategoryId) return;
+    setUpdatingCategoryId(category.id);
+    setCatError('');
+    setCatSuccess('');
+    try {
+      await toggleCategoryEnabled(category.id);
+    } catch (err: any) {
+      setCatError(err?.message || 'Failed to update category status.');
+    } finally {
+      setUpdatingCategoryId(null);
+    }
   };
 
   // Handle Delete Product
   const handleDeleteProduct = (p: Product) => {
-    Alert.alert(
+    confirmPlatformAction(
       'Delete Product?',
       `Are you sure you want to permanently remove "${p.name}" from the store?`,
-      [
-        { text: 'Cancel', style: 'cancel' },
-        {
-          text: 'Delete',
-          style: 'destructive',
-          onPress: async () => {
-            try {
-              await deleteProduct(p.id);
-              await logAdminActivity('Delete Product', `Deleted product "${p.name}" (${p.id})`, p.id);
-            } catch (err: any) {
-              Alert.alert('Error', err?.message || 'Failed to delete product.');
-            }
-          },
-        },
-      ],
+      'Delete',
+      async () => {
+        if (deletingProductId) return;
+        try {
+          await deleteProduct(p.id);
+          await logAdminActivity('Delete Product', `Deleted product "${p.name}" (${p.id})`, p.id);
+          showPlatformAlert('Product deleted', `"${p.name}" and its stored images were removed.`);
+        } catch (err: any) {
+          showPlatformAlert('Error', err?.message || 'Failed to delete product.');
+        }
+      },
+      true,
     );
   };
 
@@ -306,39 +325,44 @@ export default function AdminScreen() {
       await updateOrderStatus(order.id, nextStatus);
       await logAdminActivity('Update Order Status', `Updated order ${order.id} to ${nextStatus}`, order.id);
     } catch (err: any) {
-      Alert.alert('Transition Error', err?.message || 'Cannot advance order status.');
+      showPlatformAlert('Transition Error', err?.message || 'Cannot advance order status.');
     }
   };
 
   // Handle Order Cancel
   const handleAdminCancelOrder = (order: Order) => {
     if (!canCancelOrder(order.status) && order.status !== 'Processing') {
-      Alert.alert('Cannot Cancel', `Orders in "${order.status}" status cannot be cancelled.`);
+      showPlatformAlert('Cannot Cancel', `Orders in "${order.status}" status cannot be cancelled.`);
       return;
     }
-    Alert.alert(
+    confirmPlatformAction(
       'Cancel Order?',
       `Are you sure you want to cancel order ${order.id}?`,
-      [
-        { text: 'Keep Order', style: 'cancel' },
-        {
-          text: 'Yes, Cancel',
-          style: 'destructive',
-          onPress: async () => {
-            try {
-              await cancelOrder(order.id);
-              await logAdminActivity('Cancel Order', `Cancelled order ${order.id}`, order.id);
-            } catch (err: any) {
-              Alert.alert('Error', err?.message || 'Failed to cancel order.');
-            }
-          },
-        },
-      ],
+      'Yes, Cancel',
+      async () => {
+        if (cancellingOrderId) return;
+        setCancellingOrderId(order.id);
+        try {
+          await cancelOrder(order.id);
+          await logAdminActivity('Cancel Order', `Cancelled order ${order.id}`, order.id);
+          showPlatformAlert('Order cancelled', `Order ${order.id} was cancelled. This action does not issue a refund.`);
+        } catch (err: any) {
+          showPlatformAlert('Error', err?.message || 'Failed to cancel order.');
+        } finally {
+          setCancellingOrderId(null);
+        }
+      },
+      true,
     );
   };
 
   // Handle Save Settings
   const handleSaveSettings = async () => {
+    const validationError = validateStoreSettings(settingsForm);
+    if (validationError) {
+      showPlatformAlert('Check delivery settings', validationError);
+      return;
+    }
     setSavingSettings(true);
     setSettingsSuccess(false);
     try {
@@ -346,7 +370,7 @@ export default function AdminScreen() {
       setSettingsSuccess(true);
       setTimeout(() => setSettingsSuccess(false), 3000);
     } catch (err: any) {
-      Alert.alert('Error', err?.message || 'Failed to save settings.');
+      showPlatformAlert('Error', err?.message || 'Failed to save settings.');
     } finally {
       setSavingSettings(false);
     }
@@ -361,7 +385,7 @@ export default function AdminScreen() {
       setPaymentSuccess(true);
       setTimeout(() => setPaymentSuccess(false), 3000);
     } catch (err: any) {
-      Alert.alert('Error', err?.message || 'Failed to save payment settings.');
+      showPlatformAlert('Error', err?.message || 'Failed to save payment settings.');
     } finally {
       setSavingPayment(false);
     }
@@ -386,34 +410,37 @@ export default function AdminScreen() {
         }));
       }
     } catch (err: any) {
-      Alert.alert('Upload Failed', err?.message || 'Could not upload QR image to Cloudinary.');
+      showPlatformAlert('Upload Failed', err?.message || 'Could not upload QR image to Cloudinary.');
     } finally {
       setUploadingQr(false);
     }
   };
 
   const handleVerifyPaymentAttempt = (attempt: PaymentAttempt) => {
-    Alert.alert(
+    confirmPlatformAction(
       'Verify & confirm payment?',
       `Before continuing, check the merchant's Google Pay/PhonePe/bank transaction history. Confirm that the actual credit matches ${formatPrice(attempt.total)} and the submitted reference "${attempt.customerUtr ?? 'Not available'}". Customer-submitted details are unverified and are not proof of payment.`,
-      [
-        { text: 'Cancel', style: 'cancel' },
-        {
-          text: 'I verified the actual credit',
-          onPress: async () => {
-            setReviewingPaymentId(attempt.id);
-            try {
-              await verifyPaymentAttempt(attempt.id);
-              await logAdminActivity('Confirm Payment', `Verified payment attempt ${attempt.id}`, attempt.id);
-              Alert.alert('Payment confirmed', 'A paid order is now available in Orders and fulfillment.');
-            } catch (err) {
-              Alert.alert('Verification failed', err instanceof Error ? err.message : 'Could not confirm payment.');
-            } finally {
-              setReviewingPaymentId(null);
-            }
-          },
-        },
-      ],
+      'I verified the actual credit',
+      async () => {
+        setReviewingPaymentId(attempt.id);
+        try {
+          await verifyPaymentAttempt(attempt.id);
+          const auditError = await savePaymentReviewAudit(
+            'Confirm Payment',
+            `Verified payment attempt ${attempt.id}`,
+            attempt.id,
+          );
+          showPaymentReviewOutcome(
+            'Payment confirmed',
+            'A paid order is now available in Orders and fulfillment.',
+            auditError,
+          );
+        } catch (err) {
+          showPlatformAlert('Verification failed', err instanceof Error ? err.message : 'Could not confirm payment.');
+        } finally {
+          setReviewingPaymentId(null);
+        }
+      },
     );
   };
 
@@ -424,81 +451,93 @@ export default function AdminScreen() {
       : action === 'expire'
         ? 'Attempt manually expired after merchant-account reconciliation.'
         : 'Attempt cancelled by admin after merchant-account reconciliation.';
-    Alert.alert(
+    confirmPlatformAction(
       `${label}?`,
       'Review the merchant transaction history first. Do not cancel or expire an attempt if a payment may have succeeded and still needs reconciliation.',
-      [
-        { text: 'Keep pending', style: 'cancel' },
-        {
-          text: label,
-          style: 'destructive',
-          onPress: async () => {
-            setReviewingPaymentId(attempt.id);
-            try {
-              await reviewPaymentAttempt(action, attempt.id, reason);
-              await logAdminActivity(label, `${label} ${attempt.id}: ${reason}`, attempt.id);
-            } catch (err) {
-              Alert.alert('Update failed', err instanceof Error ? err.message : 'Could not update payment attempt.');
-            } finally {
-              setReviewingPaymentId(null);
-            }
-          },
-        },
-      ],
+      label,
+      async () => {
+        setReviewingPaymentId(attempt.id);
+        try {
+          await reviewPaymentAttempt(action, attempt.id, reason);
+          const auditError = await savePaymentReviewAudit(label, `${label} ${attempt.id}: ${reason}`, attempt.id);
+          showPaymentReviewOutcome(`${label} complete`, `Payment attempt ${attempt.id} was updated.`, auditError);
+        } catch (err) {
+          showPlatformAlert('Update failed', err instanceof Error ? err.message : 'Could not update payment attempt.');
+        } finally {
+          setReviewingPaymentId(null);
+        }
+      },
+      true,
     );
   };
 
-  const handleVerifyLegacyOrder = (order: Order) => {
-    const customerUtr = (legacyUtrInputs[order.id] ?? order.customerUtr ?? '').trim();
+  const savePaymentReviewAudit = async (action: string, details: string, targetId: string) => {
+    try {
+      await logAdminActivity(action, details, targetId);
+      return null;
+    } catch (error) {
+      return error instanceof Error ? error.message : 'Unknown audit logging error.';
+    }
+  };
+
+  const showPaymentReviewOutcome = (title: string, message: string, auditError: string | null) => {
+    showPlatformAlert(
+      auditError ? `${title} — audit log failed` : title,
+      auditError ? `${message}\n\nThe payment action succeeded, but its audit entry could not be saved: ${auditError}` : message,
+    );
+  };
+
+  const handleVerifyManualUpiOrder = (order: Order) => {
+    const customerUtr = (manualUtrInputs[order.id] ?? order.customerUtr ?? '').trim();
     if (!customerUtr) {
-      Alert.alert('Reference required', 'Enter the transaction reference that you independently matched to the actual merchant-account credit.');
+      showPlatformAlert('Reference required', 'Enter the transaction reference that you independently matched to the actual merchant-account credit.');
       return;
     }
-    Alert.alert(
-      'Verify legacy payment?',
-      `Check the actual merchant-account credit for ${formatPrice(order.total)} and reference "${customerUtr}". This is an existing pre-workflow order. Customer-submitted data alone is not proof.`,
-      [
-        { text: 'Cancel', style: 'cancel' },
-        {
-          text: 'I verified the actual credit',
-          onPress: async () => {
-            setReviewingPaymentId(order.id);
-            try {
-              await verifyLegacyOrderPayment(order.id, customerUtr);
-              await logAdminActivity('Confirm Legacy Payment', `Verified legacy order ${order.id}`, order.id);
-            } catch (err) {
-              Alert.alert('Verification failed', err instanceof Error ? err.message : 'Could not confirm payment.');
-            } finally {
-              setReviewingPaymentId(null);
-            }
-          },
-        },
-      ],
+    confirmPlatformAction(
+      'Verify manual UPI payment?',
+      `Check the actual merchant-account credit for ${formatPrice(order.total)} and reference "${customerUtr}". Customer-submitted data alone is not proof.`,
+      'I verified the actual credit',
+      async () => {
+        setReviewingPaymentId(order.id);
+        try {
+          await verifyManualUpiOrderPayment(order.id, customerUtr, true);
+          const auditError = await savePaymentReviewAudit(
+            'Confirm Manual UPI Payment',
+            `Verified manual UPI order ${order.id}`,
+            order.id,
+          );
+          showPaymentReviewOutcome('Payment confirmed', 'The order is now paid and eligible for fulfillment.', auditError);
+        } catch (err) {
+          showPlatformAlert('Verification failed', err instanceof Error ? err.message : 'Could not confirm payment.');
+        } finally {
+          setReviewingPaymentId(null);
+        }
+      },
     );
   };
 
-  const handleRejectLegacyOrder = (order: Order) => {
-    Alert.alert(
-      'Reject legacy payment?',
-      'Use this only after checking the merchant account and determining that the payment was not received. This will cancel the unpaid legacy order.',
-      [
-        { text: 'Keep for review', style: 'cancel' },
-        {
-          text: 'Reject and cancel',
-          style: 'destructive',
-          onPress: async () => {
-            setReviewingPaymentId(order.id);
-            try {
-              await rejectLegacyOrderPayment(order.id, 'Payment was not found in merchant account after review.');
-              await logAdminActivity('Reject Legacy Payment', `Rejected legacy order ${order.id}`, order.id);
-            } catch (err) {
-              Alert.alert('Update failed', err instanceof Error ? err.message : 'Could not reject payment.');
-            } finally {
-              setReviewingPaymentId(null);
-            }
-          },
-        },
-      ],
+  const handleRejectManualUpiOrder = (order: Order) => {
+    confirmPlatformAction(
+      'Reject manual UPI payment?',
+      'Use this only after checking the merchant account and determining that the payment was not received. This will cancel the unpaid order.',
+      'Reject and cancel',
+      async () => {
+        setReviewingPaymentId(order.id);
+        try {
+          await rejectManualUpiOrderPayment(order.id, 'Payment was not found in merchant account after review.');
+          const auditError = await savePaymentReviewAudit(
+            'Reject Manual UPI Payment',
+            `Rejected manual UPI order ${order.id}`,
+            order.id,
+          );
+          showPaymentReviewOutcome('Payment rejected', 'The unpaid order was cancelled.', auditError);
+        } catch (err) {
+          showPlatformAlert('Update failed', err instanceof Error ? err.message : 'Could not reject payment.');
+        } finally {
+          setReviewingPaymentId(null);
+        }
+      },
+      true,
     );
   };
 
@@ -541,7 +580,7 @@ export default function AdminScreen() {
               { key: 'products', label: `Products (${products.length})`, icon: 'package' },
               { key: 'categories', label: `Categories (${categories.length})`, icon: 'tag' },
               { key: 'orders', label: `Orders (${orders.filter((order) => order.paymentStatus === 'Paid').length})`, icon: 'shopping-bag' },
-              { key: 'pendingPayments', label: `Pending Payments (${pendingAttempts.length + legacyPendingOrders.length})`, icon: 'credit-card' },
+              { key: 'pendingPayments', label: `Pending Payments (${pendingAttempts.length + pendingManualUpiOrders.length})`, icon: 'credit-card' },
               { key: 'users', label: `Users & Sellers (${usersList.length})`, icon: 'users' },
               { key: 'payments', label: 'Payment Settings', icon: 'credit-card' },
               { key: 'settings', label: 'Store Settings', icon: 'settings' },
@@ -826,10 +865,13 @@ export default function AdminScreen() {
                           <Feather name="edit-2" size={15} color={colors.moss} />
                         </Pressable>
                         <Pressable
+                          disabled={!!deletingProductId}
                           onPress={() => handleDeleteProduct(p)}
-                          style={[styles.iconAction, { backgroundColor: '#FEE2E2' }]}
+                          style={[styles.iconAction, { backgroundColor: '#FEE2E2', opacity: deletingProductId ? 0.5 : 1 }]}
                         >
-                          <Feather name="trash-2" size={15} color={colors.destructive} />
+                          {deletingProductId === p.id
+                            ? <ActivityIndicator size="small" color={colors.destructive} />
+                            : <Feather name="trash-2" size={15} color={colors.destructive} />}
                         </Pressable>
                       </View>
                     </View>
@@ -930,6 +972,7 @@ export default function AdminScreen() {
                 </Pressable>
               </View>
               {catError ? <Text style={styles.errorText}>{catError}</Text> : null}
+              {catSuccess ? <Text style={[styles.errorText, { color: colors.moss }]}>{catSuccess}</Text> : null}
             </View>
 
             {/* Categories List */}
@@ -956,7 +999,8 @@ export default function AdminScreen() {
                   <View style={styles.catActions}>
                     <Switch
                       value={cat.enabled}
-                      onValueChange={() => toggleCategoryEnabled(cat.id)}
+                      disabled={!!updatingCategoryId}
+                      onValueChange={() => handleToggleCategoryEnabled(cat)}
                       trackColor={{ false: colors.border, true: colors.mossSoft }}
                       thumbColor={cat.enabled ? colors.moss : colors.mutedForeground}
                     />
@@ -1061,6 +1105,21 @@ export default function AdminScreen() {
                         {/* Address */}
                         <Text style={[styles.detailHeading, { color: colors.foreground }]}>Delivery Address:</Text>
                         <Text style={[styles.detailText, { color: colors.mutedForeground }]}>{order.customerAddress}</Text>
+                        {order.status === 'Cancelled' && order.cancellationReason ? (
+                          <Text style={[styles.detailText, { color: colors.mutedForeground, marginTop: 4 }]}>
+                            Cancellation: {order.cancellationReason}
+                          </Text>
+                        ) : null}
+                        {order.deliveryCharge !== undefined ? (
+                          <Text style={[styles.detailText, { color: colors.mutedForeground, marginTop: 4 }]}>
+                            Delivery charge: {order.deliveryCharge ? formatPrice(order.deliveryCharge) : 'No charge'}
+                          </Text>
+                        ) : null}
+                        {order.deliveryMinDays !== undefined && order.deliveryMaxDays !== undefined ? (
+                          <Text style={[styles.detailText, { color: colors.mutedForeground, marginTop: 4 }]}>
+                            Estimated delivery: {order.deliveryMinDays}–{order.deliveryMaxDays} working days
+                          </Text>
+                        ) : null}
 
                         {/* Items */}
                         <Text style={[styles.detailHeading, { color: colors.foreground, marginTop: 10 }]}>Purchased Items:</Text>
@@ -1168,7 +1227,7 @@ export default function AdminScreen() {
                             onPress={async () => {
                               await setTrackingId(order.id, trackingValue.trim());
                               await logAdminActivity('Set Tracking ID', `Order ${order.id} tracking: ${trackingValue.trim()}`, order.id);
-                              Alert.alert('Saved', 'Tracking ID updated successfully.');
+                              showPlatformAlert('Saved', 'Tracking ID updated successfully.');
                             }}
                             style={[styles.trackingSaveBtn, { backgroundColor: colors.moss }]}
                           >
@@ -1190,11 +1249,16 @@ export default function AdminScreen() {
                           ))}
                           {ALLOWED_STATUS_TRANSITIONS[order.status]?.includes('Cancelled') && (
                             <Pressable
+                              disabled={cancellingOrderId === order.id}
                               onPress={() => handleAdminCancelOrder(order)}
-                              style={[styles.cancelBtn, { borderColor: colors.destructive }]}
+                              style={[styles.cancelBtn, { borderColor: colors.destructive, opacity: cancellingOrderId ? 0.5 : 1 }]}
                             >
-                              <Feather name="x-circle" size={14} color={colors.destructive} />
-                              <Text style={[styles.cancelBtnText, { color: colors.destructive }]}>Cancel Order</Text>
+                              {cancellingOrderId === order.id
+                                ? <ActivityIndicator size="small" color={colors.destructive} />
+                                : <Feather name="x-circle" size={14} color={colors.destructive} />}
+                              <Text style={[styles.cancelBtnText, { color: colors.destructive }]}>
+                                {cancellingOrderId === order.id ? 'Cancelling…' : 'Cancel Order'}
+                              </Text>
                             </Pressable>
                           )}
                         </View>
@@ -1333,16 +1397,19 @@ export default function AdminScreen() {
                           )}
                           {u.role !== 'admin' && (
                             <Pressable
-                              onPress={() =>
-                                Alert.alert(
-                                  'Grant Admin Privilege?',
-                                  `Promote ${u.name} (${u.email}) to Administrator? They will have full control over the store.`,
-                                  [
-                                    { text: 'Cancel', style: 'cancel' },
-                                    { text: 'Promote', style: 'destructive', onPress: () => changeUserRole(u.uid, 'admin') },
-                                  ],
-                                )
-                              }
+                              onPress={() => confirmPlatformAction(
+                                'Grant Admin Privilege?',
+                                `Promote ${u.name} (${u.email}) to Administrator? They will have full control over the store.`,
+                                'Promote',
+                                async () => {
+                                  try {
+                                    await changeUserRole(u.uid, 'admin');
+                                  } catch (err) {
+                                    showPlatformAlert('Promotion failed', err instanceof Error ? err.message : 'Could not change this user role.');
+                                  }
+                                },
+                                true,
+                              )}
                               style={[styles.smallActionBtn, { borderColor: '#4A6CF7' }]}
                             >
                               <Text style={[styles.smallActionBtnText, { color: '#4A6CF7' }]}>Make Admin</Text>
@@ -1391,19 +1458,19 @@ export default function AdminScreen() {
           <View>
             <Text style={[styles.sectionHeading, { color: colors.foreground }]}>Pending Payments</Text>
             <Text style={[styles.sectionSub, { color: colors.mutedForeground }]}>
-              Payment attempts are not orders. Verify the actual merchant-account credit before creating an order; submitted UTRs are customer-provided and unverified.
+              Manual UPI orders are created with payment pending. Verify actual merchant-account credit before marking paid; submitted UTRs are customer-provided and unverified. Separate payment attempts are an optional Worker-backed flow.
             </Text>
             {!isCloudMode ? (
               <Text style={[styles.sectionSub, { color: colors.coral }]}>
-                Payment review requires the configured authenticated Worker. Demo mode cannot confirm or reject real payments.
+                Sign in as an administrator to review payments. Demo mode cannot confirm or reject real payments.
               </Text>
             ) : null}
             <View style={styles.paymentViewRow}>
               {(['Open', 'History'] as const).map((view) => {
                 const active = paymentView === view;
                 const count = view === 'Open'
-                  ? pendingAttempts.length + legacyPendingOrders.length
-                  : paymentAttemptHistory.length + legacyClosedOrders.length;
+                  ? pendingAttempts.length + pendingManualUpiOrders.length
+                  : paymentAttemptHistory.length + closedManualUpiOrders.length;
                 return (
                   <Pressable
                     key={view}
@@ -1507,22 +1574,22 @@ export default function AdminScreen() {
                   );
                 })}
 
-                {legacyPendingOrders.map((order) => (
+                {pendingManualUpiOrders.map((order) => (
                   <View key={`legacy-${order.id}`} style={[styles.paymentReviewCard, { backgroundColor: colors.card, borderColor: colors.border }]}>
-                    <Text style={[styles.orderId, { color: colors.foreground }]}>Legacy unpaid order · {order.id}</Text>
+                    <Text style={[styles.orderId, { color: colors.foreground }]}>Unpaid UPI order · {order.id}</Text>
                     <Text style={[styles.detailText, { color: colors.mutedForeground, marginTop: 4 }]}>
                       {order.customerName} · {order.customerPhone} · {order.items.map((item) => `${item.name} × ${item.quantity}`).join(' · ')}
                     </Text>
                     <Text style={[styles.detailText, { color: colors.foreground, marginTop: 4 }]}>
-                      {formatPrice(order.total)} · {order.paymentMethod} · existing order (not a new payment attempt)
+                      {formatPrice(order.total)} · {order.paymentMethod} · order is not paid
                     </Text>
                     <Text style={[styles.detailText, { color: '#D97706', marginTop: 4 }]}>
-                      Previously submitted UTR (unverified): {order.customerUtr || 'Not available'}
+                      Customer-submitted UTR (unverified): {order.customerUtr || 'Not submitted'}
                     </Text>
                     <TextInput
-                      value={legacyUtrInputs[order.id] ?? order.customerUtr ?? ''}
-                      onChangeText={(value) => setLegacyUtrInputs((current) => ({ ...current, [order.id]: value }))}
-                      placeholder="Verified transaction reference"
+                      value={manualUtrInputs[order.id] ?? order.customerUtr ?? ''}
+                      onChangeText={(value) => setManualUtrInputs((current) => ({ ...current, [order.id]: value }))}
+                      placeholder="Match this reference to actual account credit"
                       placeholderTextColor={colors.mutedForeground}
                       autoCapitalize="none"
                       maxLength={100}
@@ -1530,8 +1597,8 @@ export default function AdminScreen() {
                     />
                     <View style={styles.paymentActionRow}>
                       <Pressable
-                        disabled={!isCloudMode || reviewingPaymentId === order.id || !(legacyUtrInputs[order.id] ?? order.customerUtr ?? '').trim()}
-                        onPress={() => handleVerifyLegacyOrder(order)}
+                        disabled={!isCloudMode || reviewingPaymentId === order.id || !(manualUtrInputs[order.id] ?? order.customerUtr ?? '').trim()}
+                        onPress={() => handleVerifyManualUpiOrder(order)}
                         style={[styles.smallVerifyBtn, { backgroundColor: colors.moss }]}
                       >
                         <Feather name="check-circle" size={12} color="#FFFFFF" />
@@ -1539,7 +1606,7 @@ export default function AdminScreen() {
                       </Pressable>
                       <Pressable
                         disabled={!isCloudMode || reviewingPaymentId === order.id}
-                        onPress={() => handleRejectLegacyOrder(order)}
+                        onPress={() => handleRejectManualUpiOrder(order)}
                         style={[styles.smallVerifyBtn, { backgroundColor: '#EF4444' }]}
                       >
                         <Feather name="x-circle" size={12} color="#FFFFFF" />
@@ -1548,7 +1615,7 @@ export default function AdminScreen() {
                     </View>
                   </View>
                 ))}
-                {!pendingAttempts.length && !legacyPendingOrders.length ? (
+                {!pendingAttempts.length && !pendingManualUpiOrders.length ? (
                   <View style={[styles.emptyBox, { borderColor: colors.border }]}>
                     <Feather name="check-circle" size={30} color={colors.moss} />
                     <Text style={[styles.emptyText, { color: colors.foreground }]}>No payments need review.</Text>
@@ -1568,7 +1635,7 @@ export default function AdminScreen() {
                     </Text>
                   </View>
                 ))}
-                {legacyClosedOrders.map((order) => (
+                {closedManualUpiOrders.map((order) => (
                   <View key={`legacy-history-${order.id}`} style={[styles.paymentReviewCard, { backgroundColor: colors.card, borderColor: colors.border }]}>
                     <Text style={[styles.orderId, { color: colors.foreground }]}>Legacy {order.paymentStatus || 'Unpaid'} · {order.id}</Text>
                     <Text style={[styles.detailText, { color: colors.mutedForeground, marginTop: 4 }]}>
@@ -1576,7 +1643,7 @@ export default function AdminScreen() {
                     </Text>
                   </View>
                 ))}
-                {!paymentAttemptHistory.length && !legacyClosedOrders.length ? (
+                {!paymentAttemptHistory.length && !closedManualUpiOrders.length ? (
                   <View style={[styles.emptyBox, { borderColor: colors.border }]}>
                     <Feather name="archive" size={30} color={colors.mutedForeground} />
                     <Text style={[styles.emptyText, { color: colors.foreground }]}>No rejected, cancelled, or expired attempts.</Text>
@@ -1812,6 +1879,84 @@ export default function AdminScreen() {
                 style={[styles.settingInput, { backgroundColor: colors.background, borderColor: colors.border, color: colors.foreground }]}
               />
 
+              <Text style={[styles.settingLabel, { color: colors.foreground, marginTop: 22 }]}>Delivery policy</Text>
+              <Text style={[styles.settingHint, { color: colors.mutedForeground }]}>
+                Delivery totals are estimates until checkout. The Worker recalculates the charge from these settings when it creates a payment attempt.
+              </Text>
+              <View style={[styles.switchRow, { borderTopColor: colors.border, marginTop: 10 }]}>
+                <View>
+                  <Text style={[styles.switchTitle, { color: colors.foreground }]}>Enable threshold-based free delivery</Text>
+                  <Text style={[styles.switchSub, { color: colors.mutedForeground }]}>Orders at or above the minimum pay no delivery charge</Text>
+                </View>
+                <Switch
+                  value={settingsForm.freeDeliveryEnabled}
+                  onValueChange={(value) => setSettingsForm((prev) => ({ ...prev, freeDeliveryEnabled: value }))}
+                  trackColor={{ false: colors.border, true: colors.mossSoft }}
+                  thumbColor={settingsForm.freeDeliveryEnabled ? colors.moss : colors.mutedForeground}
+                />
+              </View>
+              <Text style={[styles.settingLabel, { color: colors.foreground, marginTop: 12 }]}>Free-delivery minimum (₹)</Text>
+              <TextInput
+                value={String(settingsForm.freeDeliveryThreshold)}
+                onChangeText={(value) => setSettingsForm((prev) => ({ ...prev, freeDeliveryThreshold: value === '' ? 0 : Number(value) }))}
+                keyboardType="number-pad"
+                style={[styles.settingInput, { backgroundColor: colors.background, borderColor: colors.border, color: colors.foreground }]}
+              />
+              <Text style={[styles.settingLabel, { color: colors.foreground, marginTop: 12 }]}>Delivery charge below minimum (₹)</Text>
+              <TextInput
+                value={String(settingsForm.deliveryCharge)}
+                onChangeText={(value) => setSettingsForm((prev) => ({ ...prev, deliveryCharge: value === '' ? 0 : Number(value) }))}
+                keyboardType="number-pad"
+                style={[styles.settingInput, { backgroundColor: colors.background, borderColor: colors.border, color: colors.foreground }]}
+              />
+              <View style={styles.deliveryDaysRow}>
+                <View style={{ flex: 1 }}>
+                  <Text style={[styles.settingLabel, { color: colors.foreground, marginTop: 12 }]}>Estimated minimum days</Text>
+                  <TextInput
+                    value={String(settingsForm.deliveryMinDays)}
+                    onChangeText={(value) => setSettingsForm((prev) => ({ ...prev, deliveryMinDays: value === '' ? 0 : Number(value) }))}
+                    keyboardType="number-pad"
+                    style={[styles.settingInput, { backgroundColor: colors.background, borderColor: colors.border, color: colors.foreground }]}
+                  />
+                </View>
+                <View style={{ flex: 1 }}>
+                  <Text style={[styles.settingLabel, { color: colors.foreground, marginTop: 12 }]}>Estimated maximum days</Text>
+                  <TextInput
+                    value={String(settingsForm.deliveryMaxDays)}
+                    onChangeText={(value) => setSettingsForm((prev) => ({ ...prev, deliveryMaxDays: value === '' ? 0 : Number(value) }))}
+                    keyboardType="number-pad"
+                    style={[styles.settingInput, { backgroundColor: colors.background, borderColor: colors.border, color: colors.foreground }]}
+                  />
+                </View>
+              </View>
+              <View style={[styles.switchRow, { borderTopColor: colors.border, marginTop: 12 }]}>
+                <View>
+                  <Text style={[styles.switchTitle, { color: colors.foreground }]}>Show delivery promotion</Text>
+                  <Text style={[styles.switchSub, { color: colors.mutedForeground }]}>The eligibility threshold is always shown with the claim</Text>
+                </View>
+                <Switch
+                  value={settingsForm.deliveryPromotionActive}
+                  onValueChange={(value) => setSettingsForm((prev) => ({ ...prev, deliveryPromotionActive: value }))}
+                  trackColor={{ false: colors.border, true: colors.mossSoft }}
+                  thumbColor={settingsForm.deliveryPromotionActive ? colors.moss : colors.mutedForeground}
+                />
+              </View>
+              <Text style={[styles.settingLabel, { color: colors.foreground, marginTop: 12 }]}>Promotion text</Text>
+              <TextInput
+                value={settingsForm.deliveryPromotionText}
+                onChangeText={(value) => setSettingsForm((prev) => ({ ...prev, deliveryPromotionText: value }))}
+                maxLength={100}
+                style={[styles.settingInput, { backgroundColor: colors.background, borderColor: colors.border, color: colors.foreground }]}
+              />
+              <Text style={[styles.settingLabel, { color: colors.foreground, marginTop: 12 }]}>Customer delivery instructions</Text>
+              <TextInput
+                value={settingsForm.deliveryInstructions}
+                onChangeText={(value) => setSettingsForm((prev) => ({ ...prev, deliveryInstructions: value }))}
+                multiline
+                maxLength={500}
+                style={[styles.settingInput, { minHeight: 64, textAlignVertical: 'top', backgroundColor: colors.background, borderColor: colors.border, color: colors.foreground }]}
+              />
+
               {/* Announcement Banner */}
               <Text style={[styles.settingLabel, { color: colors.foreground, marginTop: 14 }]}>
                 Announcement Banner Text
@@ -2025,7 +2170,9 @@ const styles = StyleSheet.create({
 
   settingsCard: { padding: 16, borderRadius: 16, borderWidth: 1 },
   settingLabel: { fontSize: 12, fontFamily: 'Inter_700Bold' },
+  settingHint: { fontSize: 11, lineHeight: 16, fontFamily: 'Inter_400Regular', marginTop: 6 },
   settingInput: { borderRadius: 12, borderWidth: 1, paddingHorizontal: 12, paddingVertical: 10, fontSize: 13, fontFamily: 'Inter_400Regular', marginTop: 6 },
+  deliveryDaysRow: { flexDirection: 'row', gap: 10 },
   switchRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', paddingTop: 14, borderTopWidth: 1 },
   switchTitle: { fontSize: 12, fontFamily: 'Inter_700Bold' },
   switchSub: { fontSize: 10, fontFamily: 'Inter_400Regular', marginTop: 2 },

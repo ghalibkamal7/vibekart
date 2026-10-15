@@ -2,7 +2,6 @@ import { Feather } from '@expo/vector-icons';
 import { router } from 'expo-router';
 import React, { useState } from 'react';
 import {
-  Alert,
   Pressable,
   ScrollView,
   StyleSheet,
@@ -13,6 +12,7 @@ import {
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { getAssignedProductCount, validateCategoryName } from '@/data/store';
+import { confirmPlatformAction, showPlatformAlert } from '@/utils/platformDialogs';
 import { useColors } from '@/hooks/useColors';
 import { useStore } from '@/context/StoreContext';
 
@@ -23,7 +23,10 @@ export default function SellerCategoriesScreen() {
 
   const [newName, setNewName] = useState('');
   const [newNameError, setNewNameError] = useState<string | null>(null);
+  const [newNameSuccess, setNewNameSuccess] = useState<string | null>(null);
   const [addingBusy, setAddingBusy] = useState(false);
+  const [categoryError, setCategoryError] = useState<string | null>(null);
+  const [togglingId, setTogglingId] = useState<string | null>(null);
 
   // Editing state: tracks which category is being renamed inline
   const [editingId, setEditingId] = useState<string | null>(null);
@@ -31,16 +34,20 @@ export default function SellerCategoriesScreen() {
   const [editingError, setEditingError] = useState<string | null>(null);
 
   const handleAdd = async () => {
+    if (addingBusy) return;
     const result = validateCategoryName(newName, categories);
     if (!result.valid) {
       setNewNameError(result.error ?? 'Invalid name');
       return;
     }
     setNewNameError(null);
+    setNewNameSuccess(null);
     setAddingBusy(true);
     try {
-      await addCategory({ name: newName.trim() });
+      const categoryName = newName.trim();
+      await addCategory({ name: categoryName });
       setNewName('');
+      setNewNameSuccess(`"${categoryName}" was added.`);
     } catch (err) {
       setNewNameError(err instanceof Error ? err.message : 'Failed to add category');
     } finally {
@@ -81,38 +88,37 @@ export default function SellerCategoriesScreen() {
       products,
     );
     if (count > 0) {
-      Alert.alert(
+      showPlatformAlert(
         'Cannot delete category',
         `"${name}" has ${count} product${count > 1 ? 's' : ''} assigned to it. Reassign or delete those products first, then try again.`,
-        [{ text: 'OK' }],
       );
       return;
     }
-    Alert.alert(
+    confirmPlatformAction(
       'Delete category?',
       `"${name}" will be permanently removed. Products are not affected.`,
-      [
-        { text: 'Cancel', style: 'cancel' },
-        {
-          text: 'Delete',
-          style: 'destructive',
-          onPress: async () => {
-            try {
-              await deleteCategory(id);
-            } catch (err) {
-              Alert.alert('Delete failed', err instanceof Error ? err.message : 'Something went wrong');
-            }
-          },
-        },
-      ],
+      'Delete',
+      async () => {
+        try {
+          await deleteCategory(id);
+        } catch (err) {
+          showPlatformAlert('Delete failed', err instanceof Error ? err.message : 'Something went wrong');
+        }
+      },
+      true,
     );
   };
 
   const handleToggleEnabled = async (id: string) => {
+    if (togglingId) return;
+    setTogglingId(id);
+    setCategoryError(null);
     try {
       await toggleCategoryEnabled(id);
     } catch (err) {
-      Alert.alert('Error', err instanceof Error ? err.message : 'Failed to toggle');
+      setCategoryError(err instanceof Error ? err.message : 'Failed to toggle category status.');
+    } finally {
+      setTogglingId(null);
     }
   };
 
@@ -147,6 +153,7 @@ export default function SellerCategoriesScreen() {
             onChangeText={(text) => {
               setNewName(text);
               if (newNameError) setNewNameError(null);
+              if (newNameSuccess) setNewNameSuccess(null);
             }}
             placeholder="e.g. Electronics"
             placeholderTextColor={colors.mutedForeground}
@@ -174,12 +181,18 @@ export default function SellerCategoriesScreen() {
         {newNameError ? (
           <Text style={[styles.errorText, { color: colors.destructive }]}>{newNameError}</Text>
         ) : null}
+        {newNameSuccess ? (
+          <Text style={[styles.errorText, { color: colors.moss }]}>{newNameSuccess}</Text>
+        ) : null}
       </View>
 
       {/* Category list */}
       <Text style={[styles.sectionTitle, { color: colors.foreground }]}>
         Catalogue ({categories.length})
       </Text>
+      {categoryError ? (
+        <Text style={[styles.errorText, { color: colors.destructive }]}>{categoryError}</Text>
+      ) : null}
 
       {categories.map((cat) => {
         const count = getAssignedProductCount(cat, products);
@@ -255,6 +268,7 @@ export default function SellerCategoriesScreen() {
                 </Text>
                 <Switch
                   value={cat.enabled}
+                  disabled={!!togglingId}
                   onValueChange={() => handleToggleEnabled(cat.id)}
                   trackColor={{ false: colors.border, true: colors.mossSoft }}
                   thumbColor={cat.enabled ? colors.moss : colors.mutedForeground}

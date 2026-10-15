@@ -4,7 +4,6 @@ import { router, useLocalSearchParams } from 'expo-router';
 import React, { useMemo, useState } from 'react';
 import {
   ActivityIndicator,
-  Alert,
   Image,
   Pressable,
   ScrollView,
@@ -20,6 +19,7 @@ import { computeDisplayPrice, formatPrice, MarkupType, NewProductInput } from '@
 import { isCloudinaryConfigured, uploadImageToCloudinary } from '@/services/cloudinary/upload';
 import { useColors } from '@/hooks/useColors';
 import { useStore } from '@/context/StoreContext';
+import { showPlatformAlert } from '@/utils/platformDialogs';
 
 type ImageSlot = {
   id: string;
@@ -103,7 +103,7 @@ export default function SellerAddProductScreen() {
 
   const handlePasteUrl = () => {
     if (!sourceUrl.trim()) return;
-    Alert.alert(
+    showPlatformAlert(
       'Manual import',
       "Live-scraping a Meesho page isn't safe or reliable from this app (ToS risk, and it breaks whenever the site changes). The link is saved for reference — fill in the title, images, and cost yourself below.",
     );
@@ -112,12 +112,12 @@ export default function SellerAddProductScreen() {
   const pickImages = async () => {
     const remaining = MAX_PRODUCT_IMAGES - images.length;
     if (remaining <= 0) {
-      Alert.alert('Limit reached', `A product can have a maximum of ${MAX_PRODUCT_IMAGES} photos.`);
+      showPlatformAlert('Limit reached', `A product can have a maximum of ${MAX_PRODUCT_IMAGES} photos.`);
       return;
     }
     const permission = await ImagePicker.requestMediaLibraryPermissionsAsync();
     if (!permission.granted) {
-      Alert.alert('Permission needed', 'Allow photo library access to select images.');
+      showPlatformAlert('Permission needed', 'Allow photo library access to select images.');
       return;
     }
     const result = await ImagePicker.launchImageLibraryAsync({
@@ -166,7 +166,7 @@ export default function SellerAddProductScreen() {
       setImages((current) =>
         current.map((s) => (s.id === slot.id ? { ...s, status: 'error', error: msg } : s)),
       );
-      Alert.alert('Upload failed', msg);
+      showPlatformAlert('Upload failed', msg);
     }
   };
 
@@ -195,7 +195,7 @@ export default function SellerAddProductScreen() {
 
   const handleManualUploadAll = async () => {
     if (!isCloudinaryConfigured) {
-      Alert.alert(
+      showPlatformAlert(
         'Cloudinary not configured',
         'Please configure EXPO_PUBLIC_CLOUDINARY_CLOUD_NAME and EXPO_PUBLIC_CLOUDINARY_UPLOAD_PRESET to upload images.',
       );
@@ -203,7 +203,7 @@ export default function SellerAddProductScreen() {
     }
     const pendingSlots = images.filter((s) => s.status !== 'done');
     if (!pendingSlots.length) {
-      Alert.alert('All uploaded', 'All selected images are already uploaded to Cloudinary.');
+      showPlatformAlert('All uploaded', 'All selected images are already uploaded to Cloudinary.');
       return;
     }
     setIsUploadingAll(true);
@@ -212,9 +212,9 @@ export default function SellerAddProductScreen() {
       const result = await uploadPendingImages(folderId);
       const failed = result.filter((s) => s.status === 'error').length;
       if (failed === 0) {
-        Alert.alert('Upload successful', 'All photos were uploaded to Cloudinary successfully.');
+        showPlatformAlert('Upload successful', 'All photos were uploaded to Cloudinary successfully.');
       } else {
-        Alert.alert('Partial upload', `${failed} photo(s) failed to upload. Check connection and tap Retry on the failed photos.`);
+        showPlatformAlert('Partial upload', `${failed} photo(s) failed to upload. Check connection and tap Retry on the failed photos.`);
       }
     } finally {
       setIsUploadingAll(false);
@@ -223,7 +223,7 @@ export default function SellerAddProductScreen() {
 
   const handleSave = async () => {
     if (isCloudMode && !isCloudinaryConfigured && images.some((s) => s.status !== 'done')) {
-      Alert.alert(
+      showPlatformAlert(
         'Cloudinary is not configured',
         "New photos can't be uploaded because Cloudinary environment variables are missing (EXPO_PUBLIC_CLOUDINARY_CLOUD_NAME and EXPO_PUBLIC_CLOUDINARY_UPLOAD_PRESET). Remove new photos to save without them, or configure Cloudinary first.",
       );
@@ -272,7 +272,7 @@ export default function SellerAddProductScreen() {
       }
 
       if (failedCount > 0) {
-        Alert.alert(
+        showPlatformAlert(
           'Product saved',
           `${failedCount} photo${failedCount > 1 ? 's' : ''} failed to upload. The rest of the product was saved — you can retry those photos from here.`,
         );
@@ -282,7 +282,7 @@ export default function SellerAddProductScreen() {
 
       router.back();
     } catch (error) {
-      Alert.alert('Save failed', error instanceof Error ? error.message : 'Something went wrong. Please try again.');
+      showPlatformAlert('Save failed', error instanceof Error ? error.message : 'Something went wrong. Please try again.');
     } finally {
       setSaving(false);
     }

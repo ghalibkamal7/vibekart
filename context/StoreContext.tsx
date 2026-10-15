@@ -1,6 +1,6 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as Haptics from 'expo-haptics';
-import React, { createContext, useContext, useEffect, useMemo, useState } from 'react';
+import React, { createContext, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import {
   AdminAuditLog,
   canCancelOrder,
@@ -20,6 +20,7 @@ import {
   PaymentSettings,
   Product,
   StoreSettings,
+  validateStoreSettings,
   validateCategoryName,
 } from '@/data/store';
 
@@ -39,9 +40,8 @@ import { isFirebaseConfigured } from '@/services/firebase/config';
 import {
   createAuditLogRemote,
   createCategoryRemote,
-  createPaymentAttemptViaWorker,
+  createManualUpiOrderRemote,
   createProduct,
-  confirmLegacyOrderPaymentViaWorker,
   confirmPaymentAttemptViaWorker,
   editProduct,
   fetchAuditLogsRemote,
@@ -50,7 +50,9 @@ import {
   fetchStoreSettingsRemote,
   fetchUsersRemote,
   removeCategoryRemote,
-  removeProduct,
+  deleteProductViaWorker,
+  confirmManualUpiOrderPaymentRemote,
+  rejectManualUpiOrderPaymentRemote,
   setOrderTrackingId as setOrderTrackingIdRemote,
   setProductEnabled as setProductEnabledRemote,
   setProductFeatured as setProductFeaturedRemote,
@@ -65,8 +67,8 @@ import {
   updateStoreSettingsRemote,
   updateUserRoleRemote,
   updateUserStatusRemote,
-  rejectLegacyOrderPaymentViaWorker,
   reviewPaymentAttemptViaWorker,
+  submitManualUpiOrderUtrRemote,
   submitPaymentDetailsViaWorker,
 } from '@/services/firebase/firestore';
 
@@ -92,6 +94,7 @@ type StoreContextValue = {
   addProduct: (input: NewProductInput) => Promise<string>;
   updateProduct: (id: string, patch: Partial<NewProductInput>) => Promise<void>;
   deleteProduct: (id: string) => Promise<void>;
+  deletingProductId: string | null;
   toggleStock: (id: string) => Promise<void>;
   toggleEnabled: (id: string) => Promise<void>;
   toggleFeatured: (id: string) => Promise<void>;
@@ -120,12 +123,13 @@ type StoreContextValue = {
     customerAddress: string;
     paymentMethod: 'UPI' | 'COD';
     idempotencyKey: string;
-  }) => Promise<PaymentAttempt>;
+  }) => Promise<Order>;
+  submitManualOrderUtr: (orderId: string, customerUtr: string) => Promise<void>;
   submitPaymentDetails: (attemptId: string, customerUtr: string) => Promise<void>;
   verifyPaymentAttempt: (attemptId: string) => Promise<void>;
   reviewPaymentAttempt: (action: 'reject' | 'cancel' | 'expire', attemptId: string, reason: string) => Promise<void>;
-  verifyLegacyOrderPayment: (orderId: string, customerUtr: string) => Promise<void>;
-  rejectLegacyOrderPayment: (orderId: string, reason: string) => Promise<void>;
+  verifyManualUpiOrderPayment: (orderId: string, customerUtr: string, actualCreditConfirmed: boolean) => Promise<void>;
+  rejectManualUpiOrderPayment: (orderId: string, reason: string) => Promise<void>;
 
   // order fulfilment (seller side)
   updateOrderStatus: (orderId: string, status: OrderStatus) => Promise<void>;
@@ -189,9 +193,12 @@ const STORAGE_KEYS = {
 
 export function StoreProvider({ children }: { children: React.ReactNode }) {
   const [products, setProducts] = useState<Product[]>(defaultProducts);
+  const [deletingProductId, setDeletingProductId] = useState<string | null>(null);
+  const deletingProductLock = useRef(false);
   const [categories, setCategories] = useState<CategoryItem[]>(defaultCategoryItems);
   const [cart, setCart] = useState<CartLine[]>([]);
   const [orders, setOrders] = useState<Order[]>([]);
+  const cancellingOrderIds = useRef(new Set<string>());
   const [paymentAttempts, setPaymentAttempts] = useState<PaymentAttempt[]>([]);
   const [favorites, setFavorites] = useState<string[]>([]);
   const [authUser, setAuthUser] = useState<AuthUser>(null);
@@ -486,8 +493,6 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       image: input.image ?? defaultProducts[0].image,
       imageUrls: input.imageUrls,
       imagePublicIds: input.imagePublicIds,
-      rating: 4.5,
-      reviews: 0,
       colors: input.colors.length ? input.colors : ['Standard'],
       sizes: input.sizes,
       inStock: input.inStock ?? true,
@@ -524,14 +529,23 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   };
 
   const deleteProduct: StoreContextValue['deleteProduct'] = async (id) => {
-    if (isCloudMode) {
-      const target = products.find((product) => product.id === id);
-      await removeProduct(id);
-      await refreshSellerProducts();
-     
-      return;
+    if (deletingProductLock.current) throw new Error('A product deletion is already in progress.');
+    if (!products.some((product) => product.id === id)) throw new Error('Product is no longer in the catalogue.');
+    deletingProductLock.current = true;
+    setDeletingProductId(id);
+    try {
+      if (isCloudMode) {
+        if (!authUser || authUser.isGuest || !['seller', 'admin'].includes(authUser.role)) {
+          throw new Error('Only an authorized seller or administrator can delete products.');
+        }
+        await deleteProductViaWorker(id);
+      }
+      setProducts((current) => current.filter((product) => product.id !== id));
+      setCart((current) => current.filter((line) => line.product.id !== id));
+    } finally {
+      deletingProductLock.current = false;
+      setDeletingProductId(null);
     }
-    setProducts((current) => current.filter((product) => product.id !== id));
   };
 
   const toggleStock: StoreContextValue['toggleStock'] = async (id) => {
@@ -709,10 +723,10 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       throw new Error('Only online payment (UPI) is accepted. Cash on delivery is no longer available.');
     }
     if (!isCloudMode || !authUser || authUser.isGuest) {
-      throw new Error('Sign in with an account to create a secure UPI payment attempt.');
+      throw new Error('Sign in with an account to place a manual UPI order.');
     }
     if (!cart.length) throw new Error('Your cart is empty.');
-    const attempt = await createPaymentAttemptViaWorker({
+    const order = await createManualUpiOrderRemote({
       items: cart.map((line) => ({
         productId: line.product.id,
         quantity: line.quantity,
@@ -721,12 +735,18 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       customerName: details.customerName,
       customerPhone: details.customerPhone,
       customerAddress: details.customerAddress,
-      paymentMethod: 'UPI',
-      idempotencyKey: details.idempotencyKey,
+       idempotencyKey: details.idempotencyKey,
     });
     setCart([]);
     await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-    return attempt;
+    return order;
+  };
+
+  const submitManualOrderUtr: StoreContextValue['submitManualOrderUtr'] = async (orderId, customerUtr) => {
+    if (!isCloudMode || !authUser || authUser.isGuest) {
+       throw new Error('Sign in with an account to submit your payment reference.');
+    }
+    await submitManualUpiOrderUtrRemote(orderId, customerUtr);
   };
 
   const submitPaymentDetails: StoreContextValue['submitPaymentDetails'] = async (attemptId, customerUtr) => {
@@ -748,14 +768,14 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     await reviewPaymentAttemptViaWorker(action, attemptId, reason);
   };
 
-  const verifyLegacyOrderPayment: StoreContextValue['verifyLegacyOrderPayment'] = async (orderId, customerUtr) => {
+  const verifyManualUpiOrderPayment: StoreContextValue['verifyManualUpiOrderPayment'] = async (orderId, customerUtr, actualCreditConfirmed) => {
     if (!isAdmin || !isCloudMode) throw new Error('Only an authenticated administrator can verify payments.');
-    await confirmLegacyOrderPaymentViaWorker(orderId, customerUtr.trim());
+    await confirmManualUpiOrderPaymentRemote(orderId, customerUtr.trim(), actualCreditConfirmed);
   };
 
-  const rejectLegacyOrderPayment: StoreContextValue['rejectLegacyOrderPayment'] = async (orderId, reason) => {
+  const rejectManualUpiOrderPayment: StoreContextValue['rejectManualUpiOrderPayment'] = async (orderId, reason) => {
     if (!isAdmin || !isCloudMode) throw new Error('Only an authenticated administrator can review payments.');
-    await rejectLegacyOrderPaymentViaWorker(orderId, reason);
+    await rejectManualUpiOrderPaymentRemote(orderId, reason);
   };
 
   const updateOrderStatus: StoreContextValue['updateOrderStatus'] = async (orderId, status) => {
@@ -765,6 +785,9 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     if (!canTransitionOrderStatus(order.status, status)) {
       throw new Error(`Cannot transition from "${order.status}" to "${status}".`);
     }
+    if (status === 'Cancelled') {
+      throw new Error('Use the cancellation action so the cancellation is recorded safely.');
+    }
     if (isCloudMode) {
       await updateOrderStatusRemote(orderId, status);
       return;
@@ -773,17 +796,35 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   };
 
   const cancelOrder: StoreContextValue['cancelOrder'] = async (orderId) => {
+    if (cancellingOrderIds.current.has(orderId)) throw new Error('This order cancellation is already in progress.');
     const order = orders.find((o) => o.id === orderId);
     if (!order) throw new Error('Order not found.');
     if (order.paymentStatus !== 'Paid') throw new Error('Only paid orders can be cancelled as orders.');
-    if (!canCancelOrder(order.status)) {
+    const canSellerCancel = ['seller', 'admin'].includes(authUser && !authUser.isGuest ? authUser.role : '');
+    const allowed = canSellerCancel
+      ? canTransitionOrderStatus(order.status, 'Cancelled')
+      : canCancelOrder(order.status);
+    if (!allowed) {
       throw new Error(`Orders in "${order.status}" status cannot be cancelled. Contact support if needed.`);
     }
-    if (isCloudMode) {
-      await updateOrderStatusRemote(orderId, 'Cancelled');
-      return;
+    cancellingOrderIds.current.add(orderId);
+    try {
+      if (isCloudMode) {
+        await updateOrderStatusRemote(
+          orderId,
+          'Cancelled',
+          canSellerCancel ? 'Cancelled by store staff' : 'Customer requested cancellation',
+        );
+        return;
+      }
+      setOrders((current) => current.map((o) => (
+        o.id === orderId
+          ? { ...o, status: 'Cancelled', cancellationReason: canSellerCancel ? 'Cancelled by store staff' : 'Customer requested cancellation', cancelledAt: new Date().toISOString() }
+          : o
+      )));
+    } finally {
+      cancellingOrderIds.current.delete(orderId);
     }
-    setOrders((current) => current.map((o) => (o.id === orderId ? { ...o, status: 'Cancelled' } : o)));
   };
 
   const setTrackingId: StoreContextValue['setTrackingId'] = async (orderId, trackingId) => {
@@ -806,7 +847,13 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       }
     } else {
       AsyncStorage.getItem(STORAGE_KEYS.settings).then((saved) => {
-        if (saved) setStoreSettings(JSON.parse(saved));
+        if (saved) {
+          try {
+            setStoreSettings({ ...defaultStoreSettings, ...JSON.parse(saved) });
+          } catch {
+            setStoreSettings(defaultStoreSettings);
+          }
+        }
       });
       AsyncStorage.getItem(STORAGE_KEYS.paymentSettings).then((saved) => {
         if (saved) setPaymentSettings(JSON.parse(saved));
@@ -872,12 +919,14 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
 
   const updateStoreSettings: StoreContextValue['updateStoreSettings'] = async (patch) => {
     const merged = { ...storeSettings, ...patch };
-    setStoreSettings(merged);
+    const validationError = validateStoreSettings(merged);
+    if (validationError) throw new Error(validationError);
     if (isCloudMode) {
       await updateStoreSettingsRemote(patch);
     } else {
       await AsyncStorage.setItem(STORAGE_KEYS.settings, JSON.stringify(merged));
     }
+    setStoreSettings(merged);
     await logAdminActivity('Update Store Settings', `Updated settings: ${Object.keys(patch).join(', ')}`);
   };
 
@@ -947,6 +996,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       addProduct,
       updateProduct,
       deleteProduct,
+      deletingProductId,
       toggleStock,
       toggleEnabled,
       toggleFeatured,
@@ -966,11 +1016,12 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       toggleFavorite,
       isFavorite: (productId: string) => favorites.includes(productId),
       placeOrder,
+      submitManualOrderUtr,
       submitPaymentDetails,
       verifyPaymentAttempt,
       reviewPaymentAttempt,
-      verifyLegacyOrderPayment,
-      rejectLegacyOrderPayment,
+      verifyManualUpiOrderPayment,
+      rejectManualUpiOrderPayment,
       updateOrderStatus,
       setTrackingId,
       cancelOrder,

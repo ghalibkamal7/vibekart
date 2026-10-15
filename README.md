@@ -10,7 +10,7 @@ Standalone Expo project. No Replit dependency of any kind.
 
 - **App**: Expo + Expo Router, React Native, TypeScript
 - **Backend**: Firebase (Auth, Firestore — Spark/free plan) + Cloudflare Worker
-  (mobile OTP) + Cloudinary (product images, unsigned upload). One optional
+  (mobile OTP and non-checkout APIs) + Cloudinary (product images, unsigned upload). One optional
   Cloud Function (`reconcileOrderCost`) needs the Blaze plan and isn't required
   for the app to run.
 
@@ -40,8 +40,11 @@ useful for UI work without a Firebase project set up yet.
 6. Configure and deploy the **Cloudflare Worker** — see `workers/otp/README.md`
    for the full walkthrough (Cloudflare account, KV namespace, secrets, deploy).
    Copy the Worker's URL into `.env` as `EXPO_PUBLIC_OTP_WORKER_URL`. The
-   Worker handles mobile OTP and the authenticated manual-payment workflow; it
-   needs no Firebase billing plan.
+   Worker is required for mobile phone OTP, product deletion, and trusted
+   manual-UPI order creation. The Worker re-reads product prices and delivery
+   settings and is the only client-facing order-creation path; optional
+   payment-attempt APIs remain available for future integrations and historical
+   attempts.
 7. Review and deploy the Firestore rules (works on Spark, no Blaze needed):
 ```bash
    npm install -g firebase-tools     # once
@@ -49,16 +52,19 @@ useful for UI work without a Firebase project set up yet.
    firebase use --add                # pick your project
    firebase deploy --only firestore:rules
 ```
-   The current rules deny client-side order creation/payment-status changes
-   and allow customers to read only their own payment attempts. Deploy the
-   matching rules before enabling the updated app; this repository change does
-   not apply rules to any live Firebase project.
+   The current rules deny all client-side order creation, allow customers to
+   submit a UTR without changing payment status, and reserve payment
+   confirmation/rejection for active administrators. The authenticated Worker
+   creates pending orders with server-priced snapshots. Deploy the matching rules
+   before enabling the updated app; this repository change does not apply rules
+   to any live Firebase project.
 8. **Important — this project intentionally stays on Firebase's free Spark
    plan.** Cloud Functions of any kind (secrets or not) require the Blaze
    (pay-as-you-go) plan to deploy at all. `functions/index.js` now contains
-   only `reconcileOrderCost` (automatic order profit calculation). New UPI
-   orders receive server-priced cost/profit snapshots from the Cloudflare Worker,
-   so this optional function is not required for checkout or seller analytics.
+   only `reconcileOrderCost` (automatic order profit calculation). Manual UPI
+   checkout refreshes product prices and delivery settings through the
+   authenticated Cloudflare Worker; cost/profit snapshots are written by that
+   trusted process.
    Unless you enable Blaze, skip `firebase deploy --only functions` entirely.
 9. **Create your first seller account.** Sign up once from the app (mobile OTP or
    email both create a normal `customer`-role account), then in the Firebase
@@ -70,16 +76,47 @@ useful for UI work without a Firebase project set up yet.
 
 ## Manual UPI payment lifecycle
 
-Checkout creates a server-priced payment attempt, not an order. The customer
-can scan the existing merchant QR and submit a trimmed UTR/reference later;
-submitting that reference does not mark the payment as paid. Payment attempts
-remain separate from confirmed orders and seller fulfillment. Only an active
-administrator, authenticated through the Cloudflare Worker, can confirm after
-checking the actual credit in the merchant's payment/bank history. The Worker
-atomically creates the paid order and reserves the transaction reference to
-prevent duplicate confirmations. Payment attempts are not automatically
-expired, so a customer who paid but has not yet found their UTR can return to
-submit it for review.
+Checkout sends product IDs, quantities, and a persisted request ID to the
+authenticated Worker. The Worker confirms manual UPI is enabled, reads current
+product prices/availability and delivery settings, creates the pending order and private cost snapshot, and
+returns the order on retry without accepting client-submitted prices or totals.
+The customer can scan the merchant's amount-specific QR and submit a
+trimmed UTR/reference; that update changes only the submitted reference and
+never marks the payment as paid. An active administrator must independently
+verify the actual merchant-account credit before confirming or rejecting the
+order. Confirmation reserves the transaction reference to prevent another
+order from reusing it. The previous Worker payment-attempt endpoints and
+admin UI for historical attempts remain available as an optional/future flow;
+the active manual checkout does not call them.
+
+The Firestore rule tests run against the local emulator (no production
+credentials or data):
+
+```bash
+npx firebase-tools emulators:exec --only firestore \
+  --project demo-vibekart-manual-upi --config firebase.json \
+  'npm run test:rules'
+```
+
+## Delivery and order changes
+
+Administrators configure the delivery charge, free-delivery threshold, and
+estimated delivery window in the store settings. Cart and checkout show an
+estimate; manual order creation re-reads the current settings in the trusted
+Worker and snapshots the charge and delivery window into the pending order.
+Legacy orders without a delivery snapshot are left unchanged.
+
+Customers can request cancellation while a paid order is Placed or Confirmed.
+Authorized staff can cancel a paid order before it is shipped. Cancellation
+does not itself issue a refund; any refund must be handled and confirmed
+separately.
+
+## Reviews and ratings
+
+The app does not currently have a verified customer-review system. Seed/demo
+rating values are not shown as customer feedback, and new products do not
+receive placeholder ratings. Existing stored fields and historical orders are
+preserved.
 
 ## How mobile OTP login works
 
@@ -185,22 +222,20 @@ which means upgrading to Blaze.
 4. The returned URL + public ID are saved on the product's Firestore doc as
    `imageUrls` / `imagePublicIds` (first entry = primary image).
 
-### Deleting images — the one real limitation
+### Deleting products and images
 
-Cloudinary has no "unsigned delete" API by design (it would let anyone delete
-anyone's assets). Removing an image from a product, or deleting a product
-outright, removes it from Firestore immediately (the app stops showing it
-right away) but **does not** delete the file from Cloudinary — that needs a
-signed Admin API call, which needs a secret, which this project has nowhere
-to safely hold without Cloud Functions. Orphaned images accumulate in
-Cloudinary storage over time. Two ways to deal with that:
+Product deletion is routed through the authenticated Cloudflare Worker. Sellers
+can delete only products they created; administrators can delete any product,
+including legacy products without an owner UID. The Worker deletes associated
+Cloudinary image assets using its server-only API credentials, then atomically
+deletes the public product and private cost documents from Firestore. If the
+Firestore record changes after Cloudinary cleanup, the app reports that the
+images were removed but the product record remains; retrying is safe because
+Cloudinary reports already-removed assets as `not_found`.
 
-- Periodically browse Cloudinary's Media Library and delete unused files by hand.
-- Run `scripts/cloudinary-cleanup.js` — a manual, local-only Node script (not
-  part of the app, not deployed anywhere) that compares Cloudinary against
-  Firestore and deletes what's orphaned. It reads the API secret only from
-  your own shell's environment variables at the moment you run it — see the
-  comment at the top of that file for exact usage.
+Configure the Worker's `CLOUDINARY_CLOUD_NAME`, `CLOUDINARY_API_KEY`, and
+`CLOUDINARY_API_SECRET` secrets as documented in `workers/otp/README.md`.
+Never add the API secret to the Expo app or an `EXPO_PUBLIC_*` variable.
 
 Images are organised in Cloudinary under `vibekart/products/{productId}/`.
 Older products created before this migration (or local demo-mode products using
@@ -221,19 +256,23 @@ cannot fetch that document, no matter what the app code does.
 
 The same reasoning applies to order profit: a customer's client can never read
 `baseCost`, so it can't compute a trustworthy `costTotal`/`profitTotal`. The
-Cloudflare Worker reads private costs when creating a payment attempt and writes
-them to the seller-only `orders/{id}/private/data` document only after an admin
-confirms the merchant-account credit. No Cloud Function is required for new UPI
-orders.
+optional `reconcileOrderCost` Cloud Function can read private costs and write
+them to the seller-only order fields. Without that function or another trusted
+reconciliation process, newly created manual UPI orders have no cost/profit
+snapshot; checkout and payment verification still work.
 
 ## Project structure
 
 ## Known limitations / follow-ups
 
-- **`reconcileOrderCost` needs the Blaze plan to deploy at all**, but it is
-  optional for the current UPI flow: the Worker writes trusted cost/profit
-  snapshots when it finalizes a paid order. Mobile OTP and Cloudinary also do
-  not use Cloud Functions.
+- **`reconcileOrderCost` needs the Blaze plan to deploy at all.** Without it or
+  another trusted reconciliation process, manual UPI orders do not receive
+  supplier-cost/profit snapshots. This does not block checkout or payment review.
+- **Manual order prices are read from Firestore in a client transaction.** The
+  rules constrain customer-created orders to a pending UPI shape and prevent
+  customers from changing payment status, but Firestore rules do not recompute a
+  cart's aggregate total from every product document. Administrators must verify
+  that the actual credit matches the displayed order before confirming it.
 - **The OTP Worker is a separate deployable** from the Firebase project — it
   has its own `wrangler deploy` and its own secrets (`workers/otp/README.md`).
   Forgetting to redeploy it after an edit, or letting `EXPO_PUBLIC_OTP_WORKER_URL`
@@ -243,10 +282,9 @@ orders.
   above) because Cloud Functions aren't available on Spark. This means upload
   authorisation relies entirely on the Cloudinary preset's own restrictions,
   not on checking who's calling it — accepted trade-off, not an oversight.
-- **Cloudinary asset deletion is manual.** Removing an image or deleting a
-  product stops it from displaying immediately (Firestore is updated) but
-  does not delete the underlying Cloudinary file — see
-  `scripts/cloudinary-cleanup.js` for a manual cleanup option.
+- **Removing an individual image from an existing product does not invoke the
+  Worker cleanup route.** Product-level deletion removes stored images; assets
+  removed only from an edited image list may need manual Cloudinary cleanup.
 - **OTP rate limiting is basic**: a 30-second resend cooldown, 5 verify attempts
   per code, and 10 sends per IP per hour, all via Cloudflare KV (see
   `workers/otp/src/otp-store.ts`). Fine for an MVP; worth hardening (e.g. a real
