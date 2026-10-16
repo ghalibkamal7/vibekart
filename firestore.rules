@@ -134,32 +134,9 @@ service cloud.firestore {
         isSeller()
       );
 
-      // Customers may submit an unverified UTR on their own pending order;
-      // only active admins can change payment status or reserve a reference.
+      // Payment status changes and UTR claims go through the authenticated
+      // Worker; customers may submit only an unverified UTR on their own order.
       allow update: if (
-        isAdmin() &&
-        resource.data.paymentMethod == 'UPI' &&
-        resource.data.get('paymentStatus', 'Selected') in ['Pending', 'Selected'] &&
-        request.resource.data.diff(resource.data).affectedKeys()
-          .hasOnly(['paymentStatus', 'customerUtr', 'paymentReference', 'paymentVerifiedAt', 'paymentReviewReason', 'status']) &&
-        (
-          (
-            request.resource.data.paymentStatus == 'Paid' &&
-            request.resource.data.status == resource.data.status &&
-            request.resource.data.paymentReference is string &&
-            request.resource.data.paymentReference.size() > 0 &&
-            request.resource.data.paymentReference.size() <= 100 &&
-            request.resource.data.paymentVerifiedAt == request.time
-          ) ||
-          (
-            request.resource.data.paymentStatus == 'Failed' &&
-            request.resource.data.status == 'Cancelled' &&
-            request.resource.data.paymentReviewReason is string &&
-            request.resource.data.paymentReviewReason.size() > 0 &&
-            request.resource.data.paymentReviewReason.size() <= 300
-          )
-        )
-      ) || (
         isActiveAccount() &&
         resource.data.customerUid == request.auth.uid &&
         resource.data.paymentMethod == 'UPI' &&
@@ -221,16 +198,10 @@ service cloud.firestore {
     }
 
     // A unique claim document prevents a submitted transaction reference from
-    // being used to confirm more than one payment/order.
+    // being used to confirm more than one payment/order. Only the trusted
+    // Worker can manage these claims.
     match /payment_reference_claims/{referenceHash} {
-      allow read: if isAdmin();
-      allow create: if isAdmin() &&
-        request.resource.data.keys().hasOnly(['orderId', 'reference', 'createdAt']) &&
-        request.resource.data.orderId is string &&
-        request.resource.data.reference is string &&
-        request.resource.data.reference.size() > 0 &&
-        request.resource.data.createdAt == request.time;
-      allow update, delete: if false;
+      allow read, write: if false;
     }
 
     // ---------------- settings ----------------

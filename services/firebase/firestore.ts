@@ -242,90 +242,15 @@ export async function submitManualUpiOrderUtrRemote(orderId: string, customerUtr
   });
 }
 
-function manualUpiReferenceClaimId(reference: string): string {
-  return `ref-${encodeURIComponent(reference.trim().toLocaleUpperCase('en-US'))}`;
-}
-
 export async function confirmManualUpiOrderPaymentRemote(
   orderId: string,
   customerUtr: string,
-  actualCreditConfirmed: boolean,
 ): Promise<void> {
-  const database = requireDb();
-  const reference = customerUtr.trim();
-  if (!reference || reference.length > 100 || actualCreditConfirmed !== true) {
-    throw new Error('A transaction reference and actual-credit confirmation are required.');
-  }
-  const orderRef = doc(database, ORDERS_COLLECTION, orderId);
-  const claimRef = doc(database, 'payment_reference_claims', manualUpiReferenceClaimId(reference));
-  const existingClaims = await getDocs(query(
-    collection(database, 'payment_reference_claims'),
-    where('reference', '==', reference),
-  ));
-  if (existingClaims.docs.some((claim) => claim.data().orderId !== orderId)) {
-    throw new Error('This transaction reference has already been used for another order.');
-  }
-  await runTransaction(database, async (transaction) => {
-    const [orderSnapshot, claimSnapshot] = await Promise.all([
-      transaction.get(orderRef),
-      transaction.get(claimRef),
-    ]);
-    if (!orderSnapshot.exists()) throw new Error('Order not found.');
-    const order = orderSnapshot.data();
-    if (order.paymentStatus === 'Paid') {
-      if (
-        String(order.paymentReference ?? order.customerUtr ?? '')
-          .trim()
-          .toLocaleUpperCase('en-US') !== reference.toLocaleUpperCase('en-US')
-      ) {
-        throw new Error('This order was already verified with a different transaction reference.');
-      }
-      return;
-    }
-    if (
-      order.paymentMethod !== 'UPI' ||
-      !['Pending', 'Selected', undefined].includes(order.paymentStatus) ||
-      order.status === 'Cancelled'
-    ) {
-      throw new Error('This order is not eligible for payment verification.');
-    }
-    if (claimSnapshot.exists() && claimSnapshot.data().orderId !== orderId) {
-      throw new Error('This transaction reference has already been used for another order.');
-    }
-    transaction.update(orderRef, {
-      paymentStatus: 'Paid',
-      paymentReference: reference,
-      paymentVerifiedAt: serverTimestamp(),
-    });
-    if (!claimSnapshot.exists()) {
-      transaction.set(claimRef, { orderId, reference, createdAt: serverTimestamp() });
-    }
-  });
+  await confirmManualUpiOrderPaymentViaWorker(orderId, customerUtr);
 }
 
 export async function rejectManualUpiOrderPaymentRemote(orderId: string, reason: string): Promise<void> {
-  const database = requireDb();
-  const reviewReason = reason.trim();
-  if (!reviewReason || reviewReason.length > 300) throw new Error('A payment review reason is required.');
-  const orderRef = doc(database, ORDERS_COLLECTION, orderId);
-  await runTransaction(database, async (transaction) => {
-    const orderSnapshot = await transaction.get(orderRef);
-    if (!orderSnapshot.exists()) throw new Error('Order not found.');
-    const order = orderSnapshot.data();
-    if (order.paymentStatus === 'Paid') throw new Error('A paid order cannot be rejected.');
-    if (
-      order.paymentMethod !== 'UPI' ||
-      !['Pending', 'Selected', undefined].includes(order.paymentStatus) ||
-      order.status === 'Cancelled'
-    ) {
-      throw new Error('This order is not eligible for payment review.');
-    }
-    transaction.update(orderRef, {
-      paymentStatus: 'Failed',
-      status: 'Cancelled',
-      paymentReviewReason: reviewReason,
-    });
-  });
+  await rejectManualUpiOrderPaymentViaWorker(orderId, reason);
 }
 
 export async function fetchPaymentConfigViaWorker(): Promise<{
@@ -736,26 +661,26 @@ export async function reviewPaymentAttemptViaWorker(
   if (!response.success) throw new Error('Payment attempt could not be updated.');
 }
 
-export async function confirmLegacyOrderPaymentViaWorker(
+export async function confirmManualUpiOrderPaymentViaWorker(
   orderId: string,
   customerUtr: string,
 ): Promise<void> {
   const response = await postPaymentWorker<{ success: boolean }>(
-    '/admin/legacy-orders/confirm-payment',
-    { orderId, customerUtr, actualCreditConfirmed: true },
+    '/admin/manual-upi/orders/confirm-payment',
+    { orderId, customerUtr },
   );
-  if (!response.success) throw new Error('Legacy order payment could not be confirmed.');
+  if (!response.success) throw new Error('UPI order payment could not be confirmed.');
 }
 
-export async function rejectLegacyOrderPaymentViaWorker(
+export async function rejectManualUpiOrderPaymentViaWorker(
   orderId: string,
   reason: string,
 ): Promise<void> {
   const response = await postPaymentWorker<{ success: boolean }>(
-    '/admin/legacy-orders/reject-payment',
-    { orderId, reason, adminReviewed: true },
+    '/admin/manual-upi/orders/reject-payment',
+    { orderId, reason },
   );
-  if (!response.success) throw new Error('Legacy order payment could not be rejected.');
+  if (!response.success) throw new Error('UPI order payment could not be rejected.');
 }
 
 export function subscribeToPaymentAttempts(

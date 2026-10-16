@@ -15,10 +15,17 @@ The Worker securely handles:
 * Firebase custom-token generation
 * Server-priced payment-attempt creation and UTR submission
 * Trusted manual-UPI order creation from current Firestore product prices and delivery settings
-* Admin-only payment verification and atomic paid-order creation
+* Admin-only manual-UPI payment review with order-version preconditions, unique UTR claims, and an atomic reviewer audit
 * Seller/admin-authorized product deletion with server-side Cloudinary cleanup
 
 The Expo app never receives or stores the MSG91 authentication key or Firebase service-account credentials. UPI payment confirmation uses the same Worker and does not require a payment gateway, Firebase Cloud Functions, or a billing-plan upgrade.
+
+Manual UPI confirmation and rejection are available only to authenticated users
+whose Firestore profile has an active `admin` role. The Worker rereads the order,
+validates the stored INR price snapshot, and atomically updates the order and
+review audit (plus the unique reference claim on confirmation). A customer UTR
+alone never confirms payment: the admin must first match the reference and
+amount to the merchant-account credit in the admin review flow.
 
 ## Architecture
 
@@ -76,6 +83,10 @@ Do not put these credentials inside:
 * the mobile/web application bundle
 
 Only public configuration such as the Worker URL should be available to the Expo application.
+
+Set the non-secret `MSG91_TEMPLATE_ID` Worker variable in the Cloudflare
+dashboard. `wrangler.toml` keeps dashboard variables during deploys and does not
+ship a placeholder template ID.
 
 ## Why Cloudflare Worker?
 

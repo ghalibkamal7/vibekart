@@ -128,7 +128,7 @@ type StoreContextValue = {
   submitPaymentDetails: (attemptId: string, customerUtr: string) => Promise<void>;
   verifyPaymentAttempt: (attemptId: string) => Promise<void>;
   reviewPaymentAttempt: (action: 'reject' | 'cancel' | 'expire', attemptId: string, reason: string) => Promise<void>;
-  verifyManualUpiOrderPayment: (orderId: string, customerUtr: string, actualCreditConfirmed: boolean) => Promise<void>;
+  verifyManualUpiOrderPayment: (orderId: string, customerUtr: string) => Promise<void>;
   rejectManualUpiOrderPayment: (orderId: string, reason: string) => Promise<void>;
 
   // order fulfilment (seller side)
@@ -768,14 +768,16 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     await reviewPaymentAttemptViaWorker(action, attemptId, reason);
   };
 
-  const verifyManualUpiOrderPayment: StoreContextValue['verifyManualUpiOrderPayment'] = async (orderId, customerUtr, actualCreditConfirmed) => {
+  const verifyManualUpiOrderPayment: StoreContextValue['verifyManualUpiOrderPayment'] = async (orderId, customerUtr) => {
     if (!isAdmin || !isCloudMode) throw new Error('Only an authenticated administrator can verify payments.');
-    await confirmManualUpiOrderPaymentRemote(orderId, customerUtr.trim(), actualCreditConfirmed);
+    await confirmManualUpiOrderPaymentRemote(orderId, customerUtr.trim());
+    setAuditLogs(await fetchAuditLogsRemote());
   };
 
   const rejectManualUpiOrderPayment: StoreContextValue['rejectManualUpiOrderPayment'] = async (orderId, reason) => {
     if (!isAdmin || !isCloudMode) throw new Error('Only an authenticated administrator can review payments.');
     await rejectManualUpiOrderPaymentRemote(orderId, reason);
+    setAuditLogs(await fetchAuditLogsRemote());
   };
 
   const updateOrderStatus: StoreContextValue['updateOrderStatus'] = async (orderId, status) => {

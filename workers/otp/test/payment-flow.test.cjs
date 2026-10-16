@@ -240,6 +240,24 @@ function manualOrderRequest(idempotencyKey, overrides = {}) {
   };
 }
 
+function seedManualOrder(orderId, overrides = {}) {
+  seed(`orders/${orderId}`, {
+    id: orderId,
+    customerUid: 'customer-1',
+    items: [{ productId: 'product-1', name: 'Test Lamp', quantity: 2, unitPrice: 1250, itemTotal: 2500 }],
+    itemSubtotal: 2500,
+    deliveryCharge: 45,
+    total: 2545,
+    amountPaise: 254500,
+    currency: 'INR',
+    paymentMethod: 'UPI',
+    paymentStatus: 'Pending',
+    status: 'Placed',
+    customerUtr: 'customer-submitted-utr',
+    ...overrides,
+  });
+}
+
 before(() => {
   originalFetch = global.fetch;
   const tsc = path.join(workerRoot, 'node_modules', '.bin', 'tsc');
@@ -640,6 +658,151 @@ test('legacy paid records remain unchanged and unpaid legacy payments require ad
     'legacy-pending',
   );
   assert.deepEqual(records.get('orders/existing-paid').data, original);
+});
+
+test('an active admin confirms a pending UPI order atomically with claims and reviewer audit', async () => {
+  seedManualOrder('manual-confirm-1');
+  for (const token of ['customer-token', 'seller-token', 'suspended-token']) {
+    const denied = await call('/admin/manual-upi/orders/confirm-payment', token, {
+      orderId: 'manual-confirm-1',
+      customerUtr: 'merchant-credit-reference',
+    });
+    assert.equal(denied.status, 403);
+  }
+  const result = await call('/admin/manual-upi/orders/confirm-payment', 'admin-token', {
+    orderId: 'manual-confirm-1',
+    customerUtr: 'merchant-credit-reference',
+    total: 1,
+    amountPaise: 100,
+  });
+
+  assert.equal(result.status, 200);
+  const order = records.get('orders/manual-confirm-1').data;
+  assert.equal(order.paymentStatus, 'Paid');
+  assert.equal(order.status, 'Placed');
+  assert.equal(order.paymentReference, 'merchant-credit-reference');
+  assert.equal(order.customerUtr, 'customer-submitted-utr');
+  assert.equal(order.total, 2545);
+  assert.equal(order.amountPaise, 254500);
+  assert.equal(order.paymentReviewedByUid, 'admin-1');
+  assert.equal(order.paymentReviewAction, 'Confirmed');
+  assert.ok(order.paymentReviewedAt);
+  assert.equal(
+    records.get(`payment_reference_claims/ref-${encodeURIComponent('MERCHANT-CREDIT-REFERENCE')}`).data.orderId,
+    'manual-confirm-1',
+  );
+  const audits = [...records.entries()].filter(([key]) => key.startsWith('audit_logs/'));
+  assert.equal(audits.length, 1);
+  assert.equal(audits[0][1].data.adminUid, 'admin-1');
+  assert.equal(audits[0][1].data.targetId, 'manual-confirm-1');
+});
+
+test('only an active admin may reject a pending UPI order and the rejection is audited', async () => {
+  seedManualOrder('manual-reject-1');
+  const unauthenticated = await worker.fetch(new Request('https://worker.test/admin/manual-upi/orders/reject-payment', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      orderId: 'manual-reject-1',
+      reason: 'No merchant credit found.',
+    }),
+  }), env);
+  assert.equal(unauthenticated.status, 401);
+
+  for (const token of ['customer-token', 'seller-token', 'suspended-token']) {
+    const denied = await call('/admin/manual-upi/orders/reject-payment', token, {
+      orderId: 'manual-reject-1',
+      reason: 'No merchant credit found.',
+    });
+    assert.equal(denied.status, 403);
+  }
+
+  const rejected = await call('/admin/manual-upi/orders/reject-payment', 'admin-token', {
+    orderId: 'manual-reject-1',
+    reason: 'No merchant credit found.',
+  });
+  assert.equal(rejected.status, 200);
+  const order = records.get('orders/manual-reject-1').data;
+  assert.equal(order.paymentStatus, 'Failed');
+  assert.equal(order.status, 'Cancelled');
+  assert.equal(order.paymentReviewReason, 'No merchant credit found.');
+  assert.equal(order.paymentReviewedByUid, 'admin-1');
+  assert.equal(order.paymentReviewAction, 'Rejected');
+  assert.ok(order.paymentReviewedAt);
+  assert.equal([...records.keys()].filter((key) => key.startsWith('audit_logs/')).length, 1);
+});
+
+test('manual UPI review rejects invalid IDs and never trusts malformed order pricing', async () => {
+  const missingId = await call('/admin/manual-upi/orders/confirm-payment', 'admin-token', {
+    orderId: '',
+    customerUtr: 'merchant-reference',
+    actualCreditConfirmed: true,
+  });
+  assert.equal(missingId.status, 400);
+
+  seedManualOrder('manual-invalid-price', { amountPaise: 1 });
+  const invalidPrice = await call('/admin/manual-upi/orders/confirm-payment', 'admin-token', {
+    orderId: 'manual-invalid-price',
+    customerUtr: 'merchant-reference',
+    actualCreditConfirmed: true,
+  });
+  assert.equal(invalidPrice.status, 409);
+  assert.equal(records.get('orders/manual-invalid-price').data.paymentStatus, 'Pending');
+  assert.equal([...records.keys()].filter((key) => key.startsWith('audit_logs/')).length, 0);
+});
+
+test('UTR submission alone never marks an order paid', async () => {
+  seedManualOrder('manual-utr-only');
+  records.get('orders/manual-utr-only').data.customerUtr = 'customer-entered-reference';
+  assert.equal(records.get('orders/manual-utr-only').data.paymentStatus, 'Pending');
+  assert.equal(records.has('payment_reference_claims/ref-CUSTOMER-ENTERED-REFERENCE'), false);
+});
+
+test('manual UPI confirmation is idempotent only for the same reference and protects against duplicate claims', async () => {
+  seedManualOrder('manual-idempotent-1');
+  const body = {
+    orderId: 'manual-idempotent-1',
+    customerUtr: 'idempotent-reference',
+  };
+  const confirmed = await call('/admin/manual-upi/orders/confirm-payment', 'admin-token', body);
+  assert.equal(confirmed.status, 200);
+  const duplicate = await call('/admin/manual-upi/orders/confirm-payment', 'admin-token', body);
+  assert.equal(duplicate.status, 200);
+  const differentReference = await call('/admin/manual-upi/orders/confirm-payment', 'admin-token', {
+    ...body,
+    customerUtr: 'different-reference',
+  });
+  assert.equal(differentReference.status, 409);
+  assert.equal([...records.keys()].filter((key) => key.startsWith('audit_logs/')).length, 1);
+
+  seedManualOrder('manual-idempotent-2');
+  const reusedReference = await call('/admin/manual-upi/orders/confirm-payment', 'admin-token', {
+    ...body,
+    orderId: 'manual-idempotent-2',
+  });
+  assert.equal(reusedReference.status, 409);
+  assert.equal(records.get('orders/manual-idempotent-2').data.paymentStatus, 'Pending');
+});
+
+test('concurrent confirmation and rejection cannot both transition the same UPI order', async () => {
+  seedManualOrder('manual-race');
+  const [confirmed, rejected] = await Promise.all([
+    call('/admin/manual-upi/orders/confirm-payment', 'admin-token', {
+      orderId: 'manual-race',
+      customerUtr: 'race-reference',
+    }),
+    call('/admin/manual-upi/orders/reject-payment', 'admin-token', {
+      orderId: 'manual-race',
+      reason: 'No matching credit.',
+    }),
+  ]);
+  assert.equal([confirmed, rejected].filter((result) => result.status === 200).length, 1);
+  const order = records.get('orders/manual-race').data;
+  assert.ok(
+    (order.paymentStatus === 'Paid' && order.status === 'Placed') ||
+    (order.paymentStatus === 'Failed' && order.status === 'Cancelled'),
+  );
+  assert.equal([...records.keys()].filter((key) => key.startsWith('audit_logs/')).length, 1);
 });
 
 test('preflight permits the authenticated cross-origin Worker requests', async () => {

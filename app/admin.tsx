@@ -500,13 +500,8 @@ export default function AdminScreen() {
       async () => {
         setReviewingPaymentId(order.id);
         try {
-          await verifyManualUpiOrderPayment(order.id, customerUtr, true);
-          const auditError = await savePaymentReviewAudit(
-            'Confirm Manual UPI Payment',
-            `Verified manual UPI order ${order.id}`,
-            order.id,
-          );
-          showPaymentReviewOutcome('Payment confirmed', 'The order is now paid and eligible for fulfillment.', auditError);
+          await verifyManualUpiOrderPayment(order.id, customerUtr);
+          showPlatformAlert('Payment confirmed', 'The order is now paid and eligible for fulfillment.');
         } catch (err) {
           showPlatformAlert('Verification failed', err instanceof Error ? err.message : 'Could not confirm payment.');
         } finally {
@@ -525,12 +520,7 @@ export default function AdminScreen() {
         setReviewingPaymentId(order.id);
         try {
           await rejectManualUpiOrderPayment(order.id, 'Payment was not found in merchant account after review.');
-          const auditError = await savePaymentReviewAudit(
-            'Reject Manual UPI Payment',
-            `Rejected manual UPI order ${order.id}`,
-            order.id,
-          );
-          showPaymentReviewOutcome('Payment rejected', 'The unpaid order was cancelled.', auditError);
+          showPlatformAlert('Payment rejected', 'The unpaid order was cancelled.');
         } catch (err) {
           showPlatformAlert('Update failed', err instanceof Error ? err.message : 'Could not reject payment.');
         } finally {
@@ -1599,18 +1589,26 @@ export default function AdminScreen() {
                       <Pressable
                         disabled={!isCloudMode || reviewingPaymentId === order.id || !(manualUtrInputs[order.id] ?? order.customerUtr ?? '').trim()}
                         onPress={() => handleVerifyManualUpiOrder(order)}
-                        style={[styles.smallVerifyBtn, { backgroundColor: colors.moss }]}
+                        style={[styles.smallVerifyBtn, { backgroundColor: colors.moss, opacity: reviewingPaymentId === order.id ? 0.65 : 1 }]}
                       >
-                        <Feather name="check-circle" size={12} color="#FFFFFF" />
-                        <Text style={styles.smallVerifyBtnText}>Verify & Confirm Payment</Text>
+                        {reviewingPaymentId === order.id
+                          ? <ActivityIndicator size="small" color="#FFFFFF" />
+                          : <Feather name="check-circle" size={12} color="#FFFFFF" />}
+                        <Text style={styles.smallVerifyBtnText}>
+                          {reviewingPaymentId === order.id ? 'Reviewing…' : 'Verify & Confirm Payment'}
+                        </Text>
                       </Pressable>
                       <Pressable
                         disabled={!isCloudMode || reviewingPaymentId === order.id}
                         onPress={() => handleRejectManualUpiOrder(order)}
-                        style={[styles.smallVerifyBtn, { backgroundColor: '#EF4444' }]}
+                        style={[styles.smallVerifyBtn, { backgroundColor: '#EF4444', opacity: reviewingPaymentId === order.id ? 0.65 : 1 }]}
                       >
-                        <Feather name="x-circle" size={12} color="#FFFFFF" />
-                        <Text style={styles.smallVerifyBtnText}>Reject and cancel</Text>
+                        {reviewingPaymentId === order.id
+                          ? <ActivityIndicator size="small" color="#FFFFFF" />
+                          : <Feather name="x-circle" size={12} color="#FFFFFF" />}
+                        <Text style={styles.smallVerifyBtnText}>
+                          {reviewingPaymentId === order.id ? 'Reviewing…' : 'Reject and cancel'}
+                        </Text>
                       </Pressable>
                     </View>
                   </View>

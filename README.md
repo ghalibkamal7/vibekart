@@ -268,11 +268,15 @@ snapshot; checkout and payment verification still work.
 - **`reconcileOrderCost` needs the Blaze plan to deploy at all.** Without it or
   another trusted reconciliation process, manual UPI orders do not receive
   supplier-cost/profit snapshots. This does not block checkout or payment review.
-- **Manual order prices are read from Firestore in a client transaction.** The
-  rules constrain customer-created orders to a pending UPI shape and prevent
-  customers from changing payment status, but Firestore rules do not recompute a
-  cart's aggregate total from every product document. Administrators must verify
-  that the actual credit matches the displayed order before confirming it.
+- **Manual UPI orders are priced by the trusted Worker.** It reads current
+  product prices and delivery settings from Firestore; the client cannot create
+  an order or set its totals. Payment review also goes through the Worker, which
+  authenticates the caller against the Firestore admin profile, rereads the
+  pending order, validates its stored price snapshot, atomically records the
+  transition/reference claim/reviewer audit, and rejects concurrent changes.
+  Customer-submitted UTRs are unverified data, not proof of payment; an admin
+  must match the reference and amount to the actual merchant-account credit.
+  Firestore rules deny direct client payment-status and reference-claim writes.
 - **The OTP Worker is a separate deployable** from the Firebase project — it
   has its own `wrangler deploy` and its own secrets (`workers/otp/README.md`).
   Forgetting to redeploy it after an edit, or letting `EXPO_PUBLIC_OTP_WORKER_URL`

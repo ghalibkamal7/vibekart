@@ -838,6 +838,88 @@ function referenceClaimPath(value: string): string {
   return `payment_reference_claims/ref-${encodeURIComponent(value.trim().toLocaleUpperCase('en-US'))}`;
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function hasValidTrustedOrderPricing(order: Record<string, unknown>): boolean {
+  const total = order.total;
+  if (
+    typeof total !== 'number' ||
+    !Number.isSafeInteger(total) ||
+    total <= 0 ||
+    !Number.isSafeInteger(total * 100)
+  ) return false;
+  if (order.currency !== undefined && order.currency !== 'INR') return false;
+  if (
+    order.amountPaise !== undefined &&
+    (typeof order.amountPaise !== 'number' || order.amountPaise !== total * 100)
+  ) return false;
+
+  const items = order.items;
+  if (!Array.isArray(items) || items.length === 0) return false;
+  let itemsTotal = 0;
+  for (const value of items) {
+    if (!isRecord(value)) return false;
+    const quantity = value.quantity;
+    const unitPrice = value.unitPrice;
+    if (
+      typeof quantity !== 'number' ||
+      !Number.isSafeInteger(quantity) ||
+      quantity < 1 ||
+      typeof unitPrice !== 'number' ||
+      !Number.isSafeInteger(unitPrice) ||
+      unitPrice <= 0
+    ) return false;
+    const lineTotal = quantity * unitPrice;
+    if (!Number.isSafeInteger(lineTotal)) return false;
+    if (value.itemTotal !== undefined && value.itemTotal !== lineTotal) return false;
+    itemsTotal += lineTotal;
+    if (!Number.isSafeInteger(itemsTotal)) return false;
+  }
+  if (
+    order.itemSubtotal !== undefined &&
+    (typeof order.itemSubtotal !== 'number' || order.itemSubtotal !== itemsTotal)
+  ) return false;
+
+  if (order.itemSubtotal !== undefined || order.deliveryCharge !== undefined) {
+    if (
+      typeof order.itemSubtotal !== 'number' ||
+      !Number.isSafeInteger(order.itemSubtotal) ||
+      order.itemSubtotal <= 0 ||
+      typeof order.deliveryCharge !== 'number' ||
+      !Number.isSafeInteger(order.deliveryCharge) ||
+      order.deliveryCharge < 0 ||
+      order.itemSubtotal + order.deliveryCharge !== total
+    ) return false;
+  }
+  return true;
+}
+
+function adminPaymentReviewAuditWrite(
+  sa: ReturnType<typeof parseServiceAccount>,
+  caller: AuthenticatedCaller,
+  orderId: string,
+  action: 'Confirm Manual UPI Payment' | 'Reject Manual UPI Payment',
+  now: string,
+): Record<string, unknown> {
+  const logId = crypto.randomUUID();
+  return {
+    update: {
+      name: firestoreDocumentName(sa, `audit_logs/${logId}`),
+      fields: toFirestoreFields({
+        adminEmail: caller.email || 'admin',
+        adminUid: caller.uid,
+        action,
+        targetId: orderId,
+        details: `${action === 'Confirm Manual UPI Payment' ? 'Verified' : 'Rejected'} manual UPI order ${orderId}`,
+        timestamp: now,
+      }),
+    },
+    currentDocument: { exists: false },
+  };
+}
+
 async function handleCreatePaymentAttempt(request: Request, env: Env, origin: string | null): Promise<Response> {
   const caller = await authenticateCaller(request, env, origin);
   if (!isAuthenticatedCaller(caller)) return caller;
@@ -1279,7 +1361,7 @@ async function handlePaymentAttemptAction(
   return jsonResponse({ success: true, status }, 200, origin);
 }
 
-async function handleConfirmLegacyOrderPayment(request: Request, env: Env, origin: string | null): Promise<Response> {
+async function handleConfirmManualUpiOrderPayment(request: Request, env: Env, origin: string | null): Promise<Response> {
   const caller = await authenticateCaller(request, env, origin);
   if (!isAuthenticatedCaller(caller)) return caller;
   const denied = await requireAdmin(caller, origin);
@@ -1287,19 +1369,31 @@ async function handleConfirmLegacyOrderPayment(request: Request, env: Env, origi
   const body = (await request.json().catch(() => null)) as {
     orderId?: string;
     customerUtr?: string;
-    actualCreditConfirmed?: boolean;
   } | null;
-  const orderId = String(body?.orderId ?? '').trim();
-  const reference = String(body?.customerUtr ?? '').trim();
-  if (!/^[A-Za-z0-9_-]{1,150}$/.test(orderId) || !reference || reference.length > 100 || body?.actualCreditConfirmed !== true) {
-    return jsonResponse({ error: 'A transaction reference and actual-credit confirmation are required.' }, 400, origin);
+  const orderId = typeof body?.orderId === 'string' ? body.orderId.trim() : '';
+  const reference = typeof body?.customerUtr === 'string' ? body.customerUtr.trim() : '';
+  if (!/^[A-Za-z0-9_-]{1,150}$/.test(orderId) || !reference || reference.length > 100) {
+    return jsonResponse({ error: 'A valid order ID and transaction reference are required.' }, 400, origin);
   }
   const orderPath = `orders/${orderId}`;
   const order = await getVersionedDocument(caller.sa, caller.accessToken, orderPath);
   if (!order.exists || !order.data) return jsonResponse({ error: 'Order not found.' }, 404, origin);
-  if (order.data.paymentStatus === 'Paid') return jsonResponse({ success: true, orderId, status: 'Paid' }, 200, origin);
-  if (order.data.paymentMethod !== 'UPI' || order.data.paymentStatus === 'Failed' || order.data.status === 'Cancelled') {
-    return jsonResponse({ error: 'This legacy order is not eligible for payment confirmation.' }, 409, origin);
+  if (order.data.paymentStatus === 'Paid') {
+    const paidReference = String(order.data.paymentReference ?? '').trim();
+    if (paidReference.toLocaleUpperCase('en-US') === reference.toLocaleUpperCase('en-US')) {
+      return jsonResponse({ success: true, orderId, status: 'Paid' }, 200, origin);
+    }
+    return jsonResponse({ error: 'This order was already verified with a different transaction reference.' }, 409, origin);
+  }
+  if (
+    order.data.paymentMethod !== 'UPI' ||
+    !['Pending', 'Selected', undefined].includes(order.data.paymentStatus) ||
+    order.data.status !== 'Placed'
+  ) {
+    return jsonResponse({ error: 'This UPI order is not eligible for payment confirmation.' }, 409, origin);
+  }
+  if (!hasValidTrustedOrderPricing(order.data)) {
+    return jsonResponse({ error: 'The order pricing data is invalid; no payment status was changed.' }, 409, origin);
   }
   if (!order.updateTime) return jsonResponse({ error: 'Order version is unavailable.' }, 503, origin);
 
@@ -1317,8 +1411,11 @@ async function handleConfirmLegacyOrderPayment(request: Request, env: Env, origi
   const now = new Date().toISOString();
   const updates = {
     paymentStatus: 'Paid',
-    customerUtr: reference,
+    paymentReference: reference,
     paymentVerifiedAt: now,
+    paymentReviewedByUid: caller.uid,
+    paymentReviewedAt: now,
+    paymentReviewAction: 'Confirmed',
   };
   const writes: Record<string, unknown>[] = [{
     update: {
@@ -1346,18 +1443,22 @@ async function handleConfirmLegacyOrderPayment(request: Request, env: Env, origi
       currentDocument: { exists: false },
     });
   }
+  writes.push(adminPaymentReviewAuditWrite(caller.sa, caller, orderId, 'Confirm Manual UPI Payment', now));
   try {
     await commitFirestoreWrites(caller.sa, caller.accessToken, writes);
   } catch (error) {
     const retry = await getVersionedDocument(caller.sa, caller.accessToken, orderPath);
-    if (retry.data?.paymentStatus === 'Paid') return jsonResponse({ success: true, orderId, status: 'Paid' }, 200, origin);
-    console.error('[payment] Failed to verify legacy order payment', error);
-    return jsonResponse({ error: 'Could not confirm legacy order payment. Please refresh and retry.' }, 409, origin);
+    if (
+      retry.data?.paymentStatus === 'Paid' &&
+      String(retry.data.paymentReference ?? '').trim().toLocaleUpperCase('en-US') === reference.toLocaleUpperCase('en-US')
+    ) return jsonResponse({ success: true, orderId, status: 'Paid' }, 200, origin);
+    console.error('[payment] Failed to verify manual UPI order payment', error);
+    return jsonResponse({ error: 'Could not confirm UPI order payment. Please refresh and retry.' }, 409, origin);
   }
   return jsonResponse({ success: true, orderId, status: 'Paid' }, 200, origin);
 }
 
-async function handleRejectLegacyOrderPayment(request: Request, env: Env, origin: string | null): Promise<Response> {
+async function handleRejectManualUpiOrderPayment(request: Request, env: Env, origin: string | null): Promise<Response> {
   const caller = await authenticateCaller(request, env, origin);
   if (!isAuthenticatedCaller(caller)) return caller;
   const denied = await requireAdmin(caller, origin);
@@ -1365,36 +1466,73 @@ async function handleRejectLegacyOrderPayment(request: Request, env: Env, origin
   const body = (await request.json().catch(() => null)) as {
     orderId?: string;
     reason?: string;
-    adminReviewed?: boolean;
   } | null;
-  const orderId = String(body?.orderId ?? '').trim();
-  const reason = String(body?.reason ?? '').trim();
-  if (!/^[A-Za-z0-9_-]{1,150}$/.test(orderId) || !reason || reason.length > 300 || body?.adminReviewed !== true) {
-    return jsonResponse({ error: 'A review confirmation and reason are required.' }, 400, origin);
+  const orderId = typeof body?.orderId === 'string' ? body.orderId.trim() : '';
+  const reason = typeof body?.reason === 'string' ? body.reason.trim() : '';
+  if (!/^[A-Za-z0-9_-]{1,150}$/.test(orderId) || !reason || reason.length > 300) {
+    return jsonResponse({ error: 'A valid order ID and review reason are required.' }, 400, origin);
   }
   const path = `orders/${orderId}`;
   const order = await getVersionedDocument(caller.sa, caller.accessToken, path);
   if (!order.exists || !order.data) return jsonResponse({ error: 'Order not found.' }, 404, origin);
-  if (order.data.paymentStatus === 'Paid') {
-    return jsonResponse({ error: 'A paid order cannot be rejected from payment review.' }, 409, origin);
+  if (
+    order.data.paymentStatus === 'Failed' &&
+    order.data.status === 'Cancelled' &&
+    order.data.paymentReviewReason === reason
+  ) {
+    return jsonResponse({ success: true, orderId, status: 'Rejected' }, 200, origin);
+  }
+  if (
+    order.data.paymentMethod !== 'UPI' ||
+    !['Pending', 'Selected', undefined].includes(order.data.paymentStatus) ||
+    order.data.status !== 'Placed'
+  ) {
+    return jsonResponse({ error: 'This UPI order is not eligible for payment rejection.' }, 409, origin);
+  }
+  if (!hasValidTrustedOrderPricing(order.data)) {
+    return jsonResponse({ error: 'The order pricing data is invalid; no payment status was changed.' }, 409, origin);
   }
   if (!order.updateTime) return jsonResponse({ error: 'Order version is unavailable.' }, 503, origin);
+  const now = new Date().toISOString();
   try {
-    await commitFirestoreWrites(caller.sa, caller.accessToken, [{
-      update: {
-        name: firestoreDocumentName(caller.sa, path),
-        fields: toFirestoreFields({ paymentStatus: 'Failed', status: 'Cancelled', paymentReviewReason: reason }),
+    await commitFirestoreWrites(caller.sa, caller.accessToken, [
+      {
+        update: {
+          name: firestoreDocumentName(caller.sa, path),
+          fields: toFirestoreFields({
+            paymentStatus: 'Failed',
+            status: 'Cancelled',
+            paymentReviewReason: reason,
+            paymentReviewedByUid: caller.uid,
+            paymentReviewedAt: now,
+            paymentReviewAction: 'Rejected',
+          }),
+        },
+        updateMask: {
+          fieldPaths: [
+            'paymentStatus',
+            'status',
+            'paymentReviewReason',
+            'paymentReviewedByUid',
+            'paymentReviewedAt',
+            'paymentReviewAction',
+          ],
+        },
+        currentDocument: { updateTime: order.updateTime },
       },
-      updateMask: { fieldPaths: ['paymentStatus', 'status', 'paymentReviewReason'] },
-      currentDocument: { updateTime: order.updateTime },
-    }]);
+      adminPaymentReviewAuditWrite(caller.sa, caller, orderId, 'Reject Manual UPI Payment', now),
+    ]);
   } catch (error) {
     const retry = await getVersionedDocument(caller.sa, caller.accessToken, path);
-    if (retry.data?.paymentStatus === 'Failed' && retry.data.status === 'Cancelled') {
+    if (
+      retry.data?.paymentStatus === 'Failed' &&
+      retry.data.status === 'Cancelled' &&
+      retry.data.paymentReviewReason === reason
+    ) {
       return jsonResponse({ success: true, orderId, status: 'Rejected' }, 200, origin);
     }
-    console.error('[payment] Failed to reject legacy order payment', error);
-    return jsonResponse({ error: 'Could not reject legacy order payment. Please refresh and retry.' }, 409, origin);
+    console.error('[payment] Failed to reject manual UPI order payment', error);
+    return jsonResponse({ error: 'Could not reject UPI order payment. Please refresh and retry.' }, 409, origin);
   }
   return jsonResponse({ success: true, orderId, status: 'Rejected' }, 200, origin);
 }
@@ -1433,8 +1571,14 @@ export default {
       if (url.pathname === '/admin/payment-attempts/reject') return handlePaymentAttemptAction(request, env, origin, 'reject');
       if (url.pathname === '/admin/payment-attempts/cancel') return handlePaymentAttemptAction(request, env, origin, 'cancel');
       if (url.pathname === '/admin/payment-attempts/expire') return handlePaymentAttemptAction(request, env, origin, 'expire');
-      if (url.pathname === '/admin/legacy-orders/confirm-payment') return handleConfirmLegacyOrderPayment(request, env, origin);
-      if (url.pathname === '/admin/legacy-orders/reject-payment') return handleRejectLegacyOrderPayment(request, env, origin);
+      if (
+        url.pathname === '/admin/manual-upi/orders/confirm-payment' ||
+        url.pathname === '/admin/legacy-orders/confirm-payment'
+      ) return handleConfirmManualUpiOrderPayment(request, env, origin);
+      if (
+        url.pathname === '/admin/manual-upi/orders/reject-payment' ||
+        url.pathname === '/admin/legacy-orders/reject-payment'
+      ) return handleRejectManualUpiOrderPayment(request, env, origin);
       return jsonResponse({ error: 'Not found.' }, 404, origin);
     } catch (error) {
       console.error('[worker] Unhandled request failure', error);
