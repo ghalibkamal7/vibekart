@@ -10,6 +10,7 @@ const {
 const {
   doc,
   getDoc,
+  runTransaction,
   serverTimestamp,
   setDoc,
   updateDoc,
@@ -106,7 +107,7 @@ test('rules reject forged client prices and customer attempts to set payment sta
   }));
 });
 
-test('clients cannot confirm or reject payments or manage UTR claims; reviews use the trusted Worker', async () => {
+test('only an active admin can confirm a pending order with reviewer audit fields', async () => {
   const customer = testEnvironment.authenticatedContext('customer-1').firestore();
   const orderId = 'checkout-test-003';
   const order = doc(customer, `orders/${orderId}`);
@@ -125,62 +126,114 @@ test('clients cannot confirm or reject payments or manage UTR claims; reviews us
     paymentStatus: 'Paid',
     paymentReference: 'UTR-UNIQUE',
     paymentVerifiedAt: serverTimestamp(),
+    paymentReviewedByUid: 'suspended-admin',
+    paymentReviewedAt: serverTimestamp(),
+    paymentReviewAction: 'Confirmed',
   }));
 
   const admin = testEnvironment.authenticatedContext('admin-1').firestore();
   const claim = doc(admin, 'payment_reference_claims/ref-UTR-UNIQUE');
-  await assertFails(updateDoc(doc(admin, `orders/${orderId}`), {
-    paymentStatus: 'Paid',
-    paymentReference: 'UTR-UNIQUE',
-    paymentVerifiedAt: serverTimestamp(),
-  }));
-  await assertFails(setDoc(claim, {
-    orderId,
-    reference: 'UTR-UNIQUE',
-    createdAt: serverTimestamp(),
-  }));
-
   const seller = testEnvironment.authenticatedContext('seller-1').firestore();
   await assertFails(updateDoc(doc(seller, `orders/${orderId}`), {
     paymentStatus: 'Paid',
     paymentReference: 'UTR-UNIQUE',
+    paymentVerifiedAt: serverTimestamp(),
+    paymentReviewedByUid: 'seller-1',
+    paymentReviewedAt: serverTimestamp(),
+    paymentReviewAction: 'Confirmed',
   }));
   await assertFails(updateDoc(doc(customer, `orders/${orderId}`), {
     paymentReviewReason: 'approved by customer',
     paymentReviewedByUid: 'customer-1',
   }));
+
+  await assertSucceeds(runTransaction(admin, async (transaction) => {
+    const adminOrder = doc(admin, `orders/${orderId}`);
+    const current = await transaction.get(adminOrder);
+    assert.equal(current.data().paymentStatus, 'Pending');
+    transaction.update(adminOrder, {
+      paymentStatus: 'Paid',
+      paymentReference: 'UTR-UNIQUE',
+      paymentVerifiedAt: serverTimestamp(),
+      paymentReviewedByUid: 'admin-1',
+      paymentReviewedAt: serverTimestamp(),
+      paymentReviewAction: 'Confirmed',
+    });
+    transaction.set(claim, {
+      orderId,
+      reference: 'UTR-UNIQUE',
+      createdAt: serverTimestamp(),
+    });
+  }));
+  assert.equal((await getDoc(doc(admin, `orders/${orderId}`))).data().paymentStatus, 'Paid');
 });
 
-test('client payment-reference claims are unavailable to all roles', async () => {
+test('authorized admin may reject a pending UPI payment with a reason and audit identity', async () => {
+  const orderId = 'checkout-test-reject';
+  await seedOrder(orderId);
   const admin = testEnvironment.authenticatedContext('admin-1').firestore();
-  const claim = doc(admin, 'payment_reference_claims/ref-UTR-REUSED');
-  await assertFails(setDoc(claim, {
-    orderId: 'first-order',
-    reference: 'UTR-REUSED',
-    createdAt: serverTimestamp(),
+  await assertSucceeds(updateDoc(doc(admin, `orders/${orderId}`), {
+    paymentStatus: 'Failed',
+    status: 'Cancelled',
+    paymentReviewReason: 'No matching merchant-account credit.',
+    paymentReviewedByUid: 'admin-1',
+    paymentReviewedAt: serverTimestamp(),
+    paymentReviewAction: 'Rejected',
+  }));
+
+  const customer = testEnvironment.authenticatedContext('customer-1').firestore();
+  await seedOrder('checkout-test-reject-customer');
+  await assertFails(updateDoc(doc(customer, 'orders/checkout-test-reject-customer'), {
+    paymentStatus: 'Failed',
+    status: 'Cancelled',
+    paymentReviewReason: 'Customer forged a review.',
+    paymentReviewedByUid: 'customer-1',
+    paymentReviewedAt: serverTimestamp(),
+    paymentReviewAction: 'Rejected',
   }));
 });
 
-test('no client role may reject an unpaid order directly', async () => {
+test('admins may reserve reference claims but ordinary customers may not', async () => {
+  const admin = testEnvironment.authenticatedContext('admin-1').firestore();
+  const claimData = {
+    orderId: 'first-order',
+    reference: 'UTR-REUSED',
+    createdAt: serverTimestamp(),
+  };
+  await assertSucceeds(setDoc(doc(admin, 'payment_reference_claims/ref-UTR-REUSED'), claimData));
+  const customer = testEnvironment.authenticatedContext('customer-1').firestore();
+  await assertFails(setDoc(doc(customer, 'payment_reference_claims/ref-UTR-CUSTOMER'), claimData));
+});
+
+test('admin cannot review orders outside valid pending states or reject a paid order', async () => {
   const admin = testEnvironment.authenticatedContext('admin-1').firestore();
   await testEnvironment.withSecurityRulesDisabled(async (context) => {
     const database = context.firestore();
-    await setDoc(doc(database, 'orders/pending-reject'), orderData('pending-reject'));
+    await setDoc(doc(database, 'orders/processing-unpaid'), {
+      ...orderData('processing-unpaid'),
+      status: 'Processing',
+    });
     await setDoc(doc(database, 'orders/already-paid'), {
       ...orderData('already-paid'),
       paymentStatus: 'Paid',
     });
   });
 
-  await assertFails(updateDoc(doc(admin, 'orders/pending-reject'), {
-    paymentStatus: 'Failed',
-    status: 'Cancelled',
-    paymentReviewReason: 'No matching merchant credit.',
+  await assertFails(updateDoc(doc(admin, 'orders/processing-unpaid'), {
+    paymentStatus: 'Paid',
+    paymentReference: 'UTR-123',
+    paymentVerifiedAt: serverTimestamp(),
+    paymentReviewedByUid: 'admin-1',
+    paymentReviewedAt: serverTimestamp(),
+    paymentReviewAction: 'Confirmed',
   }));
   await assertFails(updateDoc(doc(admin, 'orders/already-paid'), {
     paymentStatus: 'Failed',
     status: 'Cancelled',
     paymentReviewReason: 'No matching merchant credit.',
+    paymentReviewedByUid: 'admin-1',
+    paymentReviewedAt: serverTimestamp(),
+    paymentReviewAction: 'Rejected',
   }));
 });
 
@@ -193,9 +246,12 @@ test('existing Selected UPI orders cannot be approved by direct client writes', 
   });
 
   const admin = testEnvironment.authenticatedContext('admin-1').firestore();
-  await assertFails(updateDoc(doc(admin, 'orders/legacy-selected'), {
+  await assertSucceeds(updateDoc(doc(admin, 'orders/legacy-selected'), {
     paymentStatus: 'Paid',
     paymentReference: 'LEGACY-UTR',
     paymentVerifiedAt: serverTimestamp(),
+    paymentReviewedByUid: 'admin-1',
+    paymentReviewedAt: serverTimestamp(),
+    paymentReviewAction: 'Confirmed',
   }));
 });

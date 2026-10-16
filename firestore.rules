@@ -135,8 +135,63 @@ service cloud.firestore {
       );
 
       // Payment status changes and UTR claims go through the authenticated
-      // Worker; customers may submit only an unverified UTR on their own order.
+      // Worker. Keep a narrowly scoped admin rule for the equivalent review
+      // transaction; customers may submit only an unverified UTR on their order.
       allow update: if (
+        isAdmin() &&
+        resource.data.paymentMethod == 'UPI' &&
+        resource.data.get('paymentStatus', 'Selected') in ['Pending', 'Selected'] &&
+        resource.data.status == 'Placed' &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          'paymentStatus',
+          'paymentReference',
+          'paymentVerifiedAt',
+          'paymentReviewedByUid',
+          'paymentReviewedAt',
+          'paymentReviewAction',
+          'paymentReviewReason',
+          'status'
+        ]) &&
+        (
+          (
+            request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+              'paymentStatus',
+              'paymentReference',
+              'paymentVerifiedAt',
+              'paymentReviewedByUid',
+              'paymentReviewedAt',
+              'paymentReviewAction'
+            ]) &&
+            request.resource.data.paymentStatus == 'Paid' &&
+            request.resource.data.status == resource.data.status &&
+            request.resource.data.paymentReference is string &&
+            request.resource.data.paymentReference.size() > 0 &&
+            request.resource.data.paymentReference.size() <= 100 &&
+            request.resource.data.paymentVerifiedAt == request.time &&
+            request.resource.data.paymentReviewedByUid == request.auth.uid &&
+            request.resource.data.paymentReviewedAt == request.time &&
+            request.resource.data.paymentReviewAction == 'Confirmed'
+          ) ||
+          (
+            request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+              'paymentStatus',
+              'status',
+              'paymentReviewReason',
+              'paymentReviewedByUid',
+              'paymentReviewedAt',
+              'paymentReviewAction'
+            ]) &&
+            request.resource.data.paymentStatus == 'Failed' &&
+            request.resource.data.status == 'Cancelled' &&
+            request.resource.data.paymentReviewReason is string &&
+            request.resource.data.paymentReviewReason.size() > 0 &&
+            request.resource.data.paymentReviewReason.size() <= 300 &&
+            request.resource.data.paymentReviewedByUid == request.auth.uid &&
+            request.resource.data.paymentReviewedAt == request.time &&
+            request.resource.data.paymentReviewAction == 'Rejected'
+          )
+        )
+      ) || (
         isActiveAccount() &&
         resource.data.customerUid == request.auth.uid &&
         resource.data.paymentMethod == 'UPI' &&
@@ -198,10 +253,27 @@ service cloud.firestore {
     }
 
     // A unique claim document prevents a submitted transaction reference from
-    // being used to confirm more than one payment/order. Only the trusted
-    // Worker can manage these claims.
+    // being used to confirm more than one payment/order.
     match /payment_reference_claims/{referenceHash} {
-      allow read, write: if false;
+      allow read: if isAdmin();
+      allow create: if isAdmin() &&
+        request.resource.data.keys().hasOnly(['orderId', 'reference', 'createdAt', 'claimedAt']) &&
+        request.resource.data.orderId is string &&
+        request.resource.data.reference is string &&
+        request.resource.data.reference.size() > 0 &&
+        (
+          (
+            'createdAt' in request.resource.data &&
+            !('claimedAt' in request.resource.data) &&
+            request.resource.data.createdAt == request.time
+          ) ||
+          (
+            'claimedAt' in request.resource.data &&
+            !('createdAt' in request.resource.data) &&
+            request.resource.data.claimedAt == request.time
+          )
+        );
+      allow update, delete: if false;
     }
 
     // ---------------- settings ----------------
