@@ -21,6 +21,7 @@ let cloudinaryStatus = 200;
 let cloudinaryPartialFailureFor = null;
 let cloudinaryAssets = new Set();
 let kvValues = new Map();
+let msg91Calls = 0;
 
 const privateKey = generateKeyPairSync('rsa', { modulusLength: 2048 })
   .privateKey.export({ type: 'pkcs8', format: 'pem' });
@@ -119,6 +120,7 @@ function resetStore() {
   cloudinaryPartialFailureFor = null;
   cloudinaryAssets = new Set(['vibekart/products/product-1/test-image']);
   kvValues = new Map();
+  msg91Calls = 0;
   seed('users/customer-1', { uid: 'customer-1', role: 'customer', status: 'active', phone: '+911234567890' });
   seed('users/admin-1', { uid: 'admin-1', role: 'admin', status: 'active' });
   seed('users/seller-1', { uid: 'seller-1', role: 'seller', status: 'active' });
@@ -140,6 +142,10 @@ function resetStore() {
 
 async function mockedFetch(input, init = {}) {
   const url = new URL(input);
+  if (url.hostname === 'control.msg91.com') {
+    msg91Calls += 1;
+    throw new Error('Disabled OTP endpoint must not call MSG91');
+  }
   if (url.hostname === 'api.cloudinary.com') {
     if (init.method === 'POST') {
       assert.equal(url.pathname, '/v1_1/vibekart-test/image/upload');
@@ -402,6 +408,25 @@ test('CORS allows the configured Vercel origin and rejects lookalike origins', (
   assert.equal(isAllowedOrigin('https://vibekaart.vercel.app.attacker.test'), false);
   assert.equal(isAllowedOrigin('http://vibekaart.vercel.app'), false);
   assert.equal(isAllowedOrigin(null), false);
+});
+
+test('phone OTP endpoints are unavailable and never call MSG91', async () => {
+  for (const pathname of ['/send-otp', '/verify-otp']) {
+    const result = await worker.fetch(new Request(`https://worker.test${pathname}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ phone: '+911234567890', otp: '1234' }),
+    }), env);
+
+    assert.equal(result.status, 410);
+    assert.deepEqual(await result.json(), {
+      error: 'Phone OTP sign-in is currently unavailable. Use Google or email and password.',
+      code: 'PHONE_OTP_UNAVAILABLE',
+    });
+  }
+
+  assert.equal(msg91Calls, 0);
+  assert.equal(kvValues.size, 0);
 });
 
 beforeEach(() => {

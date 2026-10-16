@@ -10,7 +10,7 @@ Standalone Expo project. No Replit dependency of any kind.
 
 - **App**: Expo + Expo Router, React Native, TypeScript
 - **Backend**: Firebase (Auth, Firestore — Spark/free plan) + Cloudflare Worker
-  (mobile OTP, image upload/cleanup, and non-checkout APIs) + Cloudinary. One optional
+  (image upload/cleanup and trusted order APIs) + Cloudinary. One optional
   Cloud Function (`reconcileOrderCost`) needs the Blaze plan and isn't required
   for the app to run.
 
@@ -41,7 +41,7 @@ useful for UI work without a Firebase project set up yet.
 6. Configure and deploy the **Cloudflare Worker** — see `workers/otp/README.md`
    for the full walkthrough (Cloudflare account, KV namespace, secrets, deploy).
    Copy the Worker's URL into `.env` as `EXPO_PUBLIC_OTP_WORKER_URL`. The
-   Worker is required for mobile phone OTP, product deletion, and trusted
+   Worker is required for product deletion and trusted
    manual-UPI order creation. The Worker re-reads product prices and delivery
    settings and is the only client-facing order-creation path; optional
    payment-attempt APIs remain available for future integrations and historical
@@ -67,8 +67,8 @@ useful for UI work without a Firebase project set up yet.
    authenticated Cloudflare Worker; cost/profit snapshots are written by that
    trusted process.
    Unless you enable Blaze, skip `firebase deploy --only functions` entirely.
-9. **Create your first seller account.** Sign up once from the app (mobile OTP or
-   email both create a normal `customer`-role account), then in the Firebase
+9. **Create your first seller account.** Sign up once from the app (email
+   creates a normal `customer`-role account), then in the Firebase
    console open **Firestore → users → `<that uid>`** and change `role` from
    `customer` to `seller`. This has to be a manual step — the security rules
    deliberately never let a client set its own role to `seller` (see
@@ -119,50 +119,16 @@ rating values are not shown as customer feedback, and new products do not
 receive placeholder ratings. Existing stored fields and historical orders are
 preserved.
 
-## How mobile OTP login works
+## Phone OTP status
 
-Firebase's own client-side phone auth needs a web reCAPTCHA challenge via
-`expo-firebase-recaptcha` — but that package was deprecated and **removed from
-Expo as of SDK 48** — and Firebase's phone auth has required the **Blaze** plan
-since late 2024 regardless. Firebase Cloud Functions need Blaze too, to deploy
-at all, so a Cloud-Function-based OTP backend (MSG91 + a Function holding the
-secret) isn't an option either while staying on Spark.
-
-So phone sign-in here goes through a small **Cloudflare Worker** instead —
-`workers/otp/` — which needs no Firebase billing plan:
-
-1. The app calls the Worker's `/send-otp` endpoint. The Worker generates a
-   4-digit code with Web Crypto's CSPRNG (`crypto.getRandomValues` —
-   deliberately never `Math.random()`, which isn't cryptographically
-   secure), hashes it into Cloudflare KV with a 5-minute expiry (replacing
-   what used to be a Firestore `otp_requests` collection), and texts it via
-   MSG91 through a DLT-approved template (India requires a pre-registered
-   template for OTP SMS — see `workers/otp/README.md` to create one; MSG91's
-   OTP API rejects free-form text without it).
-2. The app calls `/verify-otp`. The Worker checks the code against the KV
-   record itself (the client's claim of "verified" is never trusted, and
-   MSG91's own verify endpoint is never used — this Worker is the one source
-   of truth), then looks up — or creates — a Firebase Auth user by phone
-   number via the Identity Toolkit REST API. Either way (new or existing
-   user) it also makes sure a `users/{uid}` Firestore profile exists,
-   creating one if it's somehow missing, before signing a Firebase **custom
-   token** locally.
-3. The app calls `signInWithCustomToken` with that token — from there it's a
-   normal Firebase session, same as email sign-in.
-
-The Worker never uses the `firebase-admin` npm package — its Node.js
-Firestore/Auth clients need gRPC, which doesn't run in the Workers runtime.
-Every Admin operation it needs (OAuth2 token exchange, looking up/creating a
-user, signing a custom token, checking/writing the user's Firestore profile
-doc) is reimplemented as plain signed-JWT + REST calls, following Firebase's
-documented custom-token JWT spec exactly (RS256, `iss`/`sub`/`aud`/`iat`/`exp`/
-`uid` claims) — see `workers/otp/src/google.ts` for exactly how and why.
-
-See `workers/otp/README.md` for deployment, and `services/firebase/auth.ts`
-(`requestPhoneOtp` / `confirmPhoneOtp`) for the client side, which now calls the
-Worker's URL (`EXPO_PUBLIC_OTP_WORKER_URL`) with plain `fetch()` instead of a
-Firebase callable function. Swapping MSG91 for Twilio or another provider only
-means changing `workers/otp/src/msg91.ts` — nothing else needs to change.
+Phone OTP is currently unavailable and reserved for future use. Both Worker
+routes (`/send-otp` and `/verify-otp`) return the same unavailable response
+without sending SMS or creating a Firebase session. The MSG91 integration and
+client helpers remain in the repository for possible future reactivation, but
+MSG91 is not called by any active user-facing flow and no MSG91 configuration
+is required for current functionality. Current sign-in methods are Google and
+email/password; guest browsing remains available. See `workers/otp/README.md`
+for the future-only OTP implementation notes.
 
 ## Product images (Cloudinary)
 
@@ -177,9 +143,10 @@ JPEG, PNG, WebP, or AVIF images up to 10 MB.
 ### Local Worker configuration
 
 1. Copy `workers/otp/.dev.vars.example` to `workers/otp/.dev.vars`.
-2. Add the local Firebase service-account JSON, MSG91 key/template ID, and
-   Cloudinary values to that local-only file. The checked-in example contains
-   blank values only.
+2. Add the local Firebase service-account JSON and Cloudinary values to that
+   local-only file. MSG91 settings are future-only and are not needed for
+   current Worker functionality. The checked-in example contains blank values
+   only.
 3. `.dev.vars` and its variants are ignored by Git. Keep the file on this
    machine; never paste values into `.env`, `EXPO_PUBLIC_*`, or source control.
 4. Set `EXPO_PUBLIC_OTP_WORKER_URL` in the app's `.env` to the local Worker
@@ -198,10 +165,9 @@ JPEG, PNG, WebP, or AVIF images up to 10 MB.
 4. For production, open **Cloudflare Dashboard → Workers & Pages →
    vibekart-otp → Settings → Variables and Secrets**. Add these exact names as
    Worker secrets: `CLOUDINARY_CLOUD_NAME`, `CLOUDINARY_API_KEY`,
-   `CLOUDINARY_API_SECRET`, `FIREBASE_SERVICE_ACCOUNT_JSON`, and
-   `MSG91_AUTH_KEY`. Add `MSG91_TEMPLATE_ID` as a non-secret Worker variable.
-   Never paste secret values into the repository, build logs, or Expo
-   configuration.
+   `CLOUDINARY_API_SECRET`, and `FIREBASE_SERVICE_ACCOUNT_JSON`. MSG91 is
+   future-only and must not be configured for current functionality. Never
+   paste secret values into the repository, build logs, or Expo configuration.
 5. `workers/otp/wrangler.toml` schedules cleanup retries every 15 minutes. The
    schedule becomes active only when the updated Worker is deployed.
 
@@ -283,20 +249,13 @@ snapshot; checkout and payment verification still work.
   Customer-submitted UTRs are unverified data, not proof of payment; an admin
   must match the reference and amount to the actual merchant-account credit.
   Firestore rules deny direct client payment-status and reference-claim writes.
-- **The OTP Worker is a separate deployable** from the Firebase project — it
-  has its own `wrangler deploy` and its own secrets (`workers/otp/README.md`).
-  Forgetting to redeploy it after an edit, or letting `EXPO_PUBLIC_OTP_WORKER_URL`
-  drift out of sync with the actual deployed Worker, will break mobile OTP
-  without affecting anything else in the app.
+- **The Worker is a separate deployable** from the Firebase project — it has
+  its own `wrangler deploy` and secrets (`workers/otp/README.md`). Phone OTP
+  is currently disabled; MSG91 code and configuration are future-only.
 - **Legacy Cloudinary images require migration before deletion.** Existing URLs
   continue to render, but assets without a trusted Worker ownership record
   cannot be safely removed during edits or product deletion. See "Product
   images (Cloudinary)" for the required inventory review and migration.
-- **OTP rate limiting is basic**: a 30-second resend cooldown, 5 verify attempts
-  per code, and 10 sends per IP per hour, all via Cloudflare KV (see
-  `workers/otp/src/otp-store.ts`). Fine for an MVP; worth hardening (e.g. a real
-  WAF rule, or Durable Objects for stronger per-phone-number locking) before
-  high-volume production use.
 - **Meesho product import is manual, not scraped.** The seller "Add product" form
   lets you paste a Meesho URL for your own reference, but does not auto-fetch
   title/price/images from it — see the note in `app/seller-add-product.tsx` for why

@@ -7,11 +7,10 @@ import { isFirebaseConfigured } from '@/services/firebase/config';
 import { useColors } from '@/hooks/useColors';
 import { useStore } from '@/context/StoreContext';
 
-// Mobile OTP sign-in is temporarily hidden from this screen. Nothing behind
-// it was removed: sendPhoneOtp / verifyPhoneOtp still exist in StoreContext,
-// requestPhoneOtp / confirmPhoneOtp still exist in services/firebase/auth.ts,
-// and the Cloudflare Worker in workers/otp/ is untouched — restoring OTP
-// later means re-adding the phone tab to this screen, not rebuilding it.
+// Phone OTP is future-only: the Worker routes are disabled and return an
+// unavailable response without calling MSG91. Keep the provider/helpers for
+// possible future reactivation; current sign-in remains Google/email, with
+// guest browsing available.
 
 export default function LoginScreen() {
   const colors = useColors();

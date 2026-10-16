@@ -1,7 +1,7 @@
 {
   "name": "vibekart-otp-worker",
   "private": true,
-  "description": "Cloudflare Worker: secure Mobile OTP backend for VibeKart (Spark-plan compatible, no Firebase Cloud Functions)",
+  "description": "Cloudflare Worker for VibeKart trusted order and image APIs (phone OTP is future-only)",
   "scripts": {
     "typecheck": "tsc --noEmit",
     "test": "node --test test/*.test.cjs",

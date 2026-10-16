@@ -1,24 +1,26 @@
-# VibeKart OTP Worker
+# VibeKart Cloudflare Worker
 
-A Cloudflare Worker that replaces Firebase Cloud Functions for OTP and manual UPI payment operations.
+A Cloudflare Worker for trusted manual-UPI order operations, image management,
+and cleanup. Phone OTP is currently disabled and reserved for future use.
+Both `/send-otp` and `/verify-otp` return HTTP 410 with
+`PHONE_OTP_UNAVAILABLE`; these routes do not call MSG91 or create a Firebase
+session.
 
-Firebase Cloud Functions require the Blaze plan, so this Worker keeps the OTP backend outside Firebase while allowing the Firebase project to remain on the Spark/free plan.
+MSG91 integration code and phone OTP helpers remain in the repository for
+possible future reactivation. MSG91 is not used by current authentication, and
+no MSG91 secret, template, dashboard setup, or `MSG91_TEMPLATE_ID` is required
+for current functionality. Do not enable these routes or configure MSG91
+without an explicit future product decision.
 
 The Worker securely handles:
 
-* OTP generation using Web Crypto
-* OTP storage and expiration using Cloudflare KV
-* OTP verification
-* MSG91 SMS delivery
-* Firebase user lookup/creation
-* Firestore profile creation/repair
-* Firebase custom-token generation
 * Server-priced payment-attempt creation and UTR submission
 * Trusted manual-UPI order creation from current Firestore product prices and delivery settings
 * Admin-only payment review with version preconditions, unique UTR claims, and an audit record committed atomically with each payment-attempt or legacy-order review
 * Seller/admin-authorized product deletion with server-side Cloudinary cleanup
 
-The Expo app never receives or stores the MSG91 authentication key or Firebase service-account credentials. UPI payment confirmation uses the same Worker and does not require a payment gateway, Firebase Cloud Functions, or a billing-plan upgrade.
+UPI payment confirmation uses the Worker and does not require a payment gateway,
+Firebase Cloud Functions, or a billing-plan upgrade.
 
 Manual UPI confirmation and rejection are available only to authenticated users
 whose Firestore profile has an active `admin` role. The Worker rereads the order,
@@ -34,41 +36,17 @@ Expo app
    |
    | HTTPS
    v
-Cloudflare OTP Worker
+Cloudflare Worker
    |
-   +--> Generate OTP using Web Crypto
-   |
-   +--> Store OTP + expiry + attempts in Cloudflare KV
-   |
-   +--> MSG91
-   |      |
-   |      +--> Deliver OTP through SMS
-   |
-   +--> Firebase Identity Toolkit REST API
-   |      |
-   |      +--> Find existing Firebase user
-   |      +--> Create Firebase user if necessary
-   |
+   +--> Authenticate trusted order/image requests
    +--> Firebase Firestore REST API
-   |      |
-   |      +--> Create/repair users/{uid} profile
-   |
-   +--> Sign Firebase Custom Token locally
-   |
-   v
-Expo app
-   |
-   +--> signInWithCustomToken()
-   |
-   v
-Normal Firebase Authentication session
+   +--> Cloudinary signed upload and cleanup
 ```
 
 ## Important security model
 
 The following credentials must remain on the Cloudflare Worker and must never be exposed to the Expo application:
 
-* MSG91 authentication key
 * Firebase service-account private key
 * Google private key
 * Firebase service-account JSON
@@ -84,27 +62,22 @@ Do not put these credentials inside:
 
 Only public configuration such as the Worker URL should be available to the Expo application.
 
-Set the non-secret `MSG91_TEMPLATE_ID` Worker variable in the Cloudflare
-dashboard. `wrangler.toml` keeps dashboard variables during deploys and does not
-ship a placeholder template ID.
+MSG91 credentials and the non-secret `MSG91_TEMPLATE_ID` are future-only. They
+are not current Worker requirements and should not be added for this release.
 
 ## Why Cloudflare Worker?
 
-Firebase Cloud Functions are not used for OTP because they require the Firebase Blaze plan.
+Phone OTP is disabled. The Worker does not send SMS or create phone-auth
+sessions.
 
 The intended architecture is therefore:
 
 ```text
-Firebase Spark
-    +
-Cloudflare Worker
-    +
-MSG91
-    +
-Firebase REST APIs
+Firebase Spark + Cloudflare Worker + Firebase REST APIs + Cloudinary
 ```
 
-No Firebase Cloud Function is required for the OTP flow.
+The Worker currently handles trusted order and image operations; phone OTP and
+MSG91 remain future-only.
 
 ## Worker requirements
 
@@ -113,7 +86,6 @@ The Worker requires:
 * Cloudflare account
 * Cloudflare Workers
 * Cloudflare KV
-* MSG91 account
 * Firebase project
 * Firebase service-account credentials
 
@@ -146,7 +118,9 @@ A browser window will open for Cloudflare authentication.
 
 ## Create the KV namespace
 
-The Worker uses Cloudflare KV to store OTP information.
+The Worker uses Cloudflare KV for request idempotency, image upload throttling,
+and scheduled cleanup cursors. Retained OTP implementation also uses KV but
+the disabled OTP routes do not access it.
 
 Run:
 
@@ -162,56 +136,17 @@ Copy that ID into:
 workers/otp/wrangler.toml
 ```
 
-Replace:
+Use the namespace ID belonging to the intended Cloudflare account. Do not
+replace an existing production namespace ID or create a duplicate namespace
+without an explicit migration plan.
 
-```text
-REPLACE_WITH_YOUR_KV_NAMESPACE_ID
-```
+## MSG91 (future-only)
 
-with the real namespace ID.
-
-Do not invent or reuse another KV namespace ID.
-
-## MSG91 setup
-
-The Worker sends OTP messages through MSG91.
-
-For Indian mobile numbers, configure an approved OTP template in MSG91.
-
-In the MSG91 dashboard:
-
-```text
-MSG91 Dashboard
-→ OTP
-→ Templates
-→ Create Template
-```
-
-Use a template containing one OTP variable, for example:
-
-```text
-Your OTP for login is ##OTP##. Please do not share it with anyone.
-```
-
-The exact template text must follow MSG91's current requirements and the applicable Indian DLT rules.
-
-After the template is approved, copy its template ID.
-
-Set the template ID in:
-
-```text
-workers/otp/wrangler.toml
-```
-
-using:
-
-```text
-MSG91_TEMPLATE_ID
-```
-
-The template ID itself is not a secret.
-
-The MSG91 authentication key is secret and must be stored using Cloudflare Worker secrets.
+Do not configure MSG91 for current functionality. Phone OTP is disabled at
+both Worker routes, and the retained `src/msg91.ts` provider implementation is
+not reached by either route. Future reactivation requires a separate product
+decision, endpoint enablement, and review of applicable MSG91/DLT settings.
+Until then, `MSG91_AUTH_KEY` and `MSG91_TEMPLATE_ID` are optional and unused.
 
 ## Firebase service account
 
@@ -247,15 +182,7 @@ From:
 cd workers/otp
 ```
 
-set the MSG91 authentication key:
-
-```bash
-npx wrangler secret put MSG91_AUTH_KEY
-```
-
-When prompted, paste the MSG91 authentication key.
-
-Then set the Firebase service-account JSON:
+set the Firebase service-account JSON:
 
 ```bash
 npx wrangler secret put FIREBASE_SERVICE_ACCOUNT_JSON
@@ -275,17 +202,16 @@ CLOUDINARY_API_SECRET
 ```
 
 For local development, copy `workers/otp/.dev.vars.example` to
-`workers/otp/.dev.vars` and populate it locally along with
-`FIREBASE_SERVICE_ACCOUNT_JSON`, `MSG91_AUTH_KEY`, `MSG91_TEMPLATE_ID`, and
-the three Cloudinary bindings. Wrangler reads `.dev.vars` when run from the
-Worker directory. The example contains names and blank placeholders only;
-`.dev.vars` and local variants are ignored by Git.
+`workers/otp/.dev.vars` and populate it locally with
+`FIREBASE_SERVICE_ACCOUNT_JSON` and the three Cloudinary bindings. Wrangler
+reads `.dev.vars` when run from the Worker directory. MSG91 settings are
+future-only and must not be treated as required. The example contains blank
+placeholders only; `.dev.vars` and local variants are ignored by Git.
 
 For production, open **Cloudflare Dashboard → Workers & Pages → vibekart-otp
 → Settings → Variables and Secrets**. Add `CLOUDINARY_CLOUD_NAME`,
-`CLOUDINARY_API_KEY`, and `CLOUDINARY_API_SECRET` as Worker secrets. Add
-`FIREBASE_SERVICE_ACCOUNT_JSON` and `MSG91_AUTH_KEY` as Worker secrets, and
-`MSG91_TEMPLATE_ID` as a non-secret Worker variable. Cloudinary's cloud name
+`CLOUDINARY_API_KEY`, and `CLOUDINARY_API_SECRET` as Worker secrets, plus
+`FIREBASE_SERVICE_ACCOUNT_JSON`. Cloudinary's cloud name
 and API key identify the account; the API secret authorizes signed uploads and
 destructive Admin API operations. Never put these values in Expo variables,
 Vercel, or source control. Do not infer live configuration from this
@@ -314,7 +240,8 @@ The Worker configuration is located at:
 workers/otp/wrangler.toml
 ```
 
-It contains the Worker name, KV binding, and non-secret configuration such as the MSG91 template ID.
+It contains the Worker name, KV binding, and non-secret configuration for
+current Worker features. MSG91 is not configured there.
 
 The KV binding name must match the binding used by the Worker source code.
 
@@ -326,67 +253,27 @@ OTP_KV
 
 ## API endpoints
 
-The Worker exposes OTP, payment, and product-management endpoints.
+The Worker exposes disabled phone-OTP routes plus payment and
+product-management endpoints.
 
-### Send OTP
+### Phone OTP (disabled)
 
 ```text
 POST /send-otp
-```
-
-Request:
-
-```json
-{
-  "phone": "9876543210"
-}
-```
-
-The Worker normalizes the number to the required Indian format.
-
-A successful request returns a response similar to:
-
-```json
-{
-  "success": true
-}
-```
-
-The actual OTP is never returned to the frontend.
-
-It is sent through MSG91 SMS.
-
-### Verify OTP
-
-```text
 POST /verify-otp
 ```
 
-Request:
+Both routes return HTTP 410 with the same response:
 
 ```json
 {
-  "phone": "9876543210",
-  "otp": "1234"
+  "error": "Phone OTP sign-in is currently unavailable. Use Google or email and password.",
+  "code": "PHONE_OTP_UNAVAILABLE"
 }
 ```
 
-If verification succeeds, the Worker returns a Firebase custom token:
-
-```json
-{
-  "success": true,
-  "token": "..."
-}
-```
-
-The Expo application then passes that token to Firebase:
-
-```text
-signInWithCustomToken()
-```
-
-The Worker does not expose the Firebase service-account credentials.
+Neither route sends an SMS, reads/writes OTP state, or creates a Firebase
+session. Do not use production SMS for testing.
 
 ## Manual UPI payments
 
@@ -515,94 +402,20 @@ the deletion rather than risking deletion of unrelated account assets.
 
 Direct client product deletion remains denied by `firestore.rules`.
 
-## OTP storage
+## Future-only OTP implementation
 
-OTP information is stored in Cloudflare KV.
+The OTP storage, cryptographic generation, abuse controls, Firebase user
+handling, and custom-token code remain in `src/` for possible future use.
+They are not part of the active route behavior: `/send-otp` and `/verify-otp`
+return the unavailable response before invoking those handlers. MSG91
+configuration is optional and unused while the feature is disabled. A future
+reactivation must include a security review and tests proving that phone
+verification cannot be bypassed.
 
-The stored information includes the information required to:
+## Expo Worker URL
 
-* verify the OTP
-* enforce expiration
-* limit verification attempts
-
-OTP data is temporary and should expire automatically.
-
-The Worker should invalidate the OTP after successful verification.
-
-## OTP generation
-
-OTP generation must use the Web Crypto API available in Cloudflare Workers.
-
-The implementation must not use:
-
-```text
-Math.random()
-```
-
-for authentication OTP generation.
-
-The OTP should be generated using a cryptographically secure random source.
-
-## Rate limiting
-
-The Worker provides basic free-tier-compatible abuse protection.
-
-The intended limits are:
-
-* OTP sends: up to 10 per IP per hour
-* OTP verification: up to 5 attempts per OTP
-
-The implementation uses Cloudflare KV for this state.
-
-This is basic application-level protection.
-
-It is not a replacement for a dedicated WAF or advanced rate-limiting system if the application grows significantly.
-
-## Firebase user handling
-
-After a valid OTP:
-
-1. The Worker checks Firebase for an existing user associated with the phone number.
-2. If the user exists, the existing Firebase Auth user is reused.
-3. If the user does not exist, the Worker creates the Firebase Auth user.
-4. The Worker checks the Firestore profile:
-
-   ```text
-   users/{uid}
-   ```
-5. If the profile does not exist, the Worker creates it.
-6. The Worker generates a Firebase custom token.
-7. The token is returned to the Expo application.
-8. The Expo application calls:
-
-   ```text
-   signInWithCustomToken()
-   ```
-
-This also handles the recovery case where a Firebase Auth user exists but the corresponding Firestore profile is missing.
-
-## Firebase custom token
-
-The Worker generates the Firebase custom token locally using the Firebase service-account private key.
-
-The token must follow Firebase's custom-token JWT requirements, including:
-
-* correct JWT header
-* RS256 signature
-* issuer
-* subject
-* audience
-* issued-at timestamp
-* expiration
-* Firebase authentication claims
-
-The private key remains inside the Cloudflare Worker secret.
-
-## Expo environment variable
-
-The Expo application needs the Worker URL.
-
-In the root Vibekart `.env`:
+The Expo application uses this URL for trusted order and image APIs (the
+variable name is retained for compatibility):
 
 ```text
 EXPO_PUBLIC_OTP_WORKER_URL=https://YOUR-WORKER-URL.workers.dev
@@ -629,64 +442,39 @@ For example:
 https://vibekart-otp.YOUR-SUBDOMAIN.workers.dev
 ```
 
-Put that URL into the root Vibekart `.env`:
+Put that URL into the root Vibekart `.env` for current Worker APIs:
 
 ```text
 EXPO_PUBLIC_OTP_WORKER_URL=https://vibekart-otp.YOUR-SUBDOMAIN.workers.dev
 ```
 
-Do not include `/send-otp` or `/verify-otp` in the environment variable.
-
-The frontend adds those paths itself.
+The URL is used for current Worker operations. Phone OTP remains disabled.
 
 ## Test the Worker
 
 Before testing through the Expo application, test the Worker endpoints directly.
 
-### Send OTP
+### Disabled phone OTP routes
 
 ```bash
-curl -X POST https://YOUR-WORKER-URL.workers.dev/send-otp \
-  -H "Content-Type: application/json" \
-  -d '{"phone":"9876543210"}'
+curl -i -X POST https://YOUR-WORKER-URL.workers.dev/send-otp
 ```
 
-A successful request should return:
+The route should return HTTP 410 and:
 
 ```json
 {
-  "success": true
+  "error": "Phone OTP sign-in is currently unavailable. Use Google or email and password.",
+  "code": "PHONE_OTP_UNAVAILABLE"
 }
 ```
-
-and an OTP SMS should be delivered to the phone.
-
-### Verify OTP
-
-Use the OTP received by SMS:
 
 ```bash
-curl -X POST https://YOUR-WORKER-URL.workers.dev/verify-otp \
-  -H "Content-Type: application/json" \
-  -d '{"phone":"9876543210","otp":"1234"}'
+curl -i -X POST https://YOUR-WORKER-URL.workers.dev/verify-otp
 ```
 
-A successful verification should return:
-
-```json
-{
-  "success": true,
-  "token": "..."
-}
-```
-
-The actual token should then be consumed by the Expo application through Firebase's:
-
-```text
-signInWithCustomToken()
-```
-
-Do not paste production Firebase custom tokens into public services, GitHub, chat, or issue trackers.
+Neither request sends SMS or performs Firebase authentication. Do not submit a
+real phone number or OTP while checking these disabled routes.
 
 ## Local type checking
 
@@ -729,22 +517,17 @@ Native Expo requests do not have the same browser CORS restrictions, but keeping
 ## Vercel configuration
 
 The Vercel project must set `EXPO_PUBLIC_OTP_WORKER_URL` to the deployed
-Cloudflare Worker URL and rebuild the web app. CORS allowlisting alone does not
-configure the app to call the Worker. Never put Worker secrets in Vercel's
-`EXPO_PUBLIC_*` variables.
+Cloudflare Worker URL for current order/image APIs and rebuild the web app.
+CORS allowlisting alone does not configure the app to call the Worker. Never
+put Worker secrets in Vercel's `EXPO_PUBLIC_*` variables.
 
 ## Troubleshooting
 
-### OTP is not received
+### Phone OTP is unavailable
 
-Check:
-
-1. MSG91 authentication key is configured.
-2. MSG91 template ID is correct.
-3. The MSG91 OTP template is approved.
-4. The phone number is valid.
-5. The MSG91 account has the required SMS configuration.
-6. Cloudflare Worker logs for the request.
+This is expected: phone OTP and MSG91 are future-only. Both endpoints return
+`PHONE_OTP_UNAVAILABLE` without sending SMS. Do not add MSG91 configuration to
+resolve this response.
 
 ### Worker returns authentication errors
 
@@ -759,23 +542,6 @@ Check:
 3. The private key is valid.
 4. The Firebase project ID is correct.
 5. The Worker has access to the required Firebase REST APIs.
-
-### Firebase custom-token sign-in fails
-
-Check:
-
-1. The custom token is generated with RS256.
-2. The service-account private key is correct.
-3. The issuer is the service-account email.
-4. The subject is the service-account email.
-5. The audience is Firebase Identity Toolkit.
-6. The token has valid `iat` and `exp` timestamps.
-7. The Firebase UID is included correctly.
-8. The Expo app is using:
-
-   ```text
-   signInWithCustomToken()
-   ```
 
 ### Expo cannot reach the Worker
 
@@ -793,11 +559,13 @@ Never commit:
 
 ```text
 FIREBASE_SERVICE_ACCOUNT_JSON
-MSG91_AUTH_KEY
 Firebase private keys
 service-account JSON files
 Cloudflare secret values
 ```
+
+`MSG91_AUTH_KEY` is also a secret if configured in the future, but is not
+required or used while phone OTP is disabled.
 
 Never place these values inside:
 
@@ -807,51 +575,13 @@ EXPO_PUBLIC_*
 
 The Expo application is client-side code and anything placed in an `EXPO_PUBLIC_*` variable should be treated as public.
 
-## Relationship with Firebase Cloud Functions
-
-The OTP Worker replaces the old Firebase Cloud Functions:
+## Current authentication and OTP status
 
 ```text
-sendOtp
-verifyOtp
+Google sign-in / email-password sign-in -> Firebase Authentication
+Guest browsing -> local app experience
+Phone OTP -> unavailable (HTTP 410; no MSG91 call)
 ```
 
-The OTP flow should not depend on Firebase Cloud Functions.
-
-Other Firebase Cloud Functions may still exist in the project for unrelated functionality. Those functions are outside the scope of this OTP Worker.
-
-## Current OTP flow summary
-
-```text
-1. User enters phone number
-        ↓
-2. Expo calls /send-otp
-        ↓
-3. Worker validates phone
-        ↓
-4. Worker generates secure OTP
-        ↓
-5. OTP stored temporarily in Cloudflare KV
-        ↓
-6. MSG91 sends SMS
-        ↓
-7. User enters OTP
-        ↓
-8. Expo calls /verify-otp
-        ↓
-9. Worker verifies OTP from KV
-        ↓
-10. Worker finds or creates Firebase Auth user
-        ↓
-11. Worker creates/repairs Firestore profile
-        ↓
-12. Worker creates Firebase custom token
-        ↓
-13. Expo receives token
-        ↓
-14. signInWithCustomToken()
-        ↓
-15. Normal Firebase Auth session
-```
-
-The Worker is intended to keep the Firebase project on the Spark plan while providing a secure server-side OTP flow through Cloudflare Workers and MSG91.
+The retained OTP/MSG91 implementation is future-only. It is not used by a
+current user-facing flow and is not needed to deploy the current Worker.

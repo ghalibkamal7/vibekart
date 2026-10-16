@@ -1,6 +1,10 @@
 FIREBASE_SERVICE_ACCOUNT_JSON=
-MSG91_AUTH_KEY=
-MSG91_TEMPLATE_ID=
 CLOUDINARY_CLOUD_NAME=
 CLOUDINARY_API_KEY=
 CLOUDINARY_API_SECRET=
+
+# Future-only phone OTP configuration. Not needed while /send-otp and
+# /verify-otp are disabled. Uncomment and configure only after authorized
+# reactivation of the OTP feature.
+# MSG91_AUTH_KEY=
+# MSG91_TEMPLATE_ID=

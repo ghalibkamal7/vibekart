@@ -29,11 +29,10 @@ import {
 
 export interface Env {
   OTP_KV: KVNamespace;
-  /** Non-secret config (wrangler.toml [vars]) — the DLT-approved MSG91
-   * template id this Worker sends the OTP through. See README.md. */
-  MSG91_TEMPLATE_ID: string;
-  /** Cloudflare Worker secret — set with `wrangler secret put MSG91_AUTH_KEY`. */
-  MSG91_AUTH_KEY: string;
+  /** Optional future-only configuration for reactivating phone OTP via MSG91. */
+  MSG91_TEMPLATE_ID?: string;
+  /** Optional future-only secret for reactivating phone OTP via MSG91. */
+  MSG91_AUTH_KEY?: string;
   /** Cloudflare Worker secret — the full Firebase service-account JSON, as
    * one string. Set with `wrangler secret put FIREBASE_SERVICE_ACCOUNT_JSON`. */
   FIREBASE_SERVICE_ACCOUNT_JSON: string;
@@ -57,6 +56,14 @@ const MAX_CLOUDINARY_REQUEST_BYTES = MAX_CLOUDINARY_UPLOAD_BYTES + 64 * 1024;
 const MAX_CLEANUP_ASSETS_PER_RUN = 25;
 const STALE_CLOUDINARY_UPLOAD_MS = 30 * 60 * 1000;
 const STALE_UNATTACHED_CLOUDINARY_ASSET_MS = 24 * 60 * 60 * 1000;
+const PHONE_OTP_UNAVAILABLE_MESSAGE = 'Phone OTP sign-in is currently unavailable. Use Google or email and password.';
+
+function phoneOtpUnavailableResponse(origin: string | null): Response {
+  return jsonResponse({
+    error: PHONE_OTP_UNAVAILABLE_MESSAGE,
+    code: 'PHONE_OTP_UNAVAILABLE',
+  }, 410, origin);
+}
 
 async function cloudinaryAssetPath(publicId: string): Promise<string> {
   return `cloudinary_assets/${await hashValue(publicId)}`;
@@ -149,6 +156,9 @@ async function readBoundedRequestBody(
 }
 
 async function handleSendOtp(request: Request, env: Env, origin: string | null): Promise<Response> {
+  if (!env.MSG91_AUTH_KEY || !env.MSG91_TEMPLATE_ID) {
+    return jsonResponse({ error: 'Phone OTP provider configuration is unavailable.' }, 503, origin);
+  }
   const ip = request.headers.get('CF-Connecting-IP') ?? 'unknown';
   const withinLimit = await checkIpRateLimit(env.OTP_KV, ip, 10, 60 * 60); // 10 sends/hour/IP
   if (!withinLimit) {
@@ -2509,8 +2519,9 @@ export default {
         return jsonResponse({ error: 'Method not allowed.' }, 405, origin);
       }
 
-      if (url.pathname === '/send-otp') return handleSendOtp(request, env, origin);
-      if (url.pathname === '/verify-otp') return handleVerifyOtp(request, env, origin);
+      if (url.pathname === '/send-otp' || url.pathname === '/verify-otp') {
+        return phoneOtpUnavailableResponse(origin);
+      }
       if (url.pathname === '/cloudinary/upload') return handleCloudinaryUpload(request, env, origin);
       if (url.pathname === '/cloudinary/cleanup') return handleCloudinaryCleanupRequest(request, env, origin);
       if (url.pathname === '/seller/products/delete') return handleDeleteProduct(request, env, origin);

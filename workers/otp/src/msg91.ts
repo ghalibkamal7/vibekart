@@ -13,8 +13,9 @@
  * hash stored in KV, never MSG91's own verify endpoint. That keeps exactly
  * one source of truth for "was this OTP correct".
  *
- * See workers/otp/README.md for how to create the template in the MSG91
- * dashboard and get its template_id (not a secret, but required config).
+ * Phone OTP is currently disabled. This provider implementation and any
+ * MSG91 credentials/template are future-only; see workers/otp/README.md
+ * before any explicit reactivation.
  */
 export async function sendOtpSms(params: {
   authKey: string;

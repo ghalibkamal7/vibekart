@@ -32,13 +32,10 @@ export type UserProfile = {
  * out a Cloud-Function-based OTP backend too (Cloud Functions need Blaze
  * to deploy at all, independent of whether they use secrets).
  *
- * So phone sign-in here (requestPhoneOtp/confirmPhoneOtp below) calls a
- * Cloudflare Worker instead (see workers/otp/) — Cloudflare's free tier —
- * which holds the MSG91 and Firebase service-account credentials, verifies
- * the OTP, and returns a Firebase custom token the same way the old Cloud
- * Function did. The OTP option is currently hidden from the login screen,
- * but all of this is intentionally kept. Email/password (signUp/signIn
- * above) and Google sign-in are the visible methods.
+ * Phone OTP and its MSG91 provider implementation are retained for future
+ * use, but the Worker currently disables both OTP endpoints. The active
+ * login methods are email/password and Google; guest browsing is also
+ * available without signing in.
  */
 
 function requireAuth() {
@@ -217,12 +214,9 @@ export async function signInWithGoogle(): Promise<void> {
   }
 }
 
-// ---------------- Phone OTP (custom, via a Cloudflare Worker) ----------------
-// See the top-of-file note for why this isn't Firebase's built-in phone auth
-// or a Cloud Function. sendOtp texts a code via MSG91 (configured in the
-// Worker); verifyOtp checks it server-side there and returns a Firebase
-// custom token, which signInWithCustomToken exchanges for a real session —
-// same onAuthStateChanged listener as email sign-in picks it up from there.
+// ---------------- Future-only phone OTP (via a Cloudflare Worker) ----------------
+// Both Worker OTP endpoints return PHONE_OTP_UNAVAILABLE and do not call MSG91.
+// Keep these client helpers for a future, explicitly authorized reactivation.
 
 const OTP_WORKER_URL = process.env.EXPO_PUBLIC_OTP_WORKER_URL ?? '';
 
@@ -250,7 +244,7 @@ export async function requestPhoneOtp(phone: string): Promise<void> {
   try {
     await callOtpWorker('/send-otp', { phone });
   } catch (error) {
-    console.warn('[auth] sendOtp (Worker) failed', error);
+    console.warn('[auth] phone OTP is unavailable', describeAuthError(error));
     throw new Error(friendlyAuthMessage(error, "We couldn't send the OTP. Please try again."));
   }
 }
@@ -260,7 +254,7 @@ export async function confirmPhoneOtp(phone: string, otp: string): Promise<void>
     const result = await callOtpWorker<{ token: string }>('/verify-otp', { phone, otp });
     await signInWithCustomToken(requireAuth(), result.token);
   } catch (error) {
-    console.warn('[auth] verifyOtp (Worker) failed', error);
+    console.warn('[auth] phone OTP is unavailable', describeAuthError(error));
     throw new Error(friendlyAuthMessage(error, "We couldn't verify that OTP. Please try again."));
   }
 }
