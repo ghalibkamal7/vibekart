@@ -3,6 +3,9 @@ main = "src/index.ts"
 compatibility_date = "2024-11-01"
 keep_vars = true
 
+[triggers]
+crons = ["*/15 * * * *"]
+
 # Created by `wrangler kv namespace create OTP_KV` — paste the printed id
 # below. This id is not a secret (it's just an identifier), but it is
 # specific to your Cloudflare account, so there's no default value here.
@@ -29,4 +32,4 @@ GPAY_ENV = "TEST"
 # - BANK_PSP_MERCHANT_ID (`wrangler secret put BANK_PSP_MERCHANT_ID`) - Acquiring bank merchant ID
 # - CLOUDINARY_CLOUD_NAME (`wrangler secret put CLOUDINARY_CLOUD_NAME`)
 # - CLOUDINARY_API_KEY (`wrangler secret put CLOUDINARY_API_KEY`)
-# - CLOUDINARY_API_SECRET (`wrangler secret put CLOUDINARY_API_SECRET`) - Server-only image deletion credential
+# - CLOUDINARY_API_SECRET (`wrangler secret put CLOUDINARY_API_SECRET`) - Server-only signed upload and cleanup credential

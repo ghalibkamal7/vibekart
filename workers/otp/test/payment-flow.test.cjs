@@ -1,7 +1,7 @@
 const assert = require('node:assert/strict');
 const { after, before, beforeEach, test } = require('node:test');
 const { execFileSync } = require('node:child_process');
-const { generateKeyPairSync } = require('node:crypto');
+const { createHash, generateKeyPairSync } = require('node:crypto');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
@@ -13,8 +13,14 @@ let worker;
 let originalFetch;
 let updateCounter = 0;
 let failNextCommitStatus = null;
+let failCommitAfterCloudinaryUpload = false;
+let mutateProductBeforeNextImageCommit = false;
+let failCloudinaryUploadRequest = false;
+let appendCleanupDuringDeleteId = null;
 let cloudinaryStatus = 200;
+let cloudinaryPartialFailureFor = null;
 let cloudinaryAssets = new Set();
+let kvValues = new Map();
 
 const privateKey = generateKeyPairSync('rsa', { modulusLength: 2048 })
   .privateKey.export({ type: 'pkcs8', format: 'pem' });
@@ -28,9 +34,9 @@ const env = {
   CLOUDINARY_API_KEY: 'test-api-key',
   CLOUDINARY_API_SECRET: 'test-api-secret',
   OTP_KV: {
-    async get() { return null; },
-    async put() {},
-    async delete() {},
+    async get(key) { return kvValues.get(key) ?? null; },
+    async put(key, value) { kvValues.set(key, value); },
+    async delete(key) { kvValues.delete(key); },
   },
 };
 
@@ -84,12 +90,35 @@ function seed(pathname, data) {
   });
 }
 
+function cloudinaryAssetRecordPath(publicId) {
+  const digest = createHash('sha256').update(publicId).digest('hex');
+  return `cloudinary_assets/${digest}`;
+}
+
+function seedCloudinaryAsset(publicId, overrides = {}) {
+  seed(cloudinaryAssetRecordPath(publicId), {
+    publicId,
+    assetType: 'product',
+    targetId: 'product-1',
+    ownerUid: 'seller-1',
+    status: 'attached',
+    secureUrl: `https://res.cloudinary.com/vibekart-test/image/upload/${publicId}`,
+    ...overrides,
+  });
+}
+
 function resetStore() {
   records.clear();
   updateCounter = 0;
   failNextCommitStatus = null;
+  failCommitAfterCloudinaryUpload = false;
+  mutateProductBeforeNextImageCommit = false;
+  failCloudinaryUploadRequest = false;
+  appendCleanupDuringDeleteId = null;
   cloudinaryStatus = 200;
+  cloudinaryPartialFailureFor = null;
   cloudinaryAssets = new Set(['vibekart/products/product-1/test-image']);
+  kvValues = new Map();
   seed('users/customer-1', { uid: 'customer-1', role: 'customer', status: 'active', phone: '+911234567890' });
   seed('users/admin-1', { uid: 'admin-1', role: 'admin', status: 'active' });
   seed('users/seller-1', { uid: 'seller-1', role: 'seller', status: 'active' });
@@ -103,23 +132,62 @@ function resetStore() {
     enabled: true,
     createdByUid: 'seller-1',
     imagePublicIds: ['vibekart/products/product-1/test-image'],
+    imageUrls: ['https://res.cloudinary.com/vibekart-test/image/upload/vibekart/products/product-1/test-image'],
   });
   seed('products/product-1/private/data', { baseCost: 700, sourceUrl: 'https://supplier.invalid/item' });
+  seedCloudinaryAsset('vibekart/products/product-1/test-image');
 }
 
 async function mockedFetch(input, init = {}) {
   const url = new URL(input);
   if (url.hostname === 'api.cloudinary.com') {
-    assert.equal(url.pathname, '/v1_1/vibekart-test/resources/image/upload');
+    if (init.method === 'POST') {
+      assert.equal(url.pathname, '/v1_1/vibekart-test/image/upload');
+      const form = init.body;
+      const publicId = form.get('public_id');
+      assert.equal(form.get('overwrite'), 'false');
+      cloudinaryAssets.add(publicId);
+      if (failCloudinaryUploadRequest) {
+        failCloudinaryUploadRequest = false;
+        failNextCommitStatus = 503;
+        throw new Error('simulated lost upload response');
+      }
+      if (failCommitAfterCloudinaryUpload) {
+        failCommitAfterCloudinaryUpload = false;
+        failNextCommitStatus = 409;
+      }
+      return response({
+        secure_url: `https://res.cloudinary.com/vibekart-test/image/upload/${publicId}`,
+        public_id: publicId,
+      });
+    }
     assert.equal(init.method, 'DELETE');
+    assert.equal(url.pathname, '/v1_1/vibekart-test/resources/image/upload');
     assert.equal(init.headers.Authorization, `Basic ${Buffer.from('test-api-key:test-api-secret').toString('base64')}`);
     assert.equal(init.headers['Content-Type'], 'application/x-www-form-urlencoded');
     const publicIds = [...new URLSearchParams(init.body).getAll('public_ids[]')];
-    assert.deepEqual(publicIds, ['vibekart/products/product-1/test-image']);
+    assert.equal(publicIds.length, 1);
+    if (appendCleanupDuringDeleteId) {
+      const appendedId = appendCleanupDuringDeleteId;
+      appendCleanupDuringDeleteId = null;
+      const originalId = publicIds[0];
+      cloudinaryAssets.add(appendedId);
+      seedCloudinaryAsset(appendedId, { status: 'cleanup_pending' });
+      const currentJob = records.get('cloudinary_cleanup_jobs/product-product-1').data;
+      seed('cloudinary_cleanup_jobs/product-product-1', {
+        ...currentJob,
+        publicIds: [...currentJob.publicIds, appendedId],
+      });
+      assert.ok(currentJob.publicIds.includes(originalId));
+    }
     if (cloudinaryStatus !== 200) return response({ error: { message: 'simulated Cloudinary failure' } }, cloudinaryStatus);
     const deleted = {};
     for (const id of publicIds) {
-      deleted[id] = cloudinaryAssets.delete(id) ? 'deleted' : 'not_found';
+      if (id === cloudinaryPartialFailureFor) {
+        deleted[id] = 'error';
+      } else {
+        deleted[id] = cloudinaryAssets.delete(id) ? 'deleted' : 'not_found';
+      }
     }
     return response({ deleted });
   }
@@ -147,11 +215,19 @@ async function mockedFetch(input, init = {}) {
 
     const writes = JSON.parse(init.body || '{}').writes || [];
     const resolved = writes.map((write) => {
-      const name = write.update?.name ?? write.delete;
+      const name = write.update?.name ?? write.delete ?? write.verify;
       const documentPath = documentPathFromName(name);
       return { write, path: documentPath, current: records.get(documentPath) };
     });
-    for (const { write, current } of resolved) {
+    if (mutateProductBeforeNextImageCommit && resolved.some(({ path: target }) => target === 'products/product-1')) {
+      mutateProductBeforeNextImageCommit = false;
+      seed('products/product-1', {
+        ...records.get('products/product-1').data,
+        description: 'Concurrent edit',
+      });
+    }
+    for (const { write, path: documentPath } of resolved) {
+      const current = records.get(documentPath);
       const precondition = write.currentDocument;
       if (precondition?.exists === false && current) return response({ error: 'already exists' }, 409);
       if (precondition?.exists === true && !current) return response({ error: 'missing document' }, 404);
@@ -160,6 +236,7 @@ async function mockedFetch(input, init = {}) {
       }
     }
     for (const { write, path: documentPath, current } of resolved) {
+      if (write.verify) continue;
       if (write.delete) {
         records.delete(documentPath);
         continue;
@@ -184,6 +261,19 @@ async function mockedFetch(input, init = {}) {
     .map(decodeURIComponent)
     .join('/');
 
+  if (
+    init.method !== 'POST' &&
+    (relativePath === 'cloudinary_cleanup_jobs' || relativePath === 'cloudinary_assets')
+  ) {
+    const documents = [...records.entries()]
+      .filter(([documentPath]) => documentPath.startsWith(`${relativePath}/`))
+      .map(([documentPath, record]) => ({
+        name: `projects/vibekart-test/databases/(default)/documents/${documentPath}`,
+        fields: encodeFields(record.data),
+      }));
+    return response({ documents });
+  }
+
   if (init.method === 'POST') {
     const body = JSON.parse(init.body || '{}');
     const documentId = url.searchParams.get('documentId');
@@ -207,6 +297,39 @@ async function call(pathname, token, body) {
       'Content-Type': 'application/json',
     },
     body: JSON.stringify(body),
+  }), env);
+  return { status: result.status, body: await result.json() };
+}
+
+async function callUpload(token, assetType = 'product', targetId = 'product-1', options = {}) {
+  const form = new FormData();
+  if (options.includeFile !== false) {
+    const bytes = options.bytes || new Uint8Array([0xff, 0xd8, 0xff, 0x00]);
+    form.append('file', new Blob([bytes], { type: options.mime || 'image/jpeg' }), 'test.jpg');
+  }
+  form.append('assetType', assetType);
+  form.append('targetId', targetId);
+  const headers = new Headers();
+  if (options.contentType) headers.set('Content-Type', options.contentType);
+  if (options.contentLength !== undefined) headers.set('Content-Length', String(options.contentLength));
+  const result = await worker.fetch(new Request('https://worker.test/cloudinary/upload', {
+    method: 'POST',
+    headers: new Headers({ Authorization: `Bearer ${token}`, ...Object.fromEntries(headers.entries()) }),
+    body: form,
+  }), env);
+  return { status: result.status, body: await result.json() };
+}
+
+async function callRawUpload(token, body, contentType, contentLength) {
+  const headers = new Headers({
+    Authorization: `Bearer ${token}`,
+    'Content-Type': contentType,
+  });
+  if (contentLength !== undefined) headers.set('Content-Length', String(contentLength));
+  const result = await worker.fetch(new Request('https://worker.test/cloudinary/upload', {
+    method: 'POST',
+    headers,
+    body,
   }), env);
   return { status: result.status, body: await result.json() };
 }
@@ -406,7 +529,7 @@ test('manual UPI order creation fails closed when payment is disabled or merchan
   assert.equal([...records.keys()].filter((key) => key.startsWith('orders/')).length, 0);
 });
 
-test('product deletion requires an authorized owner and removes stored images and product documents', async () => {
+test('product deletion requires an authorized owner and queues verified images for cleanup', async () => {
   const forbidden = await call('/seller/products/delete', 'customer-token', { productId: 'product-1' });
   assert.equal(forbidden.status, 403);
   const anotherSeller = await call('/seller/products/delete', 'seller-2-token', { productId: 'product-1' });
@@ -417,6 +540,9 @@ test('product deletion requires an authorized owner and removes stored images an
   assert.equal(deleted.status, 200);
   assert.equal(records.has('products/product-1'), false);
   assert.equal(records.has('products/product-1/private/data'), false);
+  assert.equal(deleted.body.cleanupPending, false);
+  assert.equal(cloudinaryAssets.has('vibekart/products/product-1/test-image'), false);
+  assert.equal(records.has('cloudinary_cleanup_jobs/product-product-1'), false);
 });
 
 test('an administrator can delete a legacy product without an owner UID', async () => {
@@ -426,38 +552,381 @@ test('an administrator can delete a legacy product without an owner UID', async 
   assert.equal(records.has('products/legacy-product'), false);
 });
 
-test('product deletion fails closed when Cloudinary credentials are missing', async () => {
+test('legacy image IDs remain usable but cannot be deleted without trusted ownership', async () => {
+  const legacyId = 'vibekart/products/legacy-product/old-image';
+  seed('products/legacy-product', {
+    name: 'Legacy',
+    createdByUid: 'seller-1',
+    imageUrls: [`https://res.cloudinary.com/vibekart-test/image/upload/${legacyId}`],
+    imagePublicIds: [legacyId],
+  });
+  const retained = await call('/seller/products/images', 'seller-token', {
+    productId: 'legacy-product',
+    imageUrls: [`https://res.cloudinary.com/vibekart-test/image/upload/${legacyId}`],
+    imagePublicIds: [legacyId],
+  });
+  assert.equal(retained.status, 200);
+  const deleted = await call('/seller/products/delete', 'seller-token', { productId: 'legacy-product' });
+  assert.equal(deleted.status, 409);
+  assert.equal(records.has('products/legacy-product'), true);
+  assert.equal(cloudinaryAssets.has(legacyId), false);
+});
+
+test('product deletion rejects a client-injected asset belonging to another target', async () => {
+  const foreignId = 'vibekart/products/product-2/other-owner-image';
+  seedCloudinaryAsset(foreignId, { targetId: 'product-2', ownerUid: 'seller-2' });
+  seed('products/product-1', {
+    ...records.get('products/product-1').data,
+    imagePublicIds: [foreignId],
+    imageUrls: [`https://res.cloudinary.com/vibekart-test/image/upload/${foreignId}`],
+  });
+  cloudinaryAssets.add(foreignId);
+  const result = await call('/seller/products/delete', 'seller-token', { productId: 'product-1' });
+  assert.equal(result.status, 409);
+  assert.equal(records.has('products/product-1'), true);
+  assert.equal(cloudinaryAssets.has(foreignId), true);
+});
+
+test('unauthorized callers cannot upload product images', async () => {
+  const result = await callUpload('customer-token');
+  assert.equal(result.status, 403);
+  assert.equal([...records.keys()].filter((key) => key.startsWith('cloudinary_assets/')).length, 1);
+});
+
+test('upload body size is rejected before multipart parsing', async () => {
+  const maxBody = 10 * 1024 * 1024 + 64 * 1024;
+  const declaredOversize = await callRawUpload(
+    'seller-token',
+    new Uint8Array(),
+    'multipart/form-data; boundary=x',
+    maxBody + 1,
+  );
+  assert.equal(declaredOversize.status, 413);
+  const actualOversize = await callRawUpload(
+    'seller-token',
+    new Uint8Array(maxBody + 1),
+    'multipart/form-data; boundary=x',
+  );
+  assert.equal(actualOversize.status, 413);
+  assert.equal(cloudinaryAssets.size, 1);
+});
+
+test('malformed multipart and missing file requests are rejected', async () => {
+  const malformed = await callRawUpload('seller-token', 'not multipart', 'multipart/form-data; boundary=x');
+  assert.equal(malformed.status, 400);
+
+  const missingFile = await callUpload('seller-token', 'product', 'product-1', { includeFile: false });
+  assert.equal(missingFile.status, 400);
+});
+
+test('image formats are detected from bytes, not the multipart MIME label', async () => {
+  const fixtures = [
+    { mime: 'image/png', bytes: new Uint8Array([0xff, 0xd8, 0xff, 0x00]) },
+    { mime: 'image/jpeg', bytes: new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]) },
+    { mime: 'application/octet-stream', bytes: new Uint8Array([0x52, 0x49, 0x46, 0x46, 0x00, 0x00, 0x00, 0x00, 0x57, 0x45, 0x42, 0x50]) },
+    { mime: 'image/jpeg', bytes: new Uint8Array([0x00, 0x00, 0x00, 0x18, 0x66, 0x74, 0x79, 0x70, 0x61, 0x76, 0x69, 0x66]) },
+  ];
+  for (const fixture of fixtures) {
+    const result = await callUpload('seller-token', 'product', 'product-1', fixture);
+    assert.equal(result.status, 201);
+  }
+});
+
+test('spoofed MIME labels cannot make unsupported file bytes upload', async () => {
+  const result = await callUpload('seller-token', 'product', 'product-1', {
+    mime: 'image/jpeg',
+    bytes: new TextEncoder().encode('<svg onload=alert(1)>'),
+  });
+  assert.equal(result.status, 415);
+  assert.equal(cloudinaryAssets.size, 1);
+});
+
+test('Cloudinary uploads are throttled by authenticated account using shared KV', async () => {
+  kvValues.set('ratelimit:cloudinary:seller-1', '30');
+  const result = await callUpload('seller-token');
+  assert.equal(result.status, 429);
+  assert.equal(cloudinaryAssets.size, 1);
+});
+
+test('missing Cloudinary bindings return an actionable error without exposing values', async () => {
   const secret = env.CLOUDINARY_API_SECRET;
   env.CLOUDINARY_API_SECRET = undefined;
   try {
-    const result = await call('/seller/products/delete', 'seller-token', { productId: 'product-1' });
+    const result = await callUpload('seller-token');
     assert.equal(result.status, 503);
-    assert.equal(records.has('products/product-1'), true);
+    assert.match(result.body.error, /CLOUDINARY_CLOUD_NAME.*CLOUDINARY_API_KEY.*CLOUDINARY_API_SECRET/);
+    assert.equal(JSON.stringify(result.body).includes('test-api-key'), false);
+    assert.equal(JSON.stringify(result.body).includes('test-api-secret'), false);
   } finally {
     env.CLOUDINARY_API_SECRET = secret;
   }
 });
 
-test('failed image deletion preserves product documents so deletion can be retried', async () => {
+test('an uploaded image with failed ownership finalization is durably queued and cleaned on retry', async () => {
+  failCommitAfterCloudinaryUpload = true;
+  const upload = await callUpload('seller-token');
+  assert.equal(upload.status, 502);
+  assert.match(upload.body.error, /cleanup is queued/i);
+
+  const job = records.get('cloudinary_cleanup_jobs/product-product-1');
+  assert.ok(job);
+  assert.equal(job.data.publicIds.length, 1);
+  const [publicId] = job.data.publicIds;
+  assert.equal(cloudinaryAssets.has(publicId), true);
+  assert.equal(records.get(cloudinaryAssetRecordPath(publicId)).data.status, 'cleanup_pending');
+
+  const retry = await call('/cloudinary/cleanup', 'seller-token', {
+    assetType: 'product',
+    targetId: 'product-1',
+  });
+  assert.equal(retry.status, 200);
+  assert.equal(retry.body.cleanupPending, false);
+  assert.equal(cloudinaryAssets.has(publicId), false);
+  assert.equal(records.has(cloudinaryAssetRecordPath(publicId)), false);
+});
+
+test('a product metadata-write failure queues and cleans a successfully uploaded unreferenced image', async () => {
+  const upload = await callUpload('seller-token');
+  assert.equal(upload.status, 201);
+  const publicId = upload.body.publicId;
+  const oldId = 'vibekart/products/product-1/test-image';
+  failNextCommitStatus = 409;
+  const save = await call('/seller/products/images', 'seller-token', {
+    productId: 'product-1',
+    imageUrls: [
+      `https://res.cloudinary.com/vibekart-test/image/upload/${oldId}`,
+      upload.body.url,
+    ],
+    imagePublicIds: [oldId, publicId],
+  });
+  assert.equal(save.status, 409);
+  assert.match(save.body.error, /queued for cleanup retry/i);
+  assert.deepEqual(records.get('products/product-1').data.imagePublicIds, [oldId]);
+  assert.equal(cloudinaryAssets.has(publicId), true);
+  assert.equal(cloudinaryAssets.has(oldId), true);
+  assert.equal(records.has('cloudinary_cleanup_jobs/product-product-1'), true);
+  const cleanup = await call('/cloudinary/cleanup', 'seller-token', {
+    assetType: 'product',
+    targetId: 'product-1',
+    publicIds: [publicId],
+  });
+  assert.equal(cleanup.status, 200);
+  assert.equal(cleanup.body.cleanupPending, false);
+  assert.equal(cloudinaryAssets.has(publicId), false);
+});
+
+test('product image editing atomically detaches and cleans removed images', async () => {
+  const result = await call('/seller/products/images', 'seller-token', {
+    productId: 'product-1',
+    imageUrls: [],
+    imagePublicIds: [],
+    removedPublicIds: ['vibekart/products/product-1/test-image'],
+  });
+  assert.equal(result.status, 200);
+  assert.equal(result.body.cleanupPending, false);
+  assert.deepEqual(records.get('products/product-1').data.imagePublicIds, []);
+  assert.equal(cloudinaryAssets.has('vibekart/products/product-1/test-image'), false);
+});
+
+test('product image updates reject foreign ownership IDs and preserve both assets', async () => {
+  const foreignId = 'vibekart/products/product-2/other-owner-image';
+  seedCloudinaryAsset(foreignId, { targetId: 'product-2', ownerUid: 'seller-2' });
+  cloudinaryAssets.add(foreignId);
+  const result = await call('/seller/products/images', 'seller-token', {
+    productId: 'product-1',
+    imageUrls: [`https://res.cloudinary.com/vibekart-test/image/upload/${foreignId}`],
+    imagePublicIds: [foreignId],
+  });
+  assert.equal(result.status, 409);
+  assert.deepEqual(records.get('products/product-1').data.imagePublicIds, ['vibekart/products/product-1/test-image']);
+  assert.equal(cloudinaryAssets.has(foreignId), true);
+  assert.equal(cloudinaryAssets.has('vibekart/products/product-1/test-image'), true);
+});
+
+test('concurrent product changes prevent stale image cleanup from deleting a referenced image', async () => {
+  mutateProductBeforeNextImageCommit = true;
+  const result = await call('/seller/products/images', 'seller-token', {
+    productId: 'product-1',
+    imageUrls: [],
+    imagePublicIds: [],
+    removedPublicIds: ['vibekart/products/product-1/test-image'],
+  });
+  assert.equal(result.status, 409);
+  assert.equal(cloudinaryAssets.has('vibekart/products/product-1/test-image'), true);
+  assert.equal(records.has('cloudinary_cleanup_jobs/product-product-1'), false);
+});
+
+test('partial Cloudinary deletion stays queued and succeeds on retry', async () => {
+  cloudinaryPartialFailureFor = 'vibekart/products/product-1/test-image';
+  const deleted = await call('/seller/products/delete', 'seller-token', { productId: 'product-1' });
+  assert.equal(deleted.status, 200);
+  assert.equal(deleted.body.cleanupPending, true);
+  assert.equal(records.has('cloudinary_cleanup_jobs/product-product-1'), true);
+  assert.equal(records.has(cloudinaryAssetRecordPath('vibekart/products/product-1/test-image')), true);
+  cloudinaryPartialFailureFor = null;
+  const retry = await call('/seller/products/delete', 'seller-token', { productId: 'product-1' });
+  assert.equal(retry.status, 200);
+  assert.equal(retry.body.cleanupPending, false);
+  assert.equal(cloudinaryAssets.has('vibekart/products/product-1/test-image'), false);
+});
+
+test('payment QR replacement and clearing queue cleanup for the previous owned image', async () => {
+  const oldId = 'vibekart/payment/old-qr';
+  const newId = 'vibekart/payment/new-qr';
+  seed('settings/payment', {
+    enabled: true,
+    merchantVpa: 'vibekart@upi',
+    qrImageUrl: `https://res.cloudinary.com/vibekart-test/image/upload/${oldId}`,
+    qrImagePublicId: oldId,
+  });
+  seedCloudinaryAsset(oldId, {
+    assetType: 'payment-qr',
+    targetId: 'settings/payment',
+    ownerUid: 'admin-1',
+  });
+  seedCloudinaryAsset(newId, {
+    assetType: 'payment-qr',
+    targetId: 'settings/payment',
+    ownerUid: 'admin-1',
+    status: 'uploaded',
+  });
+  cloudinaryAssets.add(oldId);
+  cloudinaryAssets.add(newId);
+
+  const replace = await call('/admin/payment-settings/qr-image', 'admin-token', {
+    imageUrl: `https://res.cloudinary.com/vibekart-test/image/upload/${newId}`,
+    imagePublicId: newId,
+  });
+  assert.equal(replace.status, 200);
+  assert.equal(records.get('settings/payment').data.qrImagePublicId, newId);
+  assert.equal(cloudinaryAssets.has(oldId), false);
+
+  const clear = await call('/admin/payment-settings/qr-image', 'admin-token', {
+    imageUrl: '',
+    imagePublicId: '',
+  });
+  assert.equal(clear.status, 200);
+  assert.equal(records.get('settings/payment').data.qrImagePublicId, '');
+  assert.equal(cloudinaryAssets.has(newId), false);
+});
+
+test('missing Cloudinary credentials leave deletion durable and report cleanup pending', async () => {
+  const secret = env.CLOUDINARY_API_SECRET;
+  env.CLOUDINARY_API_SECRET = undefined;
+  try {
+    const result = await call('/seller/products/delete', 'seller-token', { productId: 'product-1' });
+    assert.equal(result.status, 200);
+    assert.equal(result.body.cleanupPending, true);
+    assert.equal(records.has('products/product-1'), false);
+    assert.equal(records.has('cloudinary_cleanup_jobs/product-product-1'), true);
+  } finally {
+    env.CLOUDINARY_API_SECRET = secret;
+  }
+});
+
+test('failed image deletion leaves a durable cleanup job for retry', async () => {
   cloudinaryStatus = 503;
   const failed = await call('/seller/products/delete', 'seller-token', { productId: 'product-1' });
-  assert.equal(failed.status, 502);
-  assert.equal(records.has('products/product-1'), true);
-  assert.equal(records.has('products/product-1/private/data'), true);
+  assert.equal(failed.status, 200);
+  assert.equal(failed.body.cleanupPending, true);
+  assert.equal(records.has('products/product-1'), false);
+  assert.equal(records.has('products/product-1/private/data'), false);
+  assert.equal(records.has('cloudinary_cleanup_jobs/product-product-1'), true);
 
   cloudinaryStatus = 200;
   const retry = await call('/seller/products/delete', 'seller-token', { productId: 'product-1' });
   assert.equal(retry.status, 200);
-  assert.equal(records.has('products/product-1'), false);
+  assert.equal(retry.body.cleanupPending, false);
+  assert.equal(records.has('cloudinary_cleanup_jobs/product-product-1'), false);
 });
 
-test('product documents remain intact when the Firestore delete fails after Cloudinary cleanup', async () => {
+test('scheduled cleanup retries pending Cloudinary deletion jobs', async () => {
+  cloudinaryStatus = 503;
+  const deleted = await call('/seller/products/delete', 'seller-token', { productId: 'product-1' });
+  assert.equal(deleted.status, 200);
+  assert.equal(deleted.body.cleanupPending, true);
+
+  cloudinaryStatus = 200;
+  let scheduledTask;
+  await worker.scheduled({}, env, { waitUntil(task) { scheduledTask = task; } });
+  await scheduledTask;
+  assert.equal(records.has('cloudinary_cleanup_jobs/product-product-1'), false);
+  assert.equal(cloudinaryAssets.has('vibekart/products/product-1/test-image'), false);
+});
+
+test('concurrent cleanup-job additions are preserved and cleaned on a later retry', async () => {
+  appendCleanupDuringDeleteId = 'vibekart/products/product-1/concurrent-image';
+  const deleted = await call('/seller/products/delete', 'seller-token', { productId: 'product-1' });
+  assert.equal(deleted.status, 200);
+  assert.equal(deleted.body.cleanupPending, true);
+  const job = records.get('cloudinary_cleanup_jobs/product-product-1');
+  assert.deepEqual(job.data.publicIds, [
+    'vibekart/products/product-1/test-image',
+    'vibekart/products/product-1/concurrent-image',
+  ]);
+  assert.equal(cloudinaryAssets.has('vibekart/products/product-1/concurrent-image'), true);
+
+  const retry = await call('/seller/products/delete', 'seller-token', { productId: 'product-1' });
+  assert.equal(retry.status, 200);
+  assert.equal(retry.body.cleanupPending, false);
+  assert.equal(cloudinaryAssets.has('vibekart/products/product-1/concurrent-image'), false);
+  assert.equal(records.has('cloudinary_cleanup_jobs/product-product-1'), false);
+});
+
+test('failed cleanup-job persistence is reported and stale uncertain uploads are recovered', async () => {
+  failCloudinaryUploadRequest = true;
+  const upload = await callUpload('seller-token');
+  assert.equal(upload.status, 502);
+  assert.match(upload.body.error, /cleanup could not be recorded/i);
+  const staleAssetEntry = [...records.entries()].find(([key, value]) =>
+    key.startsWith('cloudinary_assets/') && value.data.status === 'uploading');
+  assert.ok(staleAssetEntry);
+  const [staleAssetPath, staleAsset] = staleAssetEntry;
+  const publicId = staleAsset.data.publicId;
+  seed(staleAssetPath, {
+    ...staleAsset.data,
+    createdAt: new Date(Date.now() - 31 * 60 * 1000).toISOString(),
+  });
+  assert.equal(cloudinaryAssets.has(publicId), true);
+
+  let scheduledTask;
+  await worker.scheduled({}, env, { waitUntil(task) { scheduledTask = task; } });
+  await scheduledTask;
+  assert.equal(cloudinaryAssets.has(publicId), false);
+  assert.equal(records.has(staleAssetPath), false);
+  assert.equal(records.has('cloudinary_cleanup_jobs/product-product-1'), false);
+});
+
+test('stale-upload recovery will not delete an asset referenced by product metadata', async () => {
+  const publicId = 'vibekart/products/product-1/referenced-stale-upload';
+  seed('products/product-1', {
+    ...records.get('products/product-1').data,
+    imagePublicIds: [publicId],
+    imageUrls: [`https://res.cloudinary.com/vibekart-test/image/upload/${publicId}`],
+  });
+  const assetPath = cloudinaryAssetRecordPath(publicId);
+  seedCloudinaryAsset(publicId, {
+    status: 'uploading',
+    createdAt: new Date(Date.now() - 31 * 60 * 1000).toISOString(),
+  });
+  cloudinaryAssets.add(publicId);
+
+  let scheduledTask;
+  await worker.scheduled({}, env, { waitUntil(task) { scheduledTask = task; } });
+  await scheduledTask;
+  assert.equal(cloudinaryAssets.has(publicId), true);
+  assert.equal(records.get(assetPath).data.status, 'uploading');
+  assert.equal(records.has('cloudinary_cleanup_jobs/product-product-1'), false);
+});
+
+test('failed atomic product deletion does not delete or queue the referenced image', async () => {
   failNextCommitStatus = 409;
   const failed = await call('/seller/products/delete', 'seller-token', { productId: 'product-1' });
   assert.equal(failed.status, 409);
-  assert.match(failed.body.error, /Images were deleted/i);
+  assert.match(failed.body.error, /changed/i);
   assert.equal(records.has('products/product-1'), true);
   assert.equal(records.has('products/product-1/private/data'), true);
+  assert.equal(cloudinaryAssets.has('vibekart/products/product-1/test-image'), true);
 
   const retry = await call('/seller/products/delete', 'seller-token', { productId: 'product-1' });
   assert.equal(retry.status, 200);
@@ -520,9 +989,34 @@ test('only an active admin can confirm a payment; confirmation is atomic and ide
   assert.equal(records.get(`orders/${confirmed.body.orderId}`).data.deliveryMaxDays, 9);
   assert.equal(records.get(`orders/${confirmed.body.orderId}`).data.total, 2545);
   assert.equal(records.get(`payment_attempts/${attemptId}`).data.status, 'Paid');
+  const paymentAudits = [...records.entries()].filter(([key, value]) =>
+    key.startsWith('audit_logs/') && value.data.paymentReviewTargetType === 'payment_attempt');
+  assert.equal(paymentAudits.length, 1);
+  assert.equal(paymentAudits[0][1].data.action, 'Confirm Payment Attempt');
+  assert.equal(paymentAudits[0][1].data.paymentReviewAction, 'Confirmed');
+  assert.equal(paymentAudits[0][1].data.targetId, attemptId);
   const sharedClaim = `payment_reference_claims/ref-${encodeURIComponent('REFERENCE-ABC')}`;
   assert.equal(records.get(sharedClaim).data.orderId, confirmed.body.orderId);
   assert.equal([...records.keys()].filter((key) => key.startsWith('orders/') && !key.includes('/private/')).length, 1);
+});
+
+test('payment attempt review audit is atomic with confirmation', async () => {
+  const created = await createAttempt('atomic-review-audit');
+  const attemptId = created.body.attempt.id;
+  await call('/payment-attempts/submit', 'customer-token', {
+    attemptId,
+    customerUtr: 'atomic-review-reference',
+  });
+  failNextCommitStatus = 503;
+  const failed = await call('/admin/payment-attempts/confirm', 'admin-token', {
+    attemptId,
+    actualCreditConfirmed: true,
+  });
+  assert.equal(failed.status, 409);
+  assert.equal(records.get(`payment_attempts/${attemptId}`).data.status, 'Submitted');
+  assert.equal(records.has(`orders/ord-${attemptId.slice(4)}`), false);
+  assert.equal([...records.entries()].some(([key, value]) =>
+    key.startsWith('audit_logs/') && value.data.targetId === attemptId), false);
 });
 
 test('confirmation requires submitted details and rejects a reused transaction reference', async () => {
@@ -594,6 +1088,10 @@ test('expired attempts remain submittable until manually expired after review', 
   });
   assert.equal(expired.status, 200);
   assert.equal(records.get(`payment_attempts/${attemptId}`).data.status, 'Expired');
+  const audits = [...records.entries()].filter(([key, value]) =>
+    key.startsWith('audit_logs/') && value.data.paymentReviewTargetType === 'payment_attempt');
+  assert.equal(audits.length, 1);
+  assert.equal(audits[0][1].data.paymentReviewAction, 'Expired');
   assert.equal([...records.keys()].filter((key) => key.startsWith('orders/')).length, 0);
 });
 
@@ -608,6 +1106,10 @@ test('rejected attempts and failed Firestore writes do not create fulfillable or
   });
   assert.equal(rejected.status, 200);
   assert.equal(records.get(`payment_attempts/${attemptId}`).data.status, 'Rejected');
+  const audits = [...records.entries()].filter(([key, value]) =>
+    key.startsWith('audit_logs/') && value.data.paymentReviewTargetType === 'payment_attempt');
+  assert.equal(audits.length, 1);
+  assert.equal(audits[0][1].data.paymentReviewAction, 'Rejected');
   assert.equal([...records.keys()].filter((key) => key.startsWith('orders/')).length, 0);
 
   failNextCommitStatus = 403;

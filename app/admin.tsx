@@ -1,7 +1,7 @@
 import { Feather } from '@expo/vector-icons';
 import * as ImagePicker from 'expo-image-picker';
 import { router } from 'expo-router';
-import React, { useMemo, useState } from 'react';
+import React, { useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Image,
@@ -41,7 +41,10 @@ import { useColors } from '@/hooks/useColors';
 import { confirmPlatformAction, showPlatformAlert } from '@/utils/platformDialogs';
 import { useStore } from '@/context/StoreContext';
 import { fetchSellerOrderPrivateData } from '@/services/firebase/firestore';
-import { uploadImageToCloudinary } from '@/services/cloudinary/upload';
+import {
+  cleanupCloudinaryAssetsViaWorker,
+  uploadImageToCloudinary,
+} from '@/services/cloudinary/upload';
 
 type AdminTab = 'dashboard' | 'products' | 'categories' | 'orders' | 'pendingPayments' | 'users' | 'payments' | 'settings';
 
@@ -125,6 +128,17 @@ export default function AdminScreen() {
   const [savingPayment, setSavingPayment] = useState(false);
   const [paymentSuccess, setPaymentSuccess] = useState(false);
   const [uploadingQr, setUploadingQr] = useState(false);
+  const pendingQrUploadsRef = useRef<string[]>([]);
+
+  React.useEffect(() => () => {
+    const pendingIds = [...pendingQrUploadsRef.current];
+    if (isCloudMode && pendingIds.length) {
+      void cleanupCloudinaryAssetsViaWorker(
+        { type: 'payment-qr', targetId: 'settings/payment' },
+        pendingIds,
+      ).catch((error) => console.warn('[cloudinary] pending QR cleanup will be retried by the Worker', error));
+    }
+  }, [isCloudMode]);
 
   // Sync settingsForm when storeSettings changes
   React.useEffect(() => {
@@ -308,9 +322,14 @@ export default function AdminScreen() {
       async () => {
         if (deletingProductId) return;
         try {
-          await deleteProduct(p.id);
+          const cleanupPending = await deleteProduct(p.id);
           await logAdminActivity('Delete Product', `Deleted product "${p.name}" (${p.id})`, p.id);
-          showPlatformAlert('Product deleted', `"${p.name}" and its stored images were removed.`);
+          showPlatformAlert(
+            'Product deleted',
+            cleanupPending
+              ? `"${p.name}" was deleted. Image cleanup is safely queued for Worker retry.`
+              : `"${p.name}" and its verified stored images were removed.`,
+          );
         } catch (err: any) {
           showPlatformAlert('Error', err?.message || 'Failed to delete product.');
         }
@@ -382,9 +401,21 @@ export default function AdminScreen() {
     setPaymentSuccess(false);
     try {
       await updatePaymentSettings(paymentForm);
+      pendingQrUploadsRef.current = [];
       setPaymentSuccess(true);
       setTimeout(() => setPaymentSuccess(false), 3000);
     } catch (err: any) {
+      if (isCloudMode && paymentForm.qrImagePublicId && pendingQrUploadsRef.current.includes(paymentForm.qrImagePublicId)) {
+        try {
+          await cleanupCloudinaryAssetsViaWorker(
+            { type: 'payment-qr', targetId: 'settings/payment' },
+            [paymentForm.qrImagePublicId],
+          );
+          pendingQrUploadsRef.current = pendingQrUploadsRef.current.filter((id) => id !== paymentForm.qrImagePublicId);
+        } catch {
+          // Retain the pending ID; the Worker cleanup job is retryable and protects referenced images.
+        }
+      }
       showPlatformAlert('Error', err?.message || 'Failed to save payment settings.');
     } finally {
       setSavingPayment(false);
@@ -402,7 +433,25 @@ export default function AdminScreen() {
       });
       if (!res.canceled && res.assets?.[0]?.uri) {
         setUploadingQr(true);
-        const uploadResult = await uploadImageToCloudinary(res.assets[0].uri, 'vibekart/payment');
+        if (!isCloudMode) throw new Error('Sign in to the configured Cloudflare Worker before uploading the payment QR image.');
+        const uploadResult = await uploadImageToCloudinary(
+          res.assets[0].uri,
+          { type: 'payment-qr', targetId: 'settings/payment' },
+        );
+        const priorPendingIds = [...pendingQrUploadsRef.current];
+        pendingQrUploadsRef.current = [...new Set([...priorPendingIds, uploadResult.publicId])];
+        const priorIdsToClean = priorPendingIds.filter((publicId) => publicId !== uploadResult.publicId);
+        if (priorIdsToClean.length) {
+          try {
+            await cleanupCloudinaryAssetsViaWorker(
+              { type: 'payment-qr', targetId: 'settings/payment' },
+              priorIdsToClean,
+            );
+            pendingQrUploadsRef.current = pendingQrUploadsRef.current.filter((id) => !priorIdsToClean.includes(id));
+          } catch {
+            // The Worker retains a cleanup job for uploaded images not yet saved in settings.
+          }
+        }
         setPaymentForm((prev) => ({
           ...prev,
           qrImageUrl: uploadResult.url,
@@ -425,16 +474,7 @@ export default function AdminScreen() {
         setReviewingPaymentId(attempt.id);
         try {
           await verifyPaymentAttempt(attempt.id);
-          const auditError = await savePaymentReviewAudit(
-            'Confirm Payment',
-            `Verified payment attempt ${attempt.id}`,
-            attempt.id,
-          );
-          showPaymentReviewOutcome(
-            'Payment confirmed',
-            'A paid order is now available in Orders and fulfillment.',
-            auditError,
-          );
+          showPlatformAlert('Payment confirmed', 'A paid order is now available in Orders and fulfillment.');
         } catch (err) {
           showPlatformAlert('Verification failed', err instanceof Error ? err.message : 'Could not confirm payment.');
         } finally {
@@ -459,8 +499,7 @@ export default function AdminScreen() {
         setReviewingPaymentId(attempt.id);
         try {
           await reviewPaymentAttempt(action, attempt.id, reason);
-          const auditError = await savePaymentReviewAudit(label, `${label} ${attempt.id}: ${reason}`, attempt.id);
-          showPaymentReviewOutcome(`${label} complete`, `Payment attempt ${attempt.id} was updated.`, auditError);
+          showPlatformAlert(`${label} complete`, `Payment attempt ${attempt.id} was updated.`);
         } catch (err) {
           showPlatformAlert('Update failed', err instanceof Error ? err.message : 'Could not update payment attempt.');
         } finally {
@@ -468,22 +507,6 @@ export default function AdminScreen() {
         }
       },
       true,
-    );
-  };
-
-  const savePaymentReviewAudit = async (action: string, details: string, targetId: string) => {
-    try {
-      await logAdminActivity(action, details, targetId);
-      return null;
-    } catch (error) {
-      return error instanceof Error ? error.message : 'Unknown audit logging error.';
-    }
-  };
-
-  const showPaymentReviewOutcome = (title: string, message: string, auditError: string | null) => {
-    showPlatformAlert(
-      auditError ? `${title} — audit log failed` : title,
-      auditError ? `${message}\n\nThe payment action succeeded, but its audit entry could not be saved: ${auditError}` : message,
     );
   };
 

@@ -16,7 +16,12 @@ import {
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { MAX_PRODUCT_IMAGES } from '@/constants/config';
 import { computeDisplayPrice, formatPrice, MarkupType, NewProductInput } from '@/data/store';
-import { isCloudinaryConfigured, uploadImageToCloudinary } from '@/services/cloudinary/upload';
+import {
+  cleanupCloudinaryAssetsViaWorker,
+  isCloudinaryConfigured,
+  updateProductImagesViaWorker,
+  uploadImageToCloudinary,
+} from '@/services/cloudinary/upload';
 import { useColors } from '@/hooks/useColors';
 import { useStore } from '@/context/StoreContext';
 import { showPlatformAlert } from '@/utils/platformDialogs';
@@ -24,6 +29,7 @@ import { showPlatformAlert } from '@/utils/platformDialogs';
 type ImageSlot = {
   id: string;
   uri: string; // local file uri (new picks) or remote URL (already uploaded)
+  uploadUri?: string;
   publicId?: string; // set once uploaded to Cloudinary
   status: 'new' | 'uploading' | 'done' | 'error';
   progress: number;
@@ -39,6 +45,7 @@ export default function SellerAddProductScreen() {
   const { id } = useLocalSearchParams<{ id?: string }>();
   const { products, categories, addProduct, updateProduct, isCloudMode } = useStore();
   const editing = useMemo(() => products.find((p) => p.id === id), [id, products]);
+  const [savedProductId, setSavedProductId] = useState<string | null>(id ?? null);
 
   const [images, setImages] = useState<ImageSlot[]>(() => {
     if (editing?.imageUrls?.length) {
@@ -154,13 +161,22 @@ export default function SellerAddProductScreen() {
   const [isUploadingAll, setIsUploadingAll] = useState(false);
 
   const retryImage = async (slot: ImageSlot, targetId?: string) => {
-    const folderId = targetId || editing?.id || 'new';
+    const productId = targetId || editing?.id || savedProductId;
+    if (!productId) {
+      showPlatformAlert('Save product first', 'Save the product details before uploading its images.');
+      return;
+    }
     setImages((current) => current.map((s) => (s.id === slot.id ? { ...s, status: 'uploading', progress: 0, error: undefined } : s)));
     try {
-      const { url, publicId } = await uploadImageToCloudinary(slot.uri, `vibekart/products/${folderId}`, (progress) =>
+      const { url, publicId } = await uploadImageToCloudinary(
+        slot.uploadUri || slot.uri,
+        { type: 'product', targetId: productId },
+        (progress) =>
         setImages((current) => current.map((s) => (s.id === slot.id ? { ...s, progress } : s))),
       );
-      setImages((current) => current.map((s) => (s.id === slot.id ? { ...s, uri: url, publicId, status: 'done', progress: 100 } : s)));
+      setImages((current) => current.map((s) => (s.id === slot.id
+        ? { ...s, uri: url, uploadUri: slot.uploadUri || slot.uri, publicId, status: 'done', progress: 100 }
+        : s)));
     } catch (error) {
       const msg = error instanceof Error ? error.message : 'Upload failed';
       setImages((current) =>
@@ -177,10 +193,15 @@ export default function SellerAddProductScreen() {
       if (slot.status === 'done') continue;
       setImages((prev) => prev.map((s) => (s.id === slot.id ? { ...s, status: 'uploading', progress: 0 } : s)));
       try {
-        const { url, publicId } = await uploadImageToCloudinary(slot.uri, `vibekart/products/${folderId}`, (progress) =>
+        const { url, publicId } = await uploadImageToCloudinary(
+          slot.uploadUri || slot.uri,
+          { type: 'product', targetId: folderId },
+          (progress) =>
           setImages((prev) => prev.map((s) => (s.id === slot.id ? { ...s, progress } : s))),
         );
-        current = current.map((s) => (s.id === slot.id ? { ...s, uri: url, publicId, status: 'done' as const, progress: 100 } : s));
+        current = current.map((s) => (s.id === slot.id
+          ? { ...s, uri: url, uploadUri: slot.uploadUri || slot.uri, publicId, status: 'done' as const, progress: 100 }
+          : s));
         setImages(current);
       } catch (error) {
         const msg = error instanceof Error ? error.message : 'Upload failed';
@@ -197,7 +218,7 @@ export default function SellerAddProductScreen() {
     if (!isCloudinaryConfigured) {
       showPlatformAlert(
         'Cloudinary not configured',
-        'Please configure EXPO_PUBLIC_CLOUDINARY_CLOUD_NAME and EXPO_PUBLIC_CLOUDINARY_UPLOAD_PRESET to upload images.',
+        'Configure the authenticated Cloudinary upload service by setting EXPO_PUBLIC_OTP_WORKER_URL.',
       );
       return;
     }
@@ -208,7 +229,11 @@ export default function SellerAddProductScreen() {
     }
     setIsUploadingAll(true);
     try {
-      const folderId = editing?.id || 'new';
+      const folderId = editing?.id || savedProductId;
+      if (!folderId) {
+        showPlatformAlert('Save product first', 'Save the product details before uploading its images.');
+        return;
+      }
       const result = await uploadPendingImages(folderId);
       const failed = result.filter((s) => s.status === 'error').length;
       if (failed === 0) {
@@ -224,8 +249,8 @@ export default function SellerAddProductScreen() {
   const handleSave = async () => {
     if (isCloudMode && !isCloudinaryConfigured && images.some((s) => s.status !== 'done')) {
       showPlatformAlert(
-        'Cloudinary is not configured',
-        "New photos can't be uploaded because Cloudinary environment variables are missing (EXPO_PUBLIC_CLOUDINARY_CLOUD_NAME and EXPO_PUBLIC_CLOUDINARY_UPLOAD_PRESET). Remove new photos to save without them, or configure Cloudinary first.",
+        'Image service is not configured',
+        "New photos can't be uploaded because EXPO_PUBLIC_OTP_WORKER_URL is missing. Remove new photos to save without them, or configure the Worker first.",
       );
       return;
     }
@@ -250,8 +275,9 @@ export default function SellerAddProductScreen() {
         isNew,
       };
 
-      const productId = editing ? editing.id : await addProduct(input);
-      if (editing) await updateProduct(editing.id, input);
+      const productId = editing?.id || savedProductId || await addProduct(input);
+      setSavedProductId(productId);
+      if (editing || savedProductId) await updateProduct(productId, input);
 
       let finalImages = images;
       if (isCloudMode && isCloudinaryConfigured && images.some((s) => s.status !== 'done')) {
@@ -260,11 +286,48 @@ export default function SellerAddProductScreen() {
 
       const failedCount = finalImages.filter((s) => s.status === 'error').length;
       const successfulUrls = finalImages.filter((s) => s.status === 'done').map((s) => s.uri);
-      const successfulPublicIds = finalImages.filter((s) => s.status === 'done').map((s) => s.publicId).filter(Boolean) as string[];
+      const successfulPublicIds = finalImages
+        .filter((s) => s.status === 'done')
+        .map((s) => s.publicId)
+        .filter((value): value is string => Boolean(value));
 
       if (isCloudMode) {
-        await updateProduct(productId, { imageUrls: successfulUrls, imagePublicIds: successfulPublicIds });
-        
+        try {
+          const result = await updateProductImagesViaWorker(
+            productId,
+            successfulUrls,
+            successfulPublicIds,
+            removedPublicIds,
+          );
+          setRemovedPublicIds([]);
+          if (result.cleanupPending) {
+            showPlatformAlert('Product saved', 'Removed images are queued for secure cleanup retry.');
+          }
+        } catch (error) {
+          const newlyUploaded = finalImages
+            .filter((slot) => slot.status === 'done' && slot.publicId && !editing?.imagePublicIds?.includes(slot.publicId))
+            .map((slot) => slot.publicId!);
+          if (newlyUploaded.length) {
+            try {
+              await cleanupCloudinaryAssetsViaWorker({ type: 'product', targetId: productId }, newlyUploaded);
+              setImages((current) => current.map((slot) => (
+                newlyUploaded.includes(slot.publicId ?? '')
+                  ? {
+                      ...slot,
+                      uri: slot.uploadUri || slot.uri,
+                      uploadUri: undefined,
+                      publicId: undefined,
+                      status: 'new',
+                      progress: 0,
+                    }
+                  : slot
+              )));
+            } catch {
+              // Keep registered uploads in the form when cleanup is pending or the write may have committed.
+            }
+          }
+          throw error;
+        }
       } else {
         // Local demo mode: no real cloud upload, just keep the picked local
         // URIs as the product's images so the feature still works offline.
@@ -337,7 +400,7 @@ export default function SellerAddProductScreen() {
               Photos ({images.length}/{MAX_PRODUCT_IMAGES})
             </Text>
             {!isCloudinaryConfigured && isCloudMode ? (
-              <Text style={[styles.photosHint, { color: colors.coral }]}>Cloudinary not configured</Text>
+              <Text style={[styles.photosHint, { color: colors.coral }]}>Image service not configured</Text>
             ) : null}
           </View>
           <Text style={[styles.photosSubhint, { color: colors.mutedForeground }]}>
@@ -348,7 +411,7 @@ export default function SellerAddProductScreen() {
             <View style={[styles.configWarningBox, { backgroundColor: colors.coralSoft, borderColor: colors.coral }]}>
               <Feather name="alert-triangle" size={15} color={colors.coral} />
               <Text style={[styles.configWarningText, { color: colors.coral }]}>
-                Cloudinary is not configured. Add EXPO_PUBLIC_CLOUDINARY_CLOUD_NAME and EXPO_PUBLIC_CLOUDINARY_UPLOAD_PRESET to your environment to enable cloud photo uploads.
+                The image service is not configured. Set EXPO_PUBLIC_OTP_WORKER_URL to the Cloudflare Worker URL to enable cloud photo uploads.
               </Text>
             </View>
           ) : null}
@@ -378,7 +441,7 @@ export default function SellerAddProductScreen() {
                   </View>
                 ) : null}
                 {slot.status === 'error' ? (
-                  <Pressable style={[styles.photoOverlay, { backgroundColor: 'rgba(217,85,85,0.85)' }]} onPress={() => retryImage(slot, editing?.id)}>
+                  <Pressable style={[styles.photoOverlay, { backgroundColor: 'rgba(217,85,85,0.85)' }]} onPress={() => retryImage(slot, editing?.id || savedProductId || undefined)}>
                     <Feather name="refresh-cw" size={16} color="#FFFFFF" />
                     <Text style={styles.photoOverlayText}>Retry</Text>
                   </Pressable>
@@ -404,7 +467,7 @@ export default function SellerAddProductScreen() {
             ) : null}
           </ScrollView>
 
-          {isCloudMode && isCloudinaryConfigured && images.some((s) => s.status !== 'done') ? (
+          {isCloudMode && isCloudinaryConfigured && (editing || savedProductId) && images.some((s) => s.status !== 'done') ? (
             <Pressable
               disabled={isUploadingAll}
               onPress={handleManualUploadAll}

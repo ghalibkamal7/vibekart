@@ -64,8 +64,13 @@ export default function SellerScreen() {
       async () => {
         if (deletingProductId) return;
         try {
-          await deleteProduct(id);
-          showPlatformAlert('Product deleted', `"${name}" and any stored images were removed.`);
+          const cleanupPending = await deleteProduct(id);
+          showPlatformAlert(
+            'Product deleted',
+            cleanupPending
+              ? `"${name}" was deleted. Image cleanup is safely queued for Worker retry.`
+              : `"${name}" and its verified stored images were removed.`,
+          );
         } catch (error) {
           showPlatformAlert('Deletion failed', error instanceof Error ? error.message : 'Product could not be deleted. Retry after checking your connection and permissions.');
         }

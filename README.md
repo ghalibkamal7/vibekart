@@ -10,7 +10,7 @@ Standalone Expo project. No Replit dependency of any kind.
 
 - **App**: Expo + Expo Router, React Native, TypeScript
 - **Backend**: Firebase (Auth, Firestore — Spark/free plan) + Cloudflare Worker
-  (mobile OTP and non-checkout APIs) + Cloudinary (product images, unsigned upload). One optional
+  (mobile OTP, image upload/cleanup, and non-checkout APIs) + Cloudinary. One optional
   Cloud Function (`reconcileOrderCost`) needs the Blaze plan and isn't required
   for the app to run.
 
@@ -34,9 +34,10 @@ useful for UI work without a Firebase project set up yet.
    config into `.env` (see `.env.example` for the exact variable names).
 3. Enable **Authentication → Email/Password**.
 4. Create a **Firestore** database (production mode).
-5. Create a free [Cloudinary](https://cloudinary.com) account and set up an
-   **unsigned upload preset** — see "Product images (Cloudinary)" below for the
-   exact settings. Copy the **Cloud name** and the **preset name** into `.env`.
+5. Create a [Cloudinary](https://cloudinary.com) account and configure its API
+   credentials as **Cloudflare Worker secrets** — see "Product images
+   (Cloudinary)" below. Do not add Cloudinary credentials or upload presets to
+   Expo variables.
 6. Configure and deploy the **Cloudflare Worker** — see `workers/otp/README.md`
    for the full walkthrough (Cloudflare account, KV namespace, secrets, deploy).
    Copy the Worker's URL into `.env` as `EXPO_PUBLIC_OTP_WORKER_URL`. The
@@ -165,83 +166,88 @@ means changing `workers/otp/src/msg91.ts` — nothing else needs to change.
 
 ## Product images (Cloudinary)
 
-Firebase Storage isn't used anywhere in this app — product images go straight to
-Cloudinary. Uploads are **unsigned** (no API key, no secret, no Cloud Function):
-this project intentionally stays on Firebase's Spark (free) plan, and Cloud
-Functions require Blaze to deploy at all, secrets or not — see "Firebase project
-setup" above. Cloudinary's unsigned upload presets are the supported way to
-upload directly from a client without a server component.
+Firebase Storage is not used. Image bytes are sent to the authenticated
+Cloudflare Worker, which verifies Firebase identity and role, generates a
+unique Cloudinary public ID, signs the upload with its server-only API secret,
+and registers the asset's owner and product/QR target in Firestore. The client
+receives the secure URL and registered public ID; it never receives Cloudinary
+API credentials or calls Cloudinary's upload API directly. The Worker accepts
+JPEG, PNG, WebP, or AVIF images up to 10 MB.
 
-### Cloudinary dashboard setup (do this once)
+### Local Worker configuration
 
-1. Cloudinary Console → **Settings → Upload → Upload presets → Add upload preset**.
-2. **Signing Mode: Unsigned.** This is what lets the app upload without a secret.
-3. **Preset name**: anything you like (e.g. `vibekart_products`) — put it in
-   `.env` as `EXPO_PUBLIC_CLOUDINARY_UPLOAD_PRESET`.
-4. **Folder**: set a fixed folder (e.g. `vibekart/products`) if you want every
-   upload confined there regardless of what the app requests — recommended,
-   since an unsigned preset can't verify who's calling it (see the trade-off
-   note below).
-5. Restrict the preset as much as Cloudinary allows for this use case:
-   - **Allowed formats**: `jpg, png, webp` (no raw/video/svg).
-   - **Resource type**: `Image` only.
-   - **Max file size**: a few MB is plenty for product photos (this app also
-     compresses client-side before upload, but the preset should enforce its
-     own ceiling — don't rely on the client alone).
-   - **Max image width/height**: e.g. 2000×2000, to stop absurdly large uploads.
-   - Leave **Unique filename** on and do **not** enable letting the client set
-     a custom `public_id` — auto-generated IDs avoid collision/overwrite risk.
-6. Copy your **Cloud name** (Console → Dashboard, top of the page) into `.env`
-   as `EXPO_PUBLIC_CLOUDINARY_CLOUD_NAME`.
+1. Copy `workers/otp/.dev.vars.example` to `workers/otp/.dev.vars`.
+2. Add the local Firebase service-account JSON, MSG91 key/template ID, and
+   Cloudinary values to that local-only file. The checked-in example contains
+   blank values only.
+3. `.dev.vars` and its variants are ignored by Git. Keep the file on this
+   machine; never paste values into `.env`, `EXPO_PUBLIC_*`, or source control.
+4. Set `EXPO_PUBLIC_OTP_WORKER_URL` in the app's `.env` to the local Worker
+   address when using `wrangler dev`. The app authenticates Worker requests
+   with the signed-in Firebase user's ID token.
 
-Both `.env` values above are meant to be public (same trust model as Firebase's
-client config) — they authorise *how* an upload happens, not *who* can do it.
+### Cloudinary account and Worker setup
 
-### The trade-off this design accepts
+1. In Cloudinary Console, open **Dashboard** and note the cloud name.
+2. Open **Settings → API Keys** (or the account's API key management page) and
+   use the API key and API secret for the account that owns VibeKart images.
+   Rotate the API secret if it has ever been exposed in a client bundle.
+3. For local development, configure `CLOUDINARY_CLOUD_NAME`,
+   `CLOUDINARY_API_KEY`, and `CLOUDINARY_API_SECRET` in
+   `workers/otp/.dev.vars`.
+4. For production, open **Cloudflare Dashboard → Workers & Pages →
+   vibekart-otp → Settings → Variables and Secrets**. Add these exact names as
+   Worker secrets: `CLOUDINARY_CLOUD_NAME`, `CLOUDINARY_API_KEY`,
+   `CLOUDINARY_API_SECRET`, `FIREBASE_SERVICE_ACCOUNT_JSON`, and
+   `MSG91_AUTH_KEY`. Add `MSG91_TEMPLATE_ID` as a non-secret Worker variable.
+   Never paste secret values into the repository, build logs, or Expo
+   configuration.
+5. `workers/otp/wrangler.toml` schedules cleanup retries every 15 minutes. The
+   schedule becomes active only when the updated Worker is deployed.
 
-An unsigned preset has no concept of Firebase Auth or this app's "seller" role —
-Cloudinary and Firebase are unrelated services. Previously, a Cloud Function
-checked `role == 'seller'` before issuing a signed upload; without Cloud
-Functions, **anyone who extracts the cloud name and preset name from the app
-bundle could upload images to this Cloudinary account.** Neither value is
-encrypted or hidden in a shipped app — they're just not advertised. The
-mitigations available without a server are entirely on the preset's own
-restrictions (format/size/dimensions/folder, above). If this risk isn't
-acceptable, the alternative is re-introducing a signed-upload Cloud Function,
-which means upgrading to Blaze.
+The app no longer uses `EXPO_PUBLIC_CLOUDINARY_CLOUD_NAME`,
+`EXPO_PUBLIC_CLOUDINARY_UPLOAD_PRESET`, or unsigned presets. After all deployed
+client versions using direct unsigned uploads have been retired, verify the old
+preset under **Cloudinary Console → Settings → Upload → Upload presets** and
+disable or delete it if it is no longer needed. Do not disable it while an
+older client still depends on it.
 
-### How it works
+An unsigned preset is not authentication: anyone who knows the Cloudinary
+cloud name and preset name can attempt uploads. Until the old preset is
+disabled, inspect its **Signing Mode**, **Folder**, **Allowed formats**,
+**Resource type**, **Maximum file size**, **Maximum image dimensions**,
+**Unique filename**, and whether client-set `public_id`/overwrite behavior is
+allowed. Restrict it to image uploads in the intended folder, JPEG/PNG/WebP,
+reasonable size and dimensions, unique filenames, and no client-controlled IDs
+or overwrite if those controls are available. These are only damage limits;
+they do not replace the Firebase-authenticated Worker architecture.
 
-1. Seller picks up to `MAX_PRODUCT_IMAGES` (see `constants/config.ts`, default 10)
-   photos in the product form.
-2. Each is resized/compressed on-device (`expo-image-manipulator`) before upload,
-   to keep bandwidth and Cloudinary storage down.
-3. The client uploads the file directly to Cloudinary's API with the unsigned
-   preset attached, with live progress reported in the UI — see
-   `services/cloudinary/upload.ts`.
-4. The returned URL + public ID are saved on the product's Firestore doc as
-   `imageUrls` / `imagePublicIds` (first entry = primary image).
+### Ownership and cleanup
 
-### Deleting products and images
+Product uploads require an active seller/admin and an existing product;
+payment-QR uploads require an administrator. A Worker-only
+`cloudinary_assets` record binds each server-generated public ID to its exact
+asset type and target. Firestore rules deny client writes to these records and
+to product image metadata/payment QR metadata. The Worker checks this binding
+before attaching or deleting an asset; it does not trust a client-supplied
+public-ID prefix.
 
-Product deletion is routed through the authenticated Cloudflare Worker. Sellers
-can delete only products they created; administrators can delete any product,
-including legacy products without an owner UID. The Worker deletes associated
-Cloudinary image assets using its server-only API credentials, then atomically
-deletes the public product and private cost documents from Firestore. If the
-Firestore record changes after Cloudinary cleanup, the app reports that the
-images were removed but the product record remains; retrying is safe because
-Cloudinary reports already-removed assets as `not_found`.
+Product image metadata is updated through the Worker. The metadata change and
+durable cleanup job are committed together; cleanup deletes an image only after
+the Firestore target no longer references it. Product deletion removes the
+Firestore records and creates the same cleanup job atomically. Replacing or
+clearing a payment QR follows the same pattern. If Cloudinary is unavailable,
+cleanup remains queued for retry, and the scheduled Worker trigger retries it.
+The app reports whether cleanup is pending; images still referenced by
+Firestore are not intentionally removed.
 
-Configure the Worker's `CLOUDINARY_CLOUD_NAME`, `CLOUDINARY_API_KEY`, and
-`CLOUDINARY_API_SECRET` secrets as documented in `workers/otp/README.md`.
-Never add the API secret to the Expo app or an `EXPO_PUBLIC_*` variable.
-
-Images are organised in Cloudinary under `vibekart/products/{productId}/`.
-Older products created before this migration (or local demo-mode products using
-a bundled asset) keep working via `getProductImages()` in `data/store.ts`, which
-falls back to the legacy single `image` field when `imageUrls` is empty — no
-existing product's image ever disappears.
+Existing images and QR codes continue to render from stored URLs. Older public
+IDs created before Worker ownership records cannot be proven safe from
+repository data alone. The Worker fails closed when a legacy ID would be
+removed or deleted. Those assets require a reviewed, trusted migration that
+checks the Cloudinary inventory and associates each asset with its actual
+product/QR target before cleanup. Do not bulk-register client-supplied IDs or
+rely only on a folder prefix.
 
 ## Why a customer can never see supplier cost
 
@@ -282,13 +288,10 @@ snapshot; checkout and payment verification still work.
   Forgetting to redeploy it after an edit, or letting `EXPO_PUBLIC_OTP_WORKER_URL`
   drift out of sync with the actual deployed Worker, will break mobile OTP
   without affecting anything else in the app.
-- **Product image uploads are unsigned** (see "Product images (Cloudinary)"
-  above) because Cloud Functions aren't available on Spark. This means upload
-  authorisation relies entirely on the Cloudinary preset's own restrictions,
-  not on checking who's calling it — accepted trade-off, not an oversight.
-- **Removing an individual image from an existing product does not invoke the
-  Worker cleanup route.** Product-level deletion removes stored images; assets
-  removed only from an edited image list may need manual Cloudinary cleanup.
+- **Legacy Cloudinary images require migration before deletion.** Existing URLs
+  continue to render, but assets without a trusted Worker ownership record
+  cannot be safely removed during edits or product deletion. See "Product
+  images (Cloudinary)" for the required inventory review and migration.
 - **OTP rate limiting is basic**: a 30-second resend cooldown, 5 verify attempts
   per code, and 10 sends per IP per hour, all via Cloudflare KV (see
   `workers/otp/src/otp-store.ts`). Fine for an MVP; worth hardening (e.g. a real

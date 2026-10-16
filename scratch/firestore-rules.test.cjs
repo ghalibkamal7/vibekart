@@ -9,6 +9,7 @@ const {
 } = require('@firebase/rules-unit-testing');
 const {
   doc,
+  deleteDoc,
   getDoc,
   runTransaction,
   serverTimestamp,
@@ -107,7 +108,7 @@ test('rules reject forged client prices and customer attempts to set payment sta
   }));
 });
 
-test('only an active admin can confirm a pending order with reviewer audit fields', async () => {
+test('payment confirmation, reference claims, and payment audit writes are Worker-only', async () => {
   const customer = testEnvironment.authenticatedContext('customer-1').firestore();
   const orderId = 'checkout-test-003';
   const order = doc(customer, `orders/${orderId}`);
@@ -147,10 +148,9 @@ test('only an active admin can confirm a pending order with reviewer audit field
     paymentReviewedByUid: 'customer-1',
   }));
 
-  await assertSucceeds(runTransaction(admin, async (transaction) => {
+  await assertFails(runTransaction(admin, async (transaction) => {
     const adminOrder = doc(admin, `orders/${orderId}`);
-    const current = await transaction.get(adminOrder);
-    assert.equal(current.data().paymentStatus, 'Pending');
+    await transaction.get(adminOrder);
     transaction.update(adminOrder, {
       paymentStatus: 'Paid',
       paymentReference: 'UTR-UNIQUE',
@@ -165,14 +165,47 @@ test('only an active admin can confirm a pending order with reviewer audit field
       createdAt: serverTimestamp(),
     });
   }));
-  assert.equal((await getDoc(doc(admin, `orders/${orderId}`))).data().paymentStatus, 'Paid');
+  await assertFails(setDoc(claim, {
+    orderId,
+    reference: 'UTR-UNIQUE',
+    createdAt: serverTimestamp(),
+  }));
+  await assertFails(setDoc(doc(admin, 'audit_logs/payment-review-forged'), {
+    adminUid: 'admin-1',
+    action: 'Confirm Manual UPI Payment',
+    targetId: orderId,
+    paymentReference: 'UTR-UNIQUE',
+    timestamp: serverTimestamp(),
+  }));
+  await assertFails(setDoc(doc(admin, 'audit_logs/payment-attempt-forged'), {
+    adminUid: 'admin-1',
+    action: 'Confirm Payment',
+    targetId: 'pay-123',
+    details: 'Confirmed payment',
+    timestamp: serverTimestamp(),
+  }));
+  await assertFails(setDoc(doc(admin, 'audit_logs/payment-marker-forged'), {
+    adminUid: 'admin-1',
+    action: 'Update Payment Settings',
+    targetId: 'pay-123',
+    paymentReviewAction: 'Confirmed',
+    timestamp: serverTimestamp(),
+  }));
+  await assertSucceeds(setDoc(doc(admin, 'audit_logs/settings-update'), {
+    adminUid: 'admin-1',
+    action: 'Update Payment Settings',
+    details: 'Updated merchant display settings.',
+    timestamp: serverTimestamp(),
+  }));
+  assert.equal((await getDoc(doc(admin, `orders/${orderId}`))).data().paymentStatus, 'Pending');
+  assert.equal((await getDoc(claim)).exists(), false);
 });
 
-test('authorized admin may reject a pending UPI payment with a reason and audit identity', async () => {
+test('direct admin payment rejection is denied while customer UTR submission remains allowed', async () => {
   const orderId = 'checkout-test-reject';
   await seedOrder(orderId);
   const admin = testEnvironment.authenticatedContext('admin-1').firestore();
-  await assertSucceeds(updateDoc(doc(admin, `orders/${orderId}`), {
+  await assertFails(updateDoc(doc(admin, `orders/${orderId}`), {
     paymentStatus: 'Failed',
     status: 'Cancelled',
     paymentReviewReason: 'No matching merchant-account credit.',
@@ -193,14 +226,14 @@ test('authorized admin may reject a pending UPI payment with a reason and audit 
   }));
 });
 
-test('admins may reserve reference claims but ordinary customers may not', async () => {
+test('admins and customers cannot directly write reference claims', async () => {
   const admin = testEnvironment.authenticatedContext('admin-1').firestore();
   const claimData = {
     orderId: 'first-order',
     reference: 'UTR-REUSED',
     createdAt: serverTimestamp(),
   };
-  await assertSucceeds(setDoc(doc(admin, 'payment_reference_claims/ref-UTR-REUSED'), claimData));
+  await assertFails(setDoc(doc(admin, 'payment_reference_claims/ref-UTR-REUSED'), claimData));
   const customer = testEnvironment.authenticatedContext('customer-1').firestore();
   await assertFails(setDoc(doc(customer, 'payment_reference_claims/ref-UTR-CUSTOMER'), claimData));
 });
@@ -246,7 +279,7 @@ test('existing Selected UPI orders cannot be approved by direct client writes', 
   });
 
   const admin = testEnvironment.authenticatedContext('admin-1').firestore();
-  await assertSucceeds(updateDoc(doc(admin, 'orders/legacy-selected'), {
+  await assertFails(updateDoc(doc(admin, 'orders/legacy-selected'), {
     paymentStatus: 'Paid',
     paymentReference: 'LEGACY-UTR',
     paymentVerifiedAt: serverTimestamp(),
@@ -254,4 +287,21 @@ test('existing Selected UPI orders cannot be approved by direct client writes', 
     paymentReviewedAt: serverTimestamp(),
     paymentReviewAction: 'Confirmed',
   }));
+});
+
+test('admins cannot delete payment settings directly, but may delete other settings', async () => {
+  const admin = testEnvironment.authenticatedContext('admin-1').firestore();
+  await testEnvironment.withSecurityRulesDisabled(async (context) => {
+    const database = context.firestore();
+    await setDoc(doc(database, 'settings/payment'), {
+      merchantVpa: 'vibekart@upi',
+      qrImageUrl: 'https://res.cloudinary.com/example/image/upload/qr',
+      qrImagePublicId: 'vibekart/payment/qr',
+    });
+    await setDoc(doc(database, 'settings/banner'), { text: 'Sale' });
+  });
+
+  await assertFails(deleteDoc(doc(admin, 'settings/payment')));
+  await assertSucceeds(deleteDoc(doc(admin, 'settings/banner')));
+  await assertSucceeds(getDoc(doc(admin, 'settings/payment')));
 });

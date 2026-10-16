@@ -2,6 +2,7 @@ import { corsHeaders, isAllowedOrigin, jsonResponse } from './cors';
 import {
   createUserProfileDoc,
   commitFirestoreWrites,
+  fromFirestoreFields,
   getOrderDoc,
   getProductDoc,
   getProductPrivateDoc,
@@ -48,6 +49,103 @@ export interface Env {
   CLOUDINARY_CLOUD_NAME?: string;
   CLOUDINARY_API_KEY?: string;
   CLOUDINARY_API_SECRET?: string;
+}
+
+type CloudinaryAssetType = 'product' | 'payment-qr';
+const MAX_CLOUDINARY_UPLOAD_BYTES = 10 * 1024 * 1024;
+const MAX_CLOUDINARY_REQUEST_BYTES = MAX_CLOUDINARY_UPLOAD_BYTES + 64 * 1024;
+const MAX_CLEANUP_ASSETS_PER_RUN = 25;
+const STALE_CLOUDINARY_UPLOAD_MS = 30 * 60 * 1000;
+const STALE_UNATTACHED_CLOUDINARY_ASSET_MS = 24 * 60 * 60 * 1000;
+
+async function cloudinaryAssetPath(publicId: string): Promise<string> {
+  return `cloudinary_assets/${await hashValue(publicId)}`;
+}
+
+function cloudinaryCleanupJobPath(assetType: CloudinaryAssetType, targetId: string): string {
+  return `cloudinary_cleanup_jobs/${assetType === 'product' ? `product-${targetId}` : 'payment-settings-qr'}`;
+}
+
+function cloudinaryConfigError(env: Env): string | null {
+  return env.CLOUDINARY_CLOUD_NAME?.trim() &&
+    env.CLOUDINARY_API_KEY?.trim() &&
+    env.CLOUDINARY_API_SECRET?.trim()
+    ? null
+    : 'Cloudinary Worker bindings are incomplete. Configure CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, and CLOUDINARY_API_SECRET.';
+}
+
+async function cloudinarySignature(params: Record<string, string>, apiSecret: string): Promise<string> {
+  const signatureBase = Object.keys(params)
+    .sort()
+    .map((key) => `${key}=${params[key]}`)
+    .join('&');
+  const digest = await crypto.subtle.digest('SHA-1', new TextEncoder().encode(`${signatureBase}${apiSecret}`));
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('');
+}
+
+function detectedImageMime(bytes: Uint8Array): string | null {
+  if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) {
+    return 'image/jpeg';
+  }
+  if (
+    bytes.length >= 8 &&
+    bytes[0] === 0x89 &&
+    bytes[1] === 0x50 &&
+    bytes[2] === 0x4e &&
+    bytes[3] === 0x47 &&
+    bytes[4] === 0x0d &&
+    bytes[5] === 0x0a &&
+    bytes[6] === 0x1a &&
+    bytes[7] === 0x0a
+  ) {
+    return 'image/png';
+  }
+  if (
+    bytes.length >= 12 &&
+    String.fromCharCode(...bytes.subarray(0, 4)) === 'RIFF' &&
+    String.fromCharCode(...bytes.subarray(8, 12)) === 'WEBP'
+  ) {
+    return 'image/webp';
+  }
+  if (
+    bytes.length >= 12 &&
+    String.fromCharCode(...bytes.subarray(4, 8)) === 'ftyp' &&
+    ['avif', 'avis'].includes(String.fromCharCode(...bytes.subarray(8, 12)))
+  ) {
+    return 'image/avif';
+  }
+  return null;
+}
+
+async function readBoundedRequestBody(
+  request: Request,
+  maxBytes: number,
+): Promise<{ bytes: Uint8Array | null; tooLarge: boolean }> {
+  if (!request.body) return { bytes: new Uint8Array(), tooLarge: false };
+  const reader = request.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let totalBytes = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      totalBytes += value.byteLength;
+      if (totalBytes > maxBytes) {
+        await reader.cancel();
+        return { bytes: null, tooLarge: true };
+      }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const bytes = new Uint8Array(totalBytes);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return { bytes, tooLarge: false };
 }
 
 async function handleSendOtp(request: Request, env: Env, origin: string | null): Promise<Response> {
@@ -701,8 +799,14 @@ async function authenticateCaller(
   const idToken = authorization.startsWith('Bearer ') ? authorization.slice(7).trim() : '';
   if (!idToken) return jsonResponse({ error: 'Authentication token required.' }, 401, origin);
 
+  let sa: ReturnType<typeof parseServiceAccount>;
   try {
-    const sa = parseServiceAccount(env.FIREBASE_SERVICE_ACCOUNT_JSON);
+    sa = parseServiceAccount(env.FIREBASE_SERVICE_ACCOUNT_JSON);
+  } catch {
+    return jsonResponse({ error: 'Firebase Worker authentication is not configured correctly.' }, 503, origin);
+  }
+
+  try {
     const accessToken = await getGoogleAccessToken(sa);
     const user = await verifyFirebaseIdToken(sa, accessToken, idToken);
     if (!user) return jsonResponse({ error: 'Invalid or expired authentication token.' }, 401, origin);
@@ -713,8 +817,8 @@ async function authenticateCaller(
     }
     return { sa, accessToken, uid: user.uid, email: user.email, profile: profile.data };
   } catch (error) {
-    console.error('[payment] Caller authentication failed', error);
-    return jsonResponse({ error: 'Payment service authentication is temporarily unavailable.' }, 503, origin);
+    console.error('[auth] Firebase caller authentication failed', error);
+    return jsonResponse({ error: 'Firebase caller authentication is temporarily unavailable.' }, 503, origin);
   }
 }
 
@@ -724,6 +828,801 @@ function isAuthenticatedCaller(value: AuthenticatedCaller | Response): value is 
 
 function firestoreDocumentName(sa: ReturnType<typeof parseServiceAccount>, path: string): string {
   return `projects/${sa.project_id}/databases/(default)/documents/${path}`;
+}
+
+async function queueCloudinaryCleanup(
+  sa: ReturnType<typeof parseServiceAccount>,
+  accessToken: string,
+  assetType: CloudinaryAssetType,
+  targetId: string,
+  ownerUid: string,
+  publicIds: string[],
+  unattachedOnly = false,
+): Promise<Record<string, unknown>[]> {
+  const jobPath = cloudinaryCleanupJobPath(assetType, targetId);
+  const currentJob = await getVersionedDocument(sa, accessToken, jobPath);
+  const queuedIds = [...new Set([
+    ...(Array.isArray(currentJob.data?.publicIds) ? currentJob.data.publicIds : []),
+    ...publicIds,
+  ])];
+  if (!queuedIds.length) return [];
+
+  const writes: Record<string, unknown>[] = [];
+  for (const publicId of queuedIds) {
+    if (typeof publicId !== 'string' || !publicId || publicId.length > 255) {
+      throw new Error('Product contains an invalid Cloudinary public ID.');
+    }
+    const assetPath = await cloudinaryAssetPath(publicId);
+    const asset = await getVersionedDocument(sa, accessToken, assetPath);
+    if (
+      !asset.exists ||
+      asset.data?.publicId !== publicId ||
+      asset.data?.assetType !== assetType ||
+      asset.data?.targetId !== targetId ||
+      (unattachedOnly && publicIds.includes(publicId) &&
+        !['uploading', 'uploaded', 'cleanup_pending'].includes(String(asset.data?.status)))
+    ) {
+      throw new Error('A legacy Cloudinary image has no verified ownership record. Migrate its ownership before removing or deleting it.');
+    }
+    if (!asset.updateTime) throw new Error('Cloudinary image ownership record version is unavailable.');
+    writes.push({
+      update: {
+        name: firestoreDocumentName(sa, assetPath),
+        fields: toFirestoreFields({ ...asset.data, status: 'cleanup_pending' }),
+      },
+      updateMask: { fieldPaths: [...Object.keys(asset.data), 'status'] },
+      currentDocument: { updateTime: asset.updateTime },
+    });
+  }
+
+  const jobData = {
+    assetType,
+    targetId,
+    ownerUid: currentJob.data?.ownerUid || ownerUid,
+    publicIds: queuedIds,
+    updatedAt: new Date().toISOString(),
+  };
+  writes.push({
+    update: {
+      name: firestoreDocumentName(sa, jobPath),
+      fields: toFirestoreFields(jobData),
+    },
+    updateMask: { fieldPaths: Object.keys(jobData) },
+    currentDocument: currentJob.exists
+      ? { updateTime: currentJob.updateTime }
+      : { exists: false },
+  });
+  return writes;
+}
+
+async function queueUnreferencedCloudinaryAssets(
+  sa: ReturnType<typeof parseServiceAccount>,
+  accessToken: string,
+  assetType: CloudinaryAssetType,
+  targetId: string,
+  ownerUid: string,
+  publicIds: string[],
+): Promise<boolean> {
+  const ownerPath = assetType === 'product' ? `products/${targetId}` : 'settings/payment';
+  const owner = await getVersionedDocument(sa, accessToken, ownerPath);
+  const referencedIds = assetType === 'product'
+    ? (Array.isArray(owner.data?.imagePublicIds) ? owner.data.imagePublicIds : [])
+    : [owner.data?.qrImagePublicId];
+  const unreferencedIds = publicIds.filter((publicId) => !referencedIds.includes(publicId));
+  if (!unreferencedIds.length) return false;
+
+  const writes = await queueCloudinaryCleanup(
+    sa,
+    accessToken,
+    assetType,
+    targetId,
+    ownerUid,
+    unreferencedIds,
+  );
+  if (!writes.length) return false;
+  await commitFirestoreWrites(sa, accessToken, writes);
+  return true;
+}
+
+async function queueFailedCloudinaryUpload(
+  sa: ReturnType<typeof parseServiceAccount>,
+  accessToken: string,
+  assetType: CloudinaryAssetType,
+  targetId: string,
+  ownerUid: string,
+  publicId: string,
+  stage: 'request-failed' | 'upload-rejected' | 'ownership-finalization-failed',
+): Promise<boolean> {
+  try {
+    const writes = await queueCloudinaryCleanup(sa, accessToken, assetType, targetId, ownerUid, [publicId], true);
+    await commitFirestoreWrites(sa, accessToken, writes);
+    return true;
+  } catch {
+    console.error('[cloudinary] Failed to persist upload cleanup; stale-upload recovery remains necessary.', {
+      assetType,
+      stage,
+    });
+    return false;
+  }
+}
+
+async function runCloudinaryCleanup(
+  env: Env,
+  sa: ReturnType<typeof parseServiceAccount>,
+  accessToken: string,
+  assetType: CloudinaryAssetType,
+  targetId: string,
+): Promise<{ pending: boolean; reason?: string }> {
+  const configError = cloudinaryConfigError(env);
+  if (configError) return { pending: true, reason: configError };
+
+  const jobPath = cloudinaryCleanupJobPath(assetType, targetId);
+  const job = await getVersionedDocument(sa, accessToken, jobPath);
+  if (!job.exists || !job.data || !job.updateTime) return { pending: false };
+  const queuedIds = Array.isArray(job.data.publicIds)
+    ? job.data.publicIds.filter((id): id is string => typeof id === 'string')
+    : [];
+  const publicIds = queuedIds.slice(0, MAX_CLEANUP_ASSETS_PER_RUN);
+  const remainingIds = queuedIds.slice(publicIds.length);
+  if (!publicIds.length) {
+    await commitFirestoreWrites(sa, accessToken, [{
+      delete: firestoreDocumentName(sa, jobPath),
+      currentDocument: { updateTime: job.updateTime },
+    }]);
+    return { pending: false };
+  }
+
+  const targetPath = assetType === 'product' ? `products/${targetId}` : 'settings/payment';
+  const target = await getVersionedDocument(sa, accessToken, targetPath);
+  const currentIds = assetType === 'product'
+    ? (Array.isArray(target.data?.imagePublicIds) ? target.data.imagePublicIds : [])
+    : [target.data?.qrImagePublicId];
+  if (publicIds.some((publicId) => currentIds.includes(publicId))) {
+    return { pending: true, reason: 'An image queued for cleanup is still referenced by its Firestore record.' };
+  }
+
+  for (const publicId of publicIds) {
+    const assetPath = await cloudinaryAssetPath(publicId);
+    const asset = await getVersionedDocument(sa, accessToken, assetPath);
+    if (
+      !asset.exists ||
+      !asset.updateTime ||
+      asset.data?.publicId !== publicId ||
+      asset.data?.assetType !== assetType ||
+      asset.data?.targetId !== targetId ||
+      asset.data?.status !== 'cleanup_pending'
+    ) {
+      return { pending: true, reason: 'A Cloudinary ownership record needs review before cleanup.' };
+    }
+
+    const form = new URLSearchParams();
+    form.append('public_ids[]', publicId);
+    let response: Response;
+    try {
+      response = await fetch(
+        `https://api.cloudinary.com/v1_1/${encodeURIComponent(env.CLOUDINARY_CLOUD_NAME!)}/resources/image/upload`,
+        {
+          method: 'DELETE',
+          headers: {
+            Authorization: `Basic ${btoa(`${env.CLOUDINARY_API_KEY}:${env.CLOUDINARY_API_SECRET}`)}`,
+            'Content-Type': 'application/x-www-form-urlencoded',
+          },
+          body: form.toString(),
+        },
+      );
+    } catch (error) {
+      console.error('[cloudinary] Asset cleanup request failed', error);
+      return { pending: true, reason: 'Cloudinary could not be reached; cleanup will be retried.' };
+    }
+    const result = (await response.json().catch(() => null)) as { deleted?: Record<string, string> } | null;
+    if (!response.ok || !['deleted', 'not_found'].includes(result?.deleted?.[publicId] ?? '')) {
+      console.error('[cloudinary] Asset cleanup was incomplete', { status: response.status });
+      return { pending: true, reason: `Cloudinary returned HTTP ${response.status}; cleanup will be retried.` };
+    }
+  }
+
+  const assetRecords = await Promise.all(publicIds.map(async (publicId) => {
+    const path = await cloudinaryAssetPath(publicId);
+    return { publicId, path, record: await getVersionedDocument(sa, accessToken, path) };
+  }));
+  try {
+    await commitFirestoreWrites(sa, accessToken, [
+      ...assetRecords.map(({ path, record }) => {
+        if (!record.exists || !record.updateTime) {
+          throw new Error('Cloudinary ownership record disappeared during cleanup.');
+        }
+        return {
+            delete: firestoreDocumentName(sa, path),
+            currentDocument: { updateTime: record.updateTime },
+          };
+      }),
+      ...(remainingIds.length
+        ? [{
+            update: {
+              name: firestoreDocumentName(sa, jobPath),
+              fields: toFirestoreFields({ ...job.data, publicIds: remainingIds, updatedAt: new Date().toISOString() }),
+            },
+            updateMask: { fieldPaths: [...Object.keys(job.data), 'publicIds', 'updatedAt'] },
+            currentDocument: { updateTime: job.updateTime },
+          }]
+        : [{
+            delete: firestoreDocumentName(sa, jobPath),
+            currentDocument: { updateTime: job.updateTime },
+          }]),
+    ]);
+  } catch (error) {
+    console.error('[cloudinary] Cleanup finalization failed; the original job remains eligible for idempotent retry.');
+    return { pending: true, reason: 'Cleanup finalization was interrupted; retry will reconcile the job.' };
+  }
+  return remainingIds.length
+    ? { pending: true, reason: 'Cleanup is continuing in bounded batches.' }
+    : { pending: false };
+}
+
+async function handleCloudinaryUpload(request: Request, env: Env, origin: string | null): Promise<Response> {
+  const caller = await authenticateCaller(request, env, origin);
+  if (!isAuthenticatedCaller(caller)) return caller;
+  const configError = cloudinaryConfigError(env);
+  if (configError) return jsonResponse({ error: configError }, 503, origin);
+
+  try {
+    if (!await checkIpRateLimit(env.OTP_KV, `cloudinary:${caller.uid}`, 30, 60 * 60)) {
+      return jsonResponse({ error: 'Too many image uploads. Please try again later.' }, 429, origin);
+    }
+  } catch {
+    console.error('[cloudinary] Upload rate-limit check failed.');
+    return jsonResponse({ error: 'Image upload is temporarily unavailable. Please retry later.' }, 503, origin);
+  }
+
+  const contentType = request.headers.get('Content-Type') || '';
+  if (!/^multipart\/form-data\s*;/i.test(contentType)) {
+    return jsonResponse({ error: 'Image upload request must be multipart form data.' }, 400, origin);
+  }
+  const contentLength = request.headers.get('Content-Length');
+  if (contentLength !== null) {
+    const declaredLength = Number(contentLength);
+    if (!Number.isSafeInteger(declaredLength) || declaredLength < 0) {
+      return jsonResponse({ error: 'Image upload request has an invalid content length.' }, 400, origin);
+    }
+    if (declaredLength > MAX_CLOUDINARY_REQUEST_BYTES) {
+      return jsonResponse({ error: 'Image upload request exceeds the maximum allowed size.' }, 413, origin);
+    }
+  }
+  let bodyBytes: Uint8Array | null;
+  try {
+    const bounded = await readBoundedRequestBody(request, MAX_CLOUDINARY_REQUEST_BYTES);
+    if (bounded.tooLarge) {
+      return jsonResponse({ error: 'Image upload request exceeds the maximum allowed size.' }, 413, origin);
+    }
+    bodyBytes = bounded.bytes;
+  } catch {
+    return jsonResponse({ error: 'Image upload request body could not be read.' }, 400, origin);
+  }
+  if (!bodyBytes) return jsonResponse({ error: 'Image upload request body could not be read.' }, 400, origin);
+
+  let form: FormData;
+  try {
+    const formRequest = new Request(request.url, {
+      method: 'POST',
+      headers: { 'Content-Type': contentType },
+      body: bodyBytes,
+    });
+    form = await formRequest.formData();
+  } catch {
+    return jsonResponse({ error: 'Image upload request must be multipart form data.' }, 400, origin);
+  }
+  const fileValue: unknown = form.get('file');
+  const assetType = form.get('assetType');
+  const targetId = form.get('targetId');
+  if (!isUploadFile(fileValue)) {
+    return jsonResponse({ error: 'Image upload request must include one file.' }, 400, origin);
+  }
+  if (fileValue.size < 1 || fileValue.size > MAX_CLOUDINARY_UPLOAD_BYTES) {
+    return jsonResponse({ error: 'Choose an image smaller than 10 MB.' }, 413, origin);
+  }
+  const file = fileValue;
+  const fileBytes = new Uint8Array(await file.arrayBuffer());
+  const verifiedMime = detectedImageMime(fileBytes);
+  if (!verifiedMime) return jsonResponse({ error: 'The file is not a supported JPEG, PNG, WebP, or AVIF image.' }, 415, origin);
+
+  function isUploadFile(value: unknown): value is File {
+    return typeof value === 'object' &&
+      value !== null &&
+      'size' in value &&
+      typeof value.size === 'number' &&
+      'type' in value &&
+      typeof value.type === 'string' &&
+      'name' in value &&
+      typeof value.name === 'string';
+  }
+  if (assetType === 'product') {
+    if (typeof targetId !== 'string' || !/^[A-Za-z0-9_-]{1,150}$/.test(targetId)) {
+      return jsonResponse({ error: 'A valid product ID is required.' }, 400, origin);
+    }
+    if (!['seller', 'admin'].includes(String(caller.profile.role))) {
+      return jsonResponse({ error: 'Only an authorized seller or administrator can upload product images.' }, 403, origin);
+    }
+    const product = await getVersionedDocument(caller.sa, caller.accessToken, `products/${targetId}`);
+    if (
+      !product.exists ||
+      (caller.profile.role !== 'admin' && product.data?.createdByUid !== caller.uid) ||
+      product.data?.cloudinaryDeletionPending === true
+    ) {
+      return jsonResponse({ error: 'This product is not available for image uploads by your account.' }, 403, origin);
+    }
+  } else if (assetType === 'payment-qr' && targetId === 'settings/payment') {
+    if (caller.profile.role !== 'admin') {
+      return jsonResponse({ error: 'Only an administrator can upload the payment QR image.' }, 403, origin);
+    }
+  } else {
+    return jsonResponse({ error: 'A supported image ownership target is required.' }, 400, origin);
+  }
+
+  const resolvedType = assetType as CloudinaryAssetType;
+  const resolvedTargetId = targetId as string;
+  const publicId = resolvedType === 'product'
+    ? `vibekart/products/${resolvedTargetId}/${crypto.randomUUID().replace(/-/g, '')}`
+    : `vibekart/payment/${crypto.randomUUID().replace(/-/g, '')}`;
+  const assetPath = await cloudinaryAssetPath(publicId);
+  const now = new Date().toISOString();
+  const assetData = {
+    publicId,
+    assetType: resolvedType,
+    targetId: resolvedTargetId,
+    ownerUid: caller.uid,
+    status: 'uploading',
+    createdAt: now,
+  };
+  try {
+    await commitFirestoreWrites(caller.sa, caller.accessToken, [{
+      update: {
+        name: firestoreDocumentName(caller.sa, assetPath),
+        fields: toFirestoreFields(assetData),
+      },
+      currentDocument: { exists: false },
+    }]);
+  } catch (error) {
+    console.error('[cloudinary] Could not reserve image ownership record', error);
+    return jsonResponse({ error: 'Image ownership could not be recorded; no upload was started.' }, 503, origin);
+  }
+
+  const timestamp = Math.floor(Date.now() / 1000).toString();
+  const signedParams = { overwrite: 'false', public_id: publicId, timestamp };
+  const signature = await cloudinarySignature(signedParams, env.CLOUDINARY_API_SECRET!);
+  const uploadForm = new FormData();
+  uploadForm.set('file', new Blob([fileBytes], { type: verifiedMime }), 'vibekart-upload');
+  uploadForm.set('api_key', env.CLOUDINARY_API_KEY!);
+  uploadForm.set('overwrite', 'false');
+  uploadForm.set('public_id', publicId);
+  uploadForm.set('timestamp', timestamp);
+  uploadForm.set('signature', signature);
+
+  let uploadResponse: Response;
+  try {
+    uploadResponse = await fetch(
+      `https://api.cloudinary.com/v1_1/${encodeURIComponent(env.CLOUDINARY_CLOUD_NAME!)}/image/upload`,
+      { method: 'POST', body: uploadForm },
+    );
+  } catch (error) {
+    console.error('[cloudinary] Upload request failed.');
+    const cleanupQueued = await queueFailedCloudinaryUpload(
+      caller.sa,
+      caller.accessToken,
+      resolvedType,
+      resolvedTargetId,
+      caller.uid,
+      publicId,
+      'request-failed',
+    );
+    return jsonResponse({
+      error: cleanupQueued
+        ? 'Cloudinary could not be reached. The reserved asset is queued for cleanup; retry the upload.'
+        : 'Cloudinary could not be reached and cleanup could not be recorded. Stale-upload recovery will retry.',
+    }, 502, origin);
+  }
+
+  const uploadResult = (await uploadResponse.json().catch(() => null)) as {
+    secure_url?: string;
+    public_id?: string;
+  } | null;
+  if (!uploadResponse.ok || !uploadResult?.secure_url || uploadResult.public_id !== publicId) {
+    console.error('[cloudinary] Upload rejected', { status: uploadResponse.status });
+    const cleanupQueued = await queueFailedCloudinaryUpload(
+      caller.sa,
+      caller.accessToken,
+      resolvedType,
+      resolvedTargetId,
+      caller.uid,
+      publicId,
+      'upload-rejected',
+    );
+    return jsonResponse({
+      error: cleanupQueued
+        ? `Cloudinary rejected the image upload (HTTP ${uploadResponse.status}); cleanup is queued.`
+        : `Cloudinary rejected the image upload (HTTP ${uploadResponse.status}); cleanup could not be recorded and stale-upload recovery will retry.`,
+    }, 502, origin);
+  }
+
+  const reserved = await getVersionedDocument(caller.sa, caller.accessToken, assetPath);
+  try {
+    if (!reserved.updateTime) throw new Error('Reserved image ownership version is missing.');
+    await commitFirestoreWrites(caller.sa, caller.accessToken, [{
+      update: {
+        name: firestoreDocumentName(caller.sa, assetPath),
+        fields: toFirestoreFields({ ...assetData, status: 'uploaded', secureUrl: uploadResult.secure_url }),
+      },
+      updateMask: { fieldPaths: [...Object.keys(assetData), 'secureUrl'] },
+      currentDocument: { updateTime: reserved.updateTime },
+    }]);
+  } catch (error) {
+    console.error('[cloudinary] Upload ownership confirmation failed.');
+    const cleanupQueued = await queueFailedCloudinaryUpload(
+      caller.sa,
+      caller.accessToken,
+      resolvedType,
+      resolvedTargetId,
+      caller.uid,
+      publicId,
+      'ownership-finalization-failed',
+    );
+    return jsonResponse({
+      error: cleanupQueued
+        ? 'The image uploaded but its ownership record could not be finalized; cleanup is queued.'
+        : 'The image uploaded but its ownership record could not be finalized or queued; stale-upload recovery will retry.',
+    }, 502, origin);
+  }
+  return jsonResponse({ success: true, url: uploadResult.secure_url, publicId }, 201, origin);
+}
+
+async function handleUpdateProductImages(request: Request, env: Env, origin: string | null): Promise<Response> {
+  const caller = await authenticateCaller(request, env, origin);
+  if (!isAuthenticatedCaller(caller)) return caller;
+  if (!['seller', 'admin'].includes(String(caller.profile.role))) {
+    return jsonResponse({ error: 'Only an authorized seller or administrator can edit product images.' }, 403, origin);
+  }
+  const body = (await request.json().catch(() => null)) as {
+    productId?: string;
+    imageUrls?: unknown;
+    imagePublicIds?: unknown;
+    removedPublicIds?: unknown;
+  } | null;
+  const productId = String(body?.productId ?? '').trim();
+  if (
+    !/^[A-Za-z0-9_-]{1,150}$/.test(productId) ||
+    !Array.isArray(body?.imageUrls) ||
+    !Array.isArray(body?.imagePublicIds) ||
+    body.imageUrls.length !== body.imagePublicIds.length ||
+    body.imageUrls.length > 10 ||
+    !body.imageUrls.every((url) => typeof url === 'string' && /^https:\/\/res\.cloudinary\.com\//.test(url)) ||
+    !body.imagePublicIds.every((id) => typeof id === 'string' && id.length > 0 && id.length <= 255)
+  ) {
+    return jsonResponse({ error: 'A valid ordered set of product image URLs and public IDs is required.' }, 400, origin);
+  }
+  const productPath = `products/${productId}`;
+  const product = await getVersionedDocument(caller.sa, caller.accessToken, productPath);
+  if (
+    !product.exists ||
+    !product.data ||
+    !product.updateTime ||
+    (caller.profile.role !== 'admin' && product.data.createdByUid !== caller.uid)
+  ) {
+    return jsonResponse({ error: 'This product is not available for image changes by your account.' }, 403, origin);
+  }
+  const nextIds = body.imagePublicIds as string[];
+  const nextUrls = body.imageUrls as string[];
+  if (new Set(nextIds).size !== nextIds.length) {
+    return jsonResponse({ error: 'Duplicate Cloudinary image IDs are not allowed.' }, 400, origin);
+  }
+  const oldIds = Array.isArray(product.data.imagePublicIds) ? product.data.imagePublicIds : [];
+  const oldUrls = Array.isArray(product.data.imageUrls) ? product.data.imageUrls : [];
+  if (oldUrls.length !== oldIds.length) {
+    return jsonResponse({ error: 'This product has legacy images without verified ownership IDs. Migrate them before changing its images.' }, 409, origin);
+  }
+  for (let index = 0; index < nextIds.length; index += 1) {
+    const publicId = nextIds[index];
+    const oldIndex = oldIds.indexOf(publicId);
+    if (oldIndex >= 0) {
+      if (oldUrls[oldIndex] !== nextUrls[index]) {
+        return jsonResponse({ error: 'Existing image URLs cannot be changed independently of their verified image IDs.' }, 409, origin);
+      }
+    }
+    const asset = await getVersionedDocument(
+      caller.sa,
+      caller.accessToken,
+      await cloudinaryAssetPath(publicId),
+    );
+    if (!asset.exists && oldIndex >= 0) continue;
+    if (
+      !asset.exists ||
+      asset.data?.assetType !== 'product' ||
+      asset.data?.targetId !== productId ||
+      (oldIndex >= 0
+        ? !['uploaded', 'attached'].includes(String(asset.data?.status))
+        : asset.data?.status !== 'uploaded') ||
+      asset.data?.secureUrl !== nextUrls[index]
+    ) {
+      return jsonResponse({ error: 'A new product image has no matching verified upload record.' }, 409, origin);
+    }
+  }
+
+  const removedFromProduct = oldIds.filter((id) => !nextIds.includes(id));
+  const requestedRemoved = Array.isArray(body.removedPublicIds)
+    ? body.removedPublicIds.filter((id): id is string => typeof id === 'string')
+    : [];
+  const cleanupIds = [...new Set([...removedFromProduct, ...requestedRemoved])]
+    .filter((id) => !nextIds.includes(id));
+  let cleanupWrites: Record<string, unknown>[];
+  try {
+    cleanupWrites = await queueCloudinaryCleanup(
+      caller.sa,
+      caller.accessToken,
+      'product',
+      productId,
+      String(product.data.createdByUid || caller.uid),
+      cleanupIds,
+    );
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Image ownership could not be verified.';
+    return jsonResponse({ error: message }, 409, origin);
+  }
+
+  const writes: Record<string, unknown>[] = [
+    {
+      update: {
+        name: firestoreDocumentName(caller.sa, productPath),
+        fields: toFirestoreFields({ imageUrls: nextUrls, imagePublicIds: nextIds }),
+      },
+      updateMask: { fieldPaths: ['imageUrls', 'imagePublicIds'] },
+      currentDocument: { updateTime: product.updateTime },
+    },
+    ...cleanupWrites,
+  ];
+  for (const publicId of nextIds) {
+    if (oldIds.includes(publicId)) continue;
+    const assetPath = await cloudinaryAssetPath(publicId);
+    const asset = await getVersionedDocument(caller.sa, caller.accessToken, assetPath);
+    if (!asset.updateTime || !asset.data) {
+      return jsonResponse({ error: 'Image ownership changed; refresh the product and retry.' }, 409, origin);
+    }
+    writes.push({
+      update: {
+        name: firestoreDocumentName(caller.sa, assetPath),
+        fields: toFirestoreFields({ ...asset.data, status: 'attached' }),
+      },
+      updateMask: { fieldPaths: [...Object.keys(asset.data), 'status'] },
+      currentDocument: { updateTime: asset.updateTime },
+    });
+  }
+  try {
+    await commitFirestoreWrites(caller.sa, caller.accessToken, writes);
+  } catch (error) {
+    console.error('[product] Image metadata update failed', error);
+    let cleanupState = 'Uploaded images remain available for retry.';
+    try {
+      const queued = await queueUnreferencedCloudinaryAssets(
+        caller.sa,
+        caller.accessToken,
+        'product',
+        productId,
+        String(product.data.createdByUid || caller.uid),
+        nextIds.filter((id) => !oldIds.includes(id)),
+      );
+      if (queued) {
+        cleanupState = 'Unreferenced uploaded images are queued for cleanup retry.';
+      }
+    } catch (cleanupError) {
+      console.error('[product] Could not queue cleanup after metadata failure', cleanupError);
+      cleanupState = 'Automatic cleanup could not be queued; retry image cleanup from the app.';
+    }
+    return jsonResponse({ error: `Product image metadata could not be saved. ${cleanupState}` }, 409, origin);
+  }
+  const cleanup = await runCloudinaryCleanup(env, caller.sa, caller.accessToken, 'product', productId);
+  return jsonResponse({ success: true, cleanupPending: cleanup.pending, cleanupMessage: cleanup.reason }, 200, origin);
+}
+
+async function handleUpdatePaymentQrImage(request: Request, env: Env, origin: string | null): Promise<Response> {
+  const caller = await authenticateCaller(request, env, origin);
+  if (!isAuthenticatedCaller(caller)) return caller;
+  if (caller.profile.role !== 'admin') {
+    return jsonResponse({ error: 'Only an administrator can update the payment QR image.' }, 403, origin);
+  }
+  const body = (await request.json().catch(() => null)) as { imageUrl?: unknown; imagePublicId?: unknown } | null;
+  const imageUrl = typeof body?.imageUrl === 'string' ? body.imageUrl : '';
+  const imagePublicId = typeof body?.imagePublicId === 'string' ? body.imagePublicId : '';
+  if (
+    (imageUrl === '') !== (imagePublicId === '') ||
+    (imageUrl !== '' && !/^https:\/\/res\.cloudinary\.com\//.test(imageUrl)) ||
+    imagePublicId.length > 255
+  ) {
+    return jsonResponse({ error: 'A valid matching payment QR URL and Cloudinary ID are required.' }, 400, origin);
+  }
+  const settingsPath = 'settings/payment';
+  const settings = await getVersionedDocument(caller.sa, caller.accessToken, settingsPath);
+  const oldId = typeof settings.data?.qrImagePublicId === 'string' ? settings.data.qrImagePublicId : '';
+  if (settings.data?.qrImageUrl && !oldId) {
+    return jsonResponse({ error: 'The existing payment QR has no ownership ID. Migrate it before replacing or clearing the image.' }, 409, origin);
+  }
+  if (imagePublicId && imagePublicId !== oldId) {
+    const asset = await getVersionedDocument(
+      caller.sa,
+      caller.accessToken,
+      await cloudinaryAssetPath(imagePublicId),
+    );
+    if (
+      !asset.exists ||
+      asset.data?.assetType !== 'payment-qr' ||
+      asset.data?.targetId !== settingsPath ||
+      asset.data?.status !== 'uploaded' ||
+      asset.data?.secureUrl !== imageUrl
+    ) {
+      return jsonResponse({ error: 'The payment QR image has no matching verified upload record.' }, 409, origin);
+    }
+  }
+  let cleanupWrites: Record<string, unknown>[];
+  try {
+    cleanupWrites = await queueCloudinaryCleanup(
+      caller.sa,
+      caller.accessToken,
+      'payment-qr',
+      settingsPath,
+      caller.uid,
+      oldId && oldId !== imagePublicId ? [oldId] : [],
+    );
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Payment QR ownership could not be verified.';
+    return jsonResponse({ error: message }, 409, origin);
+  }
+  const settingsFields = {
+    ...(settings.data || {}),
+    qrImageUrl: imageUrl,
+    qrImagePublicId: imagePublicId,
+    updatedAt: new Date().toISOString(),
+  };
+  const writes: Record<string, unknown>[] = [
+    {
+      update: {
+        name: firestoreDocumentName(caller.sa, settingsPath),
+        fields: toFirestoreFields(settingsFields),
+      },
+      updateMask: { fieldPaths: Object.keys(settingsFields) },
+      currentDocument: settings.exists ? { updateTime: settings.updateTime } : { exists: false },
+    },
+    ...cleanupWrites,
+  ];
+  if (imagePublicId && imagePublicId !== oldId) {
+    const assetPath = await cloudinaryAssetPath(imagePublicId);
+    const asset = await getVersionedDocument(caller.sa, caller.accessToken, assetPath);
+    if (!asset.updateTime || !asset.data) {
+      return jsonResponse({ error: 'Payment QR ownership changed; retry the save.' }, 409, origin);
+    }
+    writes.push({
+      update: {
+        name: firestoreDocumentName(caller.sa, assetPath),
+        fields: toFirestoreFields({ ...asset.data, status: 'attached' }),
+      },
+      updateMask: { fieldPaths: [...Object.keys(asset.data), 'status'] },
+      currentDocument: { updateTime: asset.updateTime },
+    });
+  }
+  try {
+    await commitFirestoreWrites(caller.sa, caller.accessToken, writes);
+  } catch (error) {
+    console.error('[payment-settings] QR metadata update failed', error);
+    let cleanupState = 'The uploaded QR image remains available for retry.';
+    try {
+      if (imagePublicId && imagePublicId !== oldId) {
+        const queued = await queueUnreferencedCloudinaryAssets(
+          caller.sa,
+          caller.accessToken,
+          'payment-qr',
+          settingsPath,
+          caller.uid,
+          [imagePublicId],
+        );
+        if (queued) {
+          cleanupState = 'The unreferenced uploaded QR is queued for cleanup retry.';
+        }
+      }
+    } catch (cleanupError) {
+      console.error('[payment-settings] Could not queue QR cleanup after metadata failure', cleanupError);
+      cleanupState = 'Automatic QR cleanup could not be queued; retry image cleanup from the app.';
+    }
+    return jsonResponse({ error: `Payment QR settings could not be saved. ${cleanupState}` }, 409, origin);
+  }
+  const cleanup = await runCloudinaryCleanup(env, caller.sa, caller.accessToken, 'payment-qr', settingsPath);
+  return jsonResponse({ success: true, cleanupPending: cleanup.pending, cleanupMessage: cleanup.reason }, 200, origin);
+}
+
+async function handleCloudinaryCleanupRequest(request: Request, env: Env, origin: string | null): Promise<Response> {
+  const caller = await authenticateCaller(request, env, origin);
+  if (!isAuthenticatedCaller(caller)) return caller;
+  const body = (await request.json().catch(() => null)) as {
+    assetType?: string;
+    targetId?: string;
+    publicIds?: unknown;
+  } | null;
+  const assetType = body?.assetType;
+  const targetId = typeof body?.targetId === 'string' ? body.targetId : '';
+  if (!['product', 'payment-qr'].includes(String(assetType))) {
+    return jsonResponse({ error: 'A supported Cloudinary asset type is required.' }, 400, origin);
+  }
+  if (assetType === 'payment-qr') {
+    if (caller.profile.role !== 'admin' || targetId !== 'settings/payment') {
+      return jsonResponse({ error: 'Only an administrator can clean up payment QR images.' }, 403, origin);
+    }
+  } else {
+    if (!/^[A-Za-z0-9_-]{1,150}$/.test(targetId) || !['seller', 'admin'].includes(String(caller.profile.role))) {
+      return jsonResponse({ error: 'A valid product ownership target is required.' }, 400, origin);
+    }
+    const product = await getVersionedDocument(caller.sa, caller.accessToken, `products/${targetId}`);
+    const job = await getVersionedDocument(
+      caller.sa,
+      caller.accessToken,
+      cloudinaryCleanupJobPath('product', targetId),
+    );
+    const ownerUid = product.data?.createdByUid || job.data?.ownerUid;
+    if (
+      (product.exists && caller.profile.role !== 'admin' && ownerUid !== caller.uid) ||
+      (!product.exists && (!job.exists || (caller.profile.role !== 'admin' && ownerUid !== caller.uid)))
+    ) {
+      return jsonResponse({ error: 'You are not authorized to clean up this product’s images.' }, 403, origin);
+    }
+  }
+
+  const ids = Array.isArray(body?.publicIds)
+    ? body.publicIds.filter((id): id is string => typeof id === 'string')
+    : [];
+  if (ids.length) {
+    const ownerPath = assetType === 'product' ? `products/${targetId}` : 'settings/payment';
+    const owner = await getVersionedDocument(caller.sa, caller.accessToken, ownerPath);
+    const referencedIds = assetType === 'product'
+      ? (Array.isArray(owner.data?.imagePublicIds) ? owner.data.imagePublicIds : [])
+      : [owner.data?.qrImagePublicId];
+    if (ids.some((id) => referencedIds.includes(id))) {
+      return jsonResponse({ error: 'An image still referenced by its product or payment settings cannot be cleaned up.' }, 409, origin);
+    }
+    const ownerUid = assetType === 'product'
+      ? String(owner.data?.createdByUid || caller.uid)
+      : caller.uid;
+    let writes: Record<string, unknown>[];
+    try {
+      writes = await queueCloudinaryCleanup(
+        caller.sa,
+        caller.accessToken,
+        assetType as CloudinaryAssetType,
+        targetId,
+        ownerUid,
+        ids,
+        true,
+      );
+      writes.push({
+        verify: firestoreDocumentName(caller.sa, ownerPath),
+        currentDocument: owner.exists && owner.updateTime
+          ? { updateTime: owner.updateTime }
+          : { exists: false },
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Image ownership could not be verified.';
+      return jsonResponse({ error: message }, 409, origin);
+    }
+    try {
+      await commitFirestoreWrites(caller.sa, caller.accessToken, writes);
+    } catch (error) {
+      console.error('[cloudinary] Could not queue cleanup', error);
+      return jsonResponse({ error: 'Image cleanup could not be queued. Retry the request.' }, 409, origin);
+    }
+  }
+
+  const cleanup = await runCloudinaryCleanup(
+    env,
+    caller.sa,
+    caller.accessToken,
+    assetType as CloudinaryAssetType,
+    targetId,
+  );
+  return cleanup.pending
+    ? jsonResponse({ success: true, cleanupPending: true, message: cleanup.reason }, 200, origin)
+    : jsonResponse({ success: true, cleanupPending: false }, 200, origin);
 }
 
 async function handleDeleteProduct(request: Request, env: Env, origin: string | null): Promise<Response> {
@@ -742,6 +1641,20 @@ async function handleDeleteProduct(request: Request, env: Env, origin: string | 
   const productPath = `products/${productId}`;
   const product = await getVersionedDocument(caller.sa, caller.accessToken, productPath);
   if (!product.exists || !product.data || !product.updateTime) {
+    const job = await getVersionedDocument(
+      caller.sa,
+      caller.accessToken,
+      cloudinaryCleanupJobPath('product', productId),
+    );
+    if (job.exists && (caller.profile.role === 'admin' || job.data?.ownerUid === caller.uid)) {
+      const cleanup = await runCloudinaryCleanup(env, caller.sa, caller.accessToken, 'product', productId);
+      return jsonResponse({
+        success: true,
+        productId,
+        cleanupPending: cleanup.pending,
+        message: cleanup.pending ? cleanup.reason : 'Product is already deleted.',
+      }, 200, origin);
+    }
     return jsonResponse({ error: 'Product was not found or has already been deleted.' }, 404, origin);
   }
   if (caller.profile.role !== 'admin' && product.data.createdByUid !== caller.uid) {
@@ -749,51 +1662,30 @@ async function handleDeleteProduct(request: Request, env: Env, origin: string | 
   }
 
   const publicIds = Array.isArray(product.data.imagePublicIds)
-    ? product.data.imagePublicIds.filter((id): id is string =>
-        typeof id === 'string' && id.length > 0 && id.length <= 255 && /^[A-Za-z0-9_./-]+$/.test(id),
-      )
+    ? product.data.imagePublicIds.filter((id): id is string => typeof id === 'string')
     : [];
-  if (publicIds.length !== (Array.isArray(product.data.imagePublicIds) ? product.data.imagePublicIds.length : 0)) {
-    return jsonResponse({ error: 'Product contains invalid image references; deletion was stopped for review.' }, 409, origin);
+  const imageUrls = Array.isArray(product.data.imageUrls) ? product.data.imageUrls : [];
+  if (
+    publicIds.length !== (Array.isArray(product.data.imagePublicIds) ? product.data.imagePublicIds.length : 0) ||
+    imageUrls.length !== publicIds.length
+  ) {
+    return jsonResponse({
+      error: 'This product has legacy images without matching verified ownership records. Migrate them before deleting the product.',
+    }, 409, origin);
   }
-
-  if (publicIds.length > 0) {
-    if (!env.CLOUDINARY_CLOUD_NAME || !env.CLOUDINARY_API_KEY || !env.CLOUDINARY_API_SECRET) {
-      return jsonResponse({ error: 'Cloudinary deletion is not configured. The product was not deleted.' }, 503, origin);
-    }
-    const form = new URLSearchParams();
-    for (const publicId of publicIds) form.append('public_ids[]', publicId);
-    let cloudinaryResponse: Response;
-    try {
-      cloudinaryResponse = await fetch(
-        `https://api.cloudinary.com/v1_1/${encodeURIComponent(env.CLOUDINARY_CLOUD_NAME)}/resources/image/upload`,
-        {
-          method: 'DELETE',
-          headers: {
-            Authorization: `Basic ${btoa(`${env.CLOUDINARY_API_KEY}:${env.CLOUDINARY_API_SECRET}`)}`,
-            'Content-Type': 'application/x-www-form-urlencoded',
-          },
-          body: form.toString(),
-        },
-      );
-    } catch (error) {
-      console.error('[product] Cloudinary deletion request failed', error);
-      return jsonResponse({ error: 'Could not delete the product images. The product was not deleted.' }, 502, origin);
-    }
-    const cloudinaryResult = (await cloudinaryResponse.json().catch(() => null)) as {
-      deleted?: Record<string, string>;
-    } | null;
-    const deleted = cloudinaryResult?.deleted ?? {};
-    const allHandled = cloudinaryResponse.ok && publicIds.every(
-      (publicId) => deleted[publicId] === 'deleted' || deleted[publicId] === 'not_found',
+  let cleanupWrites: Record<string, unknown>[];
+  try {
+    cleanupWrites = await queueCloudinaryCleanup(
+      caller.sa,
+      caller.accessToken,
+      'product',
+      productId,
+      String(product.data.createdByUid || caller.uid),
+      publicIds,
     );
-    if (!allHandled) {
-      console.error('[product] Cloudinary did not delete every product image', {
-        status: cloudinaryResponse.status,
-        outcomes: deleted,
-      });
-      return jsonResponse({ error: 'Could not delete all product images. The product was not deleted; retry after checking Cloudinary.' }, 502, origin);
-    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Image ownership could not be verified.';
+    return jsonResponse({ error: message }, 409, origin);
   }
 
   const privatePath = `${productPath}/private/data`;
@@ -804,6 +1696,7 @@ async function handleDeleteProduct(request: Request, env: Env, origin: string | 
       currentDocument: { updateTime: product.updateTime },
     },
   ];
+  writes.push(...cleanupWrites);
   if (privateDocument.exists && privateDocument.updateTime) {
     writes.push({
       delete: firestoreDocumentName(caller.sa, privatePath),
@@ -815,13 +1708,15 @@ async function handleDeleteProduct(request: Request, env: Env, origin: string | 
     await commitFirestoreWrites(caller.sa, caller.accessToken, writes);
   } catch (error) {
     console.error('[product] Product documents could not be deleted atomically', error);
-    return jsonResponse({
-      error: publicIds.length
-        ? 'Images were deleted, but the product record changed before it could be removed. Refresh and retry.'
-        : 'Product could not be deleted because its record changed. Refresh and retry.',
-    }, 409, origin);
+    return jsonResponse({ error: 'Product record changed before it could be removed. Refresh and retry.' }, 409, origin);
   }
-  return jsonResponse({ success: true, productId }, 200, origin);
+  const cleanup = await runCloudinaryCleanup(env, caller.sa, caller.accessToken, 'product', productId);
+  return jsonResponse({
+    success: true,
+    productId,
+    cleanupPending: cleanup.pending,
+    message: cleanup.pending ? cleanup.reason : undefined,
+  }, 200, origin);
 }
 
 async function hashValue(value: string): Promise<string> {
@@ -899,9 +1794,18 @@ function hasValidTrustedOrderPricing(order: Record<string, unknown>): boolean {
 function adminPaymentReviewAuditWrite(
   sa: ReturnType<typeof parseServiceAccount>,
   caller: AuthenticatedCaller,
-  orderId: string,
-  action: 'Confirm Manual UPI Payment' | 'Reject Manual UPI Payment',
+  targetId: string,
+  targetType: 'order' | 'payment_attempt',
+  action:
+    | 'Confirm Manual UPI Payment'
+    | 'Reject Manual UPI Payment'
+    | 'Confirm Payment Attempt'
+    | 'Reject Payment Attempt'
+    | 'Cancel Payment Attempt'
+    | 'Expire Payment Attempt',
+  reviewAction: 'Confirmed' | 'Rejected' | 'Cancelled' | 'Expired',
   now: string,
+  details: string,
 ): Record<string, unknown> {
   const logId = crypto.randomUUID();
   return {
@@ -911,9 +1815,11 @@ function adminPaymentReviewAuditWrite(
         adminEmail: caller.email || 'admin',
         adminUid: caller.uid,
         action,
-        targetId: orderId,
-        details: `${action === 'Confirm Manual UPI Payment' ? 'Verified' : 'Rejected'} manual UPI order ${orderId}`,
+        targetId,
+        details,
         timestamp: now,
+        paymentReviewAction: reviewAction,
+        paymentReviewTargetType: targetType,
       }),
     },
     currentDocument: { exists: false },
@@ -1261,6 +2167,16 @@ async function handleConfirmPaymentAttempt(request: Request, env: Env, origin: s
       },
       currentDocument: { exists: false },
     },
+    adminPaymentReviewAuditWrite(
+      caller.sa,
+      caller,
+      attemptId,
+      'payment_attempt',
+      'Confirm Payment Attempt',
+      'Confirmed',
+      now,
+      `Verified payment attempt ${attemptId}`,
+    ),
   ];
   if (!claim.exists) {
     writes.push({
@@ -1339,19 +2255,36 @@ async function handlePaymentAttemptAction(
   const status = action === 'reject' ? 'Rejected' : action === 'expire' ? 'Expired' : 'Cancelled';
   const now = new Date().toISOString();
   try {
-    await commitFirestoreWrites(caller.sa, caller.accessToken, [{
-      update: {
-        name: firestoreDocumentName(caller.sa, path),
-        fields: toFirestoreFields({
-          status,
-          rejectionReason: reason,
-          reviewedAt: now,
-          reviewedByUid: caller.uid,
-        }),
+    const actionLabel = action === 'reject'
+      ? 'Reject Payment Attempt'
+      : action === 'expire'
+        ? 'Expire Payment Attempt'
+        : 'Cancel Payment Attempt';
+    await commitFirestoreWrites(caller.sa, caller.accessToken, [
+      {
+        update: {
+          name: firestoreDocumentName(caller.sa, path),
+          fields: toFirestoreFields({
+            status,
+            rejectionReason: reason,
+            reviewedAt: now,
+            reviewedByUid: caller.uid,
+          }),
+        },
+        updateMask: { fieldPaths: ['status', 'rejectionReason', 'reviewedAt', 'reviewedByUid'] },
+        currentDocument: { updateTime: attempt.updateTime },
       },
-      updateMask: { fieldPaths: ['status', 'rejectionReason', 'reviewedAt', 'reviewedByUid'] },
-      currentDocument: { updateTime: attempt.updateTime },
-    }]);
+      adminPaymentReviewAuditWrite(
+        caller.sa,
+        caller,
+        attemptId,
+        'payment_attempt',
+        actionLabel,
+        status,
+        now,
+        `${actionLabel} ${attemptId}: ${reason}`,
+      ),
+    ]);
   } catch (error) {
     const retry = await getVersionedDocument(caller.sa, caller.accessToken, path);
     if (retry.data?.status === status) return jsonResponse({ success: true, status }, 200, origin);
@@ -1443,7 +2376,16 @@ async function handleConfirmManualUpiOrderPayment(request: Request, env: Env, or
       currentDocument: { exists: false },
     });
   }
-  writes.push(adminPaymentReviewAuditWrite(caller.sa, caller, orderId, 'Confirm Manual UPI Payment', now));
+  writes.push(adminPaymentReviewAuditWrite(
+    caller.sa,
+    caller,
+    orderId,
+    'order',
+    'Confirm Manual UPI Payment',
+    'Confirmed',
+    now,
+    `Verified manual UPI order ${orderId}`,
+  ));
   try {
     await commitFirestoreWrites(caller.sa, caller.accessToken, writes);
   } catch (error) {
@@ -1520,7 +2462,16 @@ async function handleRejectManualUpiOrderPayment(request: Request, env: Env, ori
         },
         currentDocument: { updateTime: order.updateTime },
       },
-      adminPaymentReviewAuditWrite(caller.sa, caller, orderId, 'Reject Manual UPI Payment', now),
+      adminPaymentReviewAuditWrite(
+        caller.sa,
+        caller,
+        orderId,
+        'order',
+        'Reject Manual UPI Payment',
+        'Rejected',
+        now,
+        `Rejected manual UPI order ${orderId}: ${reason}`,
+      ),
     ]);
   } catch (error) {
     const retry = await getVersionedDocument(caller.sa, caller.accessToken, path);
@@ -1560,7 +2511,13 @@ export default {
 
       if (url.pathname === '/send-otp') return handleSendOtp(request, env, origin);
       if (url.pathname === '/verify-otp') return handleVerifyOtp(request, env, origin);
+      if (url.pathname === '/cloudinary/upload') return handleCloudinaryUpload(request, env, origin);
+      if (url.pathname === '/cloudinary/cleanup') return handleCloudinaryCleanupRequest(request, env, origin);
       if (url.pathname === '/seller/products/delete') return handleDeleteProduct(request, env, origin);
+      if (url.pathname === '/seller/products/images') return handleUpdateProductImages(request, env, origin);
+      if (url.pathname === '/admin/payment-settings/qr-image') {
+        return handleUpdatePaymentQrImage(request, env, origin);
+      }
       if (url.pathname === '/manual-upi/orders/create') return handleCreateManualUpiOrder(request, env, origin);
       if (url.pathname === '/payment-attempts/create') return handleCreatePaymentAttempt(request, env, origin);
       if (url.pathname === '/create-order') {
@@ -1585,4 +2542,133 @@ export default {
       return jsonResponse({ error: 'The request could not be completed. Please retry.' }, 500, origin);
     }
   },
+
+  async scheduled(_controller: ScheduledController, env: Env, context: ExecutionContext): Promise<void> {
+    context.waitUntil(retryPendingCloudinaryCleanup(env));
+  },
 };
+
+async function retryPendingCloudinaryCleanup(env: Env): Promise<void> {
+  try {
+    const sa = parseServiceAccount(env.FIREBASE_SERVICE_ACCOUNT_JSON);
+    const accessToken = await getGoogleAccessToken(sa);
+    const jobs = await listScheduledCloudinaryPage(
+      env, sa, accessToken, 'cloudinary_cleanup_jobs', 'cloudinary-cleanup-jobs-cursor',
+    );
+    for (const document of jobs) {
+      const data = fromFirestoreFields(document.fields || {});
+      if (
+        (data.assetType === 'product' || data.assetType === 'payment-qr') &&
+        typeof data.targetId === 'string'
+      ) {
+        const result = await runCloudinaryCleanup(env, sa, accessToken, data.assetType, data.targetId);
+        if (result.pending) {
+          console.warn('[cloudinary] Scheduled cleanup remains pending.', {
+            targetType: data.assetType,
+            reason: result.reason,
+          });
+        }
+      }
+    }
+    await recoverStaleCloudinaryUploads(env, sa, accessToken);
+  } catch {
+    console.error('[cloudinary] Scheduled cleanup scan failed; the next invocation will retry.');
+  }
+}
+
+async function listScheduledCloudinaryPage(
+  env: Env,
+  sa: ReturnType<typeof parseServiceAccount>,
+  accessToken: string,
+  collection: 'cloudinary_cleanup_jobs' | 'cloudinary_assets',
+  cursorKey: string,
+): Promise<Array<{ name: string; fields?: Record<string, unknown> }>> {
+  const pageToken = await env.OTP_KV.get(cursorKey);
+  const url = new URL(
+    `https://firestore.googleapis.com/v1/projects/${sa.project_id}/databases/(default)/documents/${collection}`,
+  );
+  url.searchParams.set('pageSize', '10');
+  if (pageToken) url.searchParams.set('pageToken', pageToken);
+  let response: Response;
+  try {
+    response = await fetch(url, { headers: { Authorization: `Bearer ${accessToken}` } });
+  } catch {
+    await env.OTP_KV.delete(cursorKey);
+    throw new Error('Firestore scheduled scan request failed.');
+  }
+  if (!response.ok) {
+    await env.OTP_KV.delete(cursorKey);
+    throw new Error(`Firestore scheduled scan returned HTTP ${response.status}.`);
+  }
+  let page: {
+    documents?: Array<{ name: string; fields?: Record<string, unknown> }>;
+    nextPageToken?: string;
+  };
+  try {
+    page = (await response.json()) as typeof page;
+  } catch {
+    await env.OTP_KV.delete(cursorKey);
+    throw new Error('Firestore scheduled scan response was invalid.');
+  }
+  if (page.nextPageToken) {
+    await env.OTP_KV.put(cursorKey, page.nextPageToken, { expirationTtl: 7 * 24 * 60 * 60 });
+  } else {
+    await env.OTP_KV.delete(cursorKey);
+  }
+  return page.documents || [];
+}
+
+async function recoverStaleCloudinaryUploads(
+  env: Env,
+  sa: ReturnType<typeof parseServiceAccount>,
+  accessToken: string,
+): Promise<void> {
+  const documents = await listScheduledCloudinaryPage(
+    env, sa, accessToken, 'cloudinary_assets', 'cloudinary-assets-cursor',
+  );
+  const now = Date.now();
+  for (const document of documents) {
+    const data = fromFirestoreFields(document.fields || {});
+    if (
+      (data.status !== 'uploading' && data.status !== 'uploaded') ||
+      typeof data.publicId !== 'string' ||
+      typeof data.targetId !== 'string' ||
+      typeof data.ownerUid !== 'string' ||
+      !data.ownerUid ||
+      (data.assetType !== 'product' && data.assetType !== 'payment-qr')
+    ) continue;
+    const createdAt = typeof data.createdAt === 'string' ? Date.parse(data.createdAt) : NaN;
+    const staleAfter = data.status === 'uploading'
+      ? STALE_CLOUDINARY_UPLOAD_MS
+      : STALE_UNATTACHED_CLOUDINARY_ASSET_MS;
+    if (!Number.isFinite(createdAt) || now - createdAt < staleAfter) continue;
+    if (
+      (data.assetType === 'product' && !/^[A-Za-z0-9_-]{1,150}$/.test(data.targetId)) ||
+      (data.assetType === 'payment-qr' && data.targetId !== 'settings/payment') ||
+      await cloudinaryAssetPath(data.publicId) !== document.name.split('/documents/').at(-1)
+    ) continue;
+
+    const targetPath = data.assetType === 'product' ? `products/${data.targetId}` : 'settings/payment';
+    const target = await getVersionedDocument(sa, accessToken, targetPath);
+    const references = data.assetType === 'product'
+      ? (Array.isArray(target.data?.imagePublicIds) ? target.data.imagePublicIds : [])
+      : [target.data?.qrImagePublicId];
+    if (references.includes(data.publicId)) continue;
+
+    try {
+      const writes = await queueCloudinaryCleanup(
+        sa, accessToken, data.assetType, data.targetId, data.ownerUid, [data.publicId], true,
+      );
+      writes.push({
+        verify: firestoreDocumentName(sa, targetPath),
+        currentDocument: target.exists && target.updateTime
+          ? { updateTime: target.updateTime }
+          : { exists: false },
+      });
+      await commitFirestoreWrites(sa, accessToken, writes);
+      await runCloudinaryCleanup(env, sa, accessToken, data.assetType, data.targetId);
+    } catch {
+      console.error('[cloudinary] Stale upload cleanup could not be persisted; recovery will retry.');
+    }
+  }
+}

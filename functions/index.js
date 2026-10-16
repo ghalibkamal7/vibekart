@@ -12,8 +12,8 @@ const db = getFirestore();
 // Blaze plan just to deploy.
 //   - Mobile OTP now goes through a Cloudflare Worker instead (Cloudflare's
 //     free tier) — see workers/otp/ and services/firebase/auth.ts.
-//   - Cloudinary now uses an unsigned upload preset from the client
-//     directly — see services/cloudinary/upload.ts and README.md.
+//   - Cloudinary image uploads and cleanup now go through the authenticated
+//     Cloudflare Worker — see workers/otp/ and services/cloudinary/upload.ts.
 //
 // reconcileOrderCost below is the one Cloud Function this project still
 // has. It still requires Blaze to deploy, same as any Cloud Function would

@@ -107,9 +107,12 @@ service cloud.firestore {
     match /products/{productId} {
       allow read: if isSignedIn();
       allow create: if isSeller() &&
-        request.resource.data.createdByUid == request.auth.uid;
+        request.resource.data.createdByUid == request.auth.uid &&
+        !('imageUrls' in request.resource.data) &&
+        !('imagePublicIds' in request.resource.data);
       allow update: if isSeller() &&
         request.resource.data.get('createdByUid', null) == resource.data.get('createdByUid', null) &&
+        !request.resource.data.diff(resource.data).affectedKeys().hasAny(['imageUrls', 'imagePublicIds']) &&
         (isAdmin() || resource.data.get('createdByUid', null) == request.auth.uid);
       // Deletion is routed through the Worker so Cloudinary cleanup and both
       // Firestore product documents are handled together.
@@ -134,64 +137,9 @@ service cloud.firestore {
         isSeller()
       );
 
-      // Payment status changes and UTR claims go through the authenticated
-      // Worker. Keep a narrowly scoped admin rule for the equivalent review
-      // transaction; customers may submit only an unverified UTR on their order.
+      // Payment state transitions, reference claims, and their audit records
+      // are committed only by the authenticated Worker.
       allow update: if (
-        isAdmin() &&
-        resource.data.paymentMethod == 'UPI' &&
-        resource.data.get('paymentStatus', 'Selected') in ['Pending', 'Selected'] &&
-        resource.data.status == 'Placed' &&
-        request.resource.data.diff(resource.data).affectedKeys().hasOnly([
-          'paymentStatus',
-          'paymentReference',
-          'paymentVerifiedAt',
-          'paymentReviewedByUid',
-          'paymentReviewedAt',
-          'paymentReviewAction',
-          'paymentReviewReason',
-          'status'
-        ]) &&
-        (
-          (
-            request.resource.data.diff(resource.data).affectedKeys().hasOnly([
-              'paymentStatus',
-              'paymentReference',
-              'paymentVerifiedAt',
-              'paymentReviewedByUid',
-              'paymentReviewedAt',
-              'paymentReviewAction'
-            ]) &&
-            request.resource.data.paymentStatus == 'Paid' &&
-            request.resource.data.status == resource.data.status &&
-            request.resource.data.paymentReference is string &&
-            request.resource.data.paymentReference.size() > 0 &&
-            request.resource.data.paymentReference.size() <= 100 &&
-            request.resource.data.paymentVerifiedAt == request.time &&
-            request.resource.data.paymentReviewedByUid == request.auth.uid &&
-            request.resource.data.paymentReviewedAt == request.time &&
-            request.resource.data.paymentReviewAction == 'Confirmed'
-          ) ||
-          (
-            request.resource.data.diff(resource.data).affectedKeys().hasOnly([
-              'paymentStatus',
-              'status',
-              'paymentReviewReason',
-              'paymentReviewedByUid',
-              'paymentReviewedAt',
-              'paymentReviewAction'
-            ]) &&
-            request.resource.data.paymentStatus == 'Failed' &&
-            request.resource.data.status == 'Cancelled' &&
-            request.resource.data.paymentReviewReason is string &&
-            request.resource.data.paymentReviewReason.size() > 0 &&
-            request.resource.data.paymentReviewReason.size() <= 300 &&
-            request.resource.data.paymentReviewedByUid == request.auth.uid &&
-            request.resource.data.paymentReviewedAt == request.time &&
-            request.resource.data.paymentReviewAction == 'Rejected'
-          )
-        )
-      ) || (
         isActiveAccount() &&
         resource.data.customerUid == request.auth.uid &&
         resource.data.paymentMethod == 'UPI' &&
@@ -256,24 +204,7 @@ service cloud.firestore {
     // being used to confirm more than one payment/order.
     match /payment_reference_claims/{referenceHash} {
       allow read: if isAdmin();
-      allow create: if isAdmin() &&
-        request.resource.data.keys().hasOnly(['orderId', 'reference', 'createdAt', 'claimedAt']) &&
-        request.resource.data.orderId is string &&
-        request.resource.data.reference is string &&
-        request.resource.data.reference.size() > 0 &&
-        (
-          (
-            'createdAt' in request.resource.data &&
-            !('claimedAt' in request.resource.data) &&
-            request.resource.data.createdAt == request.time
-          ) ||
-          (
-            'claimedAt' in request.resource.data &&
-            !('createdAt' in request.resource.data) &&
-            request.resource.data.claimedAt == request.time
-          )
-        );
-      allow update, delete: if false;
+      allow create, update, delete: if false;
     }
 
     // ---------------- settings ----------------
@@ -281,7 +212,20 @@ service cloud.firestore {
     // Write: only admins.
     match /settings/{settingId} {
       allow read: if isSignedIn();
-      allow write: if isAdmin();
+      allow create: if isAdmin() &&
+        !('qrImageUrl' in request.resource.data) &&
+        !('qrImagePublicId' in request.resource.data);
+      allow update: if isAdmin() &&
+        !request.resource.data.diff(resource.data).affectedKeys().hasAny(['qrImageUrl', 'qrImagePublicId']);
+      allow delete: if isAdmin() && settingId != 'payment';
+    }
+
+    // Cloudinary ownership and retry jobs are written only by the trusted Worker.
+    match /cloudinary_assets/{assetId} {
+      allow read, write: if false;
+    }
+    match /cloudinary_cleanup_jobs/{jobId} {
+      allow read, write: if false;
     }
 
     // ---------------- audit_logs ----------------
@@ -293,7 +237,30 @@ service cloud.firestore {
     match /audit_logs/{logId} {
       allow read: if isAdmin();
       allow create: if isAdmin() &&
-        request.resource.data.adminUid == request.auth.uid;
+        request.resource.data.adminUid == request.auth.uid &&
+        !request.resource.data.keys().hasAny([
+          'paymentStatus',
+          'paymentReference',
+          'paymentVerifiedAt',
+          'paymentReviewedByUid',
+          'paymentReviewedAt',
+          'paymentReviewAction',
+          'paymentReviewReason',
+          'paymentReviewTargetType',
+          'paymentAttemptId'
+        ]) &&
+        request.resource.data.action in [
+          'Update Role',
+          'Update Account Status',
+          'Update Store Settings',
+          'Update Payment Settings',
+          'Add Category',
+          'Delete Category',
+          'Delete Product',
+          'Update Order Status',
+          'Cancel Order',
+          'Set Tracking ID'
+        ];
       allow update, delete: if false;
     }
   }

@@ -31,6 +31,7 @@ import {
 } from '@/data/store';
 import { auth, db } from './config';
 import { UserProfile, UserRole } from './auth';
+import { sanitizeAuditLogPayload } from './audit';
 
 const PRODUCTS_COLLECTION = 'products';
 const CATEGORIES_COLLECTION = 'categories';
@@ -526,11 +527,13 @@ export async function fetchPaymentSettingsRemote(): Promise<PaymentSettings> {
 }
 
 export async function updatePaymentSettingsRemote(settings: Partial<PaymentSettings>): Promise<void> {
+  const { qrImageUrl: _qrImageUrl, qrImagePublicId: _qrImagePublicId, ...safeSettings } = settings;
+  if (!Object.keys(safeSettings).length) return;
   const database = requireDb();
   await setDoc(
     doc(database, SETTINGS_COLLECTION, PAYMENT_SETTINGS_DOC_ID),
     {
-      ...settings,
+      ...safeSettings,
       updatedAt: serverTimestamp(),
     },
     { merge: true },
@@ -566,15 +569,17 @@ export async function createAuditLogRemote(
   log: Omit<AdminAuditLog, 'id' | 'timestamp'>,
 ): Promise<string> {
   const database = requireDb();
+  const sanitizedLog = sanitizeAuditLogPayload(log);
   try {
     const ref = await addDoc(collection(database, AUDIT_LOGS_COLLECTION), {
-      ...log,
+      ...sanitizedLog,
       timestamp: serverTimestamp(),
     });
     return ref.id;
   } catch (err) {
+    const message = err instanceof Error ? err.message : 'Unknown audit log write error.';
     console.warn('[firestore] createAuditLogRemote failed', err);
-    return `local-${Date.now()}`;
+    throw new Error(`Audit log write failed: ${message}`);
   }
 }
 
@@ -604,14 +609,15 @@ async function postPaymentWorker<T>(path: string, input: unknown): Promise<T> {
   return payload;
 }
 
-export async function deleteProductViaWorker(productId: string): Promise<void> {
-  const response = await postPaymentWorker<{ success: boolean; productId?: string }>(
+export async function deleteProductViaWorker(productId: string): Promise<boolean> {
+  const response = await postPaymentWorker<{ success: boolean; productId?: string; cleanupPending?: boolean }>(
     '/seller/products/delete',
     { productId },
   );
   if (!response.success || response.productId !== productId) {
     throw new Error('Product deletion could not be confirmed. Refresh the catalogue and retry.');
   }
+  return response.cleanupPending === true;
 }
 
 export async function createPaymentAttemptViaWorker(input: {

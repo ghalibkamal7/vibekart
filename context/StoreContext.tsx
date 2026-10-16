@@ -36,7 +36,9 @@ import {
   UserProfile,
   UserRole,
 } from '@/services/firebase/auth';
+import { sanitizeAuditLogPayload } from '@/services/firebase/audit';
 import { isFirebaseConfigured } from '@/services/firebase/config';
+import { updatePaymentQrViaWorker } from '@/services/cloudinary/upload';
 import {
   createAuditLogRemote,
   createCategoryRemote,
@@ -85,15 +87,28 @@ export type AuthUser =
   | { isGuest: false; uid: string; email: string; name: string; phone?: string; role: UserRole }
   | null;
 
+type FirestoreListenerStatus = 'loading' | 'ready' | 'error';
+type FirestoreListenerState = {
+  status: FirestoreListenerStatus;
+  error: string | null;
+  retryAction: string | null;
+};
+
 type StoreContextValue = {
   // mode
   isCloudMode: boolean; // true once Firebase is configured AND a real (non-guest) user is signed in
+  dataLoadState: {
+    products: FirestoreListenerState;
+    categories: FirestoreListenerState;
+    orders: FirestoreListenerState;
+    paymentAttempts: FirestoreListenerState;
+  };
 
   // catalogue
   products: Product[];
   addProduct: (input: NewProductInput) => Promise<string>;
   updateProduct: (id: string, patch: Partial<NewProductInput>) => Promise<void>;
-  deleteProduct: (id: string) => Promise<void>;
+  deleteProduct: (id: string) => Promise<boolean>;
   deletingProductId: string | null;
   toggleStock: (id: string) => Promise<void>;
   toggleEnabled: (id: string) => Promise<void>;
@@ -195,6 +210,21 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   const [products, setProducts] = useState<Product[]>(defaultProducts);
   const [deletingProductId, setDeletingProductId] = useState<string | null>(null);
   const deletingProductLock = useRef(false);
+  const [dataLoadState, setDataLoadState] = useState<StoreContextValue['dataLoadState']>({
+    products: { status: 'loading', error: null, retryAction: 'Reload products' },
+    categories: { status: 'loading', error: null, retryAction: 'Reload categories' },
+    orders: { status: 'loading', error: null, retryAction: 'Reload orders' },
+    paymentAttempts: { status: 'loading', error: null, retryAction: 'Reload payment attempts' },
+  });
+  const updateDataLoadState = (
+    key: keyof StoreContextValue['dataLoadState'],
+    patch: Partial<FirestoreListenerState>,
+  ) => {
+    setDataLoadState((current) => ({
+      ...current,
+      [key]: { ...current[key], ...patch },
+    }));
+  };
   const [categories, setCategories] = useState<CategoryItem[]>(defaultCategoryItems);
   const [cart, setCart] = useState<CartLine[]>([]);
   const [orders, setOrders] = useState<Order[]>([]);
@@ -376,16 +406,40 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
 
   useEffect(() => {
     if (isCloudMode) {
+      updateDataLoadState('products', { status: 'loading', error: null, retryAction: 'Reload products' });
       if (authUser && !authUser.isGuest && authUser.role === 'seller') {
-        refreshSellerProducts();
+        refreshSellerProducts()
+          .then(() => updateDataLoadState('products', { status: 'ready', error: null, retryAction: null }))
+          .catch((error) => {
+            const message = error instanceof Error ? error.message : 'Could not refresh products.';
+            console.warn('[products] failed to refresh seller catalogue', message);
+            updateDataLoadState('products', {
+              status: 'error',
+              error: message,
+              retryAction: 'Reload products',
+            });
+          });
         return;
       }
-      const unsubscribe = subscribeToProducts(setProducts, (error) =>
-        console.warn('[products]', error.message),
+      const unsubscribe = subscribeToProducts(
+        (remoteProducts) => {
+          setProducts(remoteProducts);
+          updateDataLoadState('products', { status: 'ready', error: null, retryAction: null });
+        },
+        (error) => {
+          const message = error instanceof Error ? error.message : 'Could not load products.';
+          console.warn('[products]', message);
+          updateDataLoadState('products', {
+            status: 'error',
+            error: message,
+            retryAction: 'Reload products',
+          });
+        },
       );
       return unsubscribe;
     }
 
+    updateDataLoadState('products', { status: 'loading', error: null, retryAction: 'Reload products' });
     AsyncStorage.getItem(STORAGE_KEYS.products).then((saved) => {
       if (saved) {
         try {
@@ -399,12 +453,24 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
               inStock: p.inStock ?? true,
             })),
           );
+          updateDataLoadState('products', { status: 'ready', error: null, retryAction: null });
         } catch {
           setProducts(defaultProducts);
+          updateDataLoadState('products', { status: 'ready', error: null, retryAction: null });
         }
       } else {
         setProducts(defaultProducts);
+        updateDataLoadState('products', { status: 'ready', error: null, retryAction: null });
       }
+    }).catch((error) => {
+      const message = error instanceof Error ? error.message : 'Could not load local products.';
+      console.warn('[products] local-cache read failed', message);
+      setProducts(defaultProducts);
+      updateDataLoadState('products', {
+        status: 'error',
+        error: message,
+        retryAction: 'Reload products',
+      });
     });
   }, [isCloudMode, authUser && !authUser.isGuest ? authUser.role : null]);
 
@@ -415,10 +481,12 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   // ---------------- categories ----------------
   useEffect(() => {
     if (isCloudMode) {
+      updateDataLoadState('categories', { status: 'loading', error: null, retryAction: 'Reload categories' });
       const unsubscribe = subscribeToCategories(
         (remoteCategories) => {
           if (remoteCategories.length > 0) {
             setCategories(remoteCategories);
+            updateDataLoadState('categories', { status: 'ready', error: null, retryAction: null });
           } else if (authUser && !authUser.isGuest && authUser.role === 'seller') {
             (async () => {
               try {
@@ -431,22 +499,37 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
                     enabled: cat.enabled,
                   });
                 }
+                updateDataLoadState('categories', { status: 'ready', error: null, retryAction: null });
               } catch (seedErr) {
+                const message = seedErr instanceof Error ? seedErr.message : 'Failed to seed default categories.';
                 console.warn('[categories] failed to seed default categories', seedErr);
+                updateDataLoadState('categories', {
+                  status: 'error',
+                  error: message,
+                  retryAction: 'Reload categories',
+                });
               }
             })();
           } else {
             setCategories(defaultCategoryItems);
+            updateDataLoadState('categories', { status: 'ready', error: null, retryAction: null });
           }
         },
         (error) => {
-          console.warn('[categories] listener error', error.message);
+          const message = error instanceof Error ? error.message : 'Could not load categories.';
+          console.warn('[categories] listener error', message);
           setCategories(defaultCategoryItems);
+          updateDataLoadState('categories', {
+            status: 'error',
+            error: message,
+            retryAction: 'Reload categories',
+          });
         },
       );
       return unsubscribe;
     }
 
+    updateDataLoadState('categories', { status: 'loading', error: null, retryAction: 'Reload categories' });
     AsyncStorage.getItem(STORAGE_KEYS.categories).then((saved) => {
       if (saved) {
         try {
@@ -463,6 +546,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
                 updatedAt: c.updatedAt,
               })),
             );
+            updateDataLoadState('categories', { status: 'ready', error: null, retryAction: null });
             return;
           }
         } catch {
@@ -470,6 +554,16 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         }
       }
       setCategories(defaultCategoryItems);
+      updateDataLoadState('categories', { status: 'ready', error: null, retryAction: null });
+    }).catch((error) => {
+      const message = error instanceof Error ? error.message : 'Could not load local categories.';
+      console.warn('[categories] local-cache read failed', message);
+      setCategories(defaultCategoryItems);
+      updateDataLoadState('categories', {
+        status: 'error',
+        error: message,
+        retryAction: 'Reload categories',
+      });
     });
   }, [isCloudMode, authUser && !authUser.isGuest ? authUser.role : null]);
 
@@ -534,14 +628,16 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     deletingProductLock.current = true;
     setDeletingProductId(id);
     try {
+      let cleanupPending = false;
       if (isCloudMode) {
         if (!authUser || authUser.isGuest || !['seller', 'admin'].includes(authUser.role)) {
           throw new Error('Only an authorized seller or administrator can delete products.');
         }
-        await deleteProductViaWorker(id);
+        cleanupPending = await deleteProductViaWorker(id);
       }
       setProducts((current) => current.filter((product) => product.id !== id));
       setCart((current) => current.filter((line) => line.product.id !== id));
+      return cleanupPending;
     } finally {
       deletingProductLock.current = false;
       setDeletingProductId(null);
@@ -695,11 +791,39 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
 
   useEffect(() => {
     if (isCloudMode && authUser && !authUser.isGuest) {
+      updateDataLoadState('orders', { status: 'loading', error: null, retryAction: 'Reload orders' });
+      updateDataLoadState('paymentAttempts', { status: 'loading', error: null, retryAction: 'Reload payment attempts' });
       const uidFilter = authUser.role === 'seller' || authUser.role === 'admin' ? undefined : authUser.uid;
-      const unsubscribe = subscribeToOrders(setOrders, (error) => console.warn('[orders]', error.message), uidFilter);
+      const unsubscribe = subscribeToOrders(
+        (remoteOrders) => {
+          setOrders(remoteOrders);
+          updateDataLoadState('orders', { status: 'ready', error: null, retryAction: null });
+        },
+        (error) => {
+          const message = error instanceof Error ? error.message : 'Could not load orders.';
+          console.warn('[orders]', message);
+          updateDataLoadState('orders', {
+            status: 'error',
+            error: message,
+            retryAction: 'Reload orders',
+          });
+        },
+        uidFilter,
+      );
       const unsubscribeAttempts = subscribeToPaymentAttempts(
-        setPaymentAttempts,
-        (error) => console.warn('[payment attempts]', error.message),
+        (remoteAttempts) => {
+          setPaymentAttempts(remoteAttempts);
+          updateDataLoadState('paymentAttempts', { status: 'ready', error: null, retryAction: null });
+        },
+        (error) => {
+          const message = error instanceof Error ? error.message : 'Could not load payment attempts.';
+          console.warn('[payment attempts]', message);
+          updateDataLoadState('paymentAttempts', {
+            status: 'error',
+            error: message,
+            retryAction: 'Reload payment attempts',
+          });
+        },
         authUser.role === 'admin' ? undefined : authUser.uid,
       );
       return () => {
@@ -709,9 +833,21 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     }
 
     setPaymentAttempts([]);
+    updateDataLoadState('orders', { status: 'loading', error: null, retryAction: 'Reload orders' });
     AsyncStorage.getItem(STORAGE_KEYS.orders).then((saved) => {
       setOrders(saved ? (JSON.parse(saved) as Order[]) : []);
+      updateDataLoadState('orders', { status: 'ready', error: null, retryAction: null });
+    }).catch((error) => {
+      const message = error instanceof Error ? error.message : 'Could not load local orders.';
+      console.warn('[orders] local-cache read failed', message);
+      setOrders([]);
+      updateDataLoadState('orders', {
+        status: 'error',
+        error: message,
+        retryAction: 'Reload orders',
+      });
     });
+    updateDataLoadState('paymentAttempts', { status: 'ready', error: null, retryAction: null });
   }, [isCloudMode, authUser && !authUser.isGuest ? `${authUser.role}:${authUser.uid}` : null]);
 
   useEffect(() => {
@@ -761,11 +897,13 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   const verifyPaymentAttempt: StoreContextValue['verifyPaymentAttempt'] = async (attemptId) => {
     if (!isAdmin || !isCloudMode) throw new Error('Only an authenticated administrator can verify payments.');
     await confirmPaymentAttemptViaWorker(attemptId);
+    setAuditLogs(await fetchAuditLogsRemote());
   };
 
   const reviewPaymentAttempt: StoreContextValue['reviewPaymentAttempt'] = async (action, attemptId, reason) => {
     if (!isAdmin || !isCloudMode) throw new Error('Only an authenticated administrator can review payments.');
     await reviewPaymentAttemptViaWorker(action, attemptId, reason);
+    setAuditLogs(await fetchAuditLogsRemote());
   };
 
   const verifyManualUpiOrderPayment: StoreContextValue['verifyManualUpiOrderPayment'] = async (orderId, customerUtr) => {
@@ -938,7 +1076,13 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     setPaymentSettings(merged);
     await AsyncStorage.setItem(STORAGE_KEYS.paymentSettings, JSON.stringify(merged));
     if (isCloudMode) {
-      await updatePaymentSettingsRemote(patch);
+      const hasQrPatch = Object.prototype.hasOwnProperty.call(patch, 'qrImageUrl') ||
+        Object.prototype.hasOwnProperty.call(patch, 'qrImagePublicId');
+      if (hasQrPatch) {
+        await updatePaymentQrViaWorker(merged.qrImageUrl ?? '', merged.qrImagePublicId ?? '');
+      }
+      const { qrImageUrl: _qrImageUrl, qrImagePublicId: _qrImagePublicId, ...otherSettings } = patch;
+      if (Object.keys(otherSettings).length) await updatePaymentSettingsRemote(otherSettings);
     }
     await logAdminActivity('Update Payment Settings', `Updated payment config: ${Object.keys(patch).join(', ')}`);
   };
@@ -947,11 +1091,11 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     const adminEmail = authUser && !authUser.isGuest ? authUser.email : 'admin@vibekart.in';
     const adminUid = authUser && !authUser.isGuest ? authUser.uid : 'admin-local';
     if (isCloudMode) {
-      await createAuditLogRemote({ adminEmail, adminUid, action, details, targetId });
+      await createAuditLogRemote(sanitizeAuditLogPayload({ adminEmail, adminUid, action, details, targetId }));
       const logs = await fetchAuditLogsRemote();
       setAuditLogs(logs);
     } else {
-      const newLog: AdminAuditLog = {
+      const newLog: AdminAuditLog = sanitizeAuditLogPayload({
         id: `log-${Date.now()}`,
         timestamp: new Date().toISOString(),
         adminEmail,
@@ -959,7 +1103,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         action,
         details,
         targetId,
-      };
+      }) as AdminAuditLog;
       setAuditLogs((curr) => {
         const next = [newLog, ...curr.slice(0, 49)];
         AsyncStorage.setItem(STORAGE_KEYS.auditLogs, JSON.stringify(next));
@@ -994,6 +1138,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   const value = useMemo<StoreContextValue>(
     () => ({
       isCloudMode,
+      dataLoadState,
       products,
       addProduct,
       updateProduct,
@@ -1052,6 +1197,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     }),
     [
       isCloudMode,
+      dataLoadState,
       products,
       categories,
       cart,

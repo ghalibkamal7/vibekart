@@ -15,7 +15,7 @@ The Worker securely handles:
 * Firebase custom-token generation
 * Server-priced payment-attempt creation and UTR submission
 * Trusted manual-UPI order creation from current Firestore product prices and delivery settings
-* Admin-only manual-UPI payment review with order-version preconditions, unique UTR claims, and an atomic reviewer audit
+* Admin-only payment review with version preconditions, unique UTR claims, and an audit record committed atomically with each payment-attempt or legacy-order review
 * Seller/admin-authorized product deletion with server-side Cloudinary cleanup
 
 The Expo app never receives or stores the MSG91 authentication key or Firebase service-account credentials. UPI payment confirmation uses the same Worker and does not require a payment gateway, Firebase Cloud Functions, or a billing-plan upgrade.
@@ -265,21 +265,37 @@ When prompted, paste the complete contents of the Firebase service-account JSON.
 
 The secret is stored by Cloudflare and is not written into the repository.
 
-Product deletion also requires the Cloudinary Admin API credentials. Create
-these as Worker secrets (not app environment variables):
+Cloudinary image upload, attachment, and cleanup require these exact
+environment bindings:
 
 ```bash
-npx wrangler secret put CLOUDINARY_CLOUD_NAME
-npx wrangler secret put CLOUDINARY_API_KEY
-npx wrangler secret put CLOUDINARY_API_SECRET
+CLOUDINARY_CLOUD_NAME
+CLOUDINARY_API_KEY
+CLOUDINARY_API_SECRET
 ```
 
-The cloud name and API key identify the Cloudinary account; the API secret
-authorizes destructive Admin API operations. Keep all three out of Expo
-variables and source control. When a product has no Cloudinary image IDs, the
-Worker can remove its Firestore documents without these secrets. When it does
-have stored image IDs and the credentials are missing, deletion fails closed
-and preserves the product.
+For local development, copy `workers/otp/.dev.vars.example` to
+`workers/otp/.dev.vars` and populate it locally along with
+`FIREBASE_SERVICE_ACCOUNT_JSON`, `MSG91_AUTH_KEY`, `MSG91_TEMPLATE_ID`, and
+the three Cloudinary bindings. Wrangler reads `.dev.vars` when run from the
+Worker directory. The example contains names and blank placeholders only;
+`.dev.vars` and local variants are ignored by Git.
+
+For production, open **Cloudflare Dashboard → Workers & Pages → vibekart-otp
+→ Settings → Variables and Secrets**. Add `CLOUDINARY_CLOUD_NAME`,
+`CLOUDINARY_API_KEY`, and `CLOUDINARY_API_SECRET` as Worker secrets. Add
+`FIREBASE_SERVICE_ACCOUNT_JSON` and `MSG91_AUTH_KEY` as Worker secrets, and
+`MSG91_TEMPLATE_ID` as a non-secret Worker variable. Cloudinary's cloud name
+and API key identify the account; the API secret authorizes signed uploads and
+destructive Admin API operations. Never put these values in Expo variables,
+Vercel, or source control. Do not infer live configuration from this
+repository; verify bindings in the authorized Cloudflare dashboard and inspect
+Worker runtime logs when diagnosing production failures.
+
+Missing Cloudinary bindings return an actionable configuration error without
+including credential values. Firebase authentication and Cloudinary API
+failures use separate error paths. This distinction is diagnostic, not
+confirmation of any production incident's cause.
 
 Never put the service-account JSON into:
 
@@ -437,7 +453,7 @@ Direct client creates/updates/deletes of payment attempts and direct order
 creation/payment-status updates are denied by `firestore.rules`. Deploy the
 matching rules after review before enabling the updated app.
 
-## Product deletion
+## Product images and cleanup
 
 ```text
 POST /seller/products/delete
@@ -452,19 +468,52 @@ Request:
 }
 ```
 
-The Worker checks that the caller has an active seller or admin profile. A
-seller may delete only a product whose `createdByUid` matches their UID;
-administrators may also delete legacy products without an owner UID. Before
-deleting Firestore documents, it removes every validated `imagePublicIds`
-asset through the Cloudinary Admin API. It then conditionally deletes both the
-public product document and its private data in one Firestore commit. Direct
-client product deletion is denied by `firestore.rules`.
+The Expo app sends image bytes to authenticated `POST /cloudinary/upload`.
+Sellers/admins may upload to an existing product they are authorized to edit;
+only admins may upload payment QR images. The Worker generates the Cloudinary
+public ID, signs the upload, and records a Firestore ownership binding before
+calling Cloudinary. The app cannot choose an arbitrary public ID or use the
+server-side API secret.
 
-Cloudinary and Firestore cannot participate in one distributed transaction. If
-the Cloudinary request succeeds but the Firestore commit fails because the
-product changed, the Worker returns a conflict and leaves the product record
-intact. A retry safely accepts Cloudinary's `not_found` result for an image
-already removed.
+The app attaches product images through `POST /seller/products/images` and
+payment QR images through `POST /admin/payment-settings/qr-image`. The Worker
+checks the upload's ownership record, target, and URL before updating metadata.
+Firestore rules deny direct client changes to these protected image fields and
+deny client access to ownership records and cleanup jobs.
+
+When images are removed from a product, a QR is replaced/cleared, or a product
+is deleted, the metadata operation and a durable cleanup job are committed
+together. Cleanup rereads the target and does not call Cloudinary while a queued
+ID is still referenced. The Worker retries incomplete cleanup using the
+15-minute scheduled trigger in `wrangler.toml`; the app can also retry pending
+cleanup. Cloudinary partial responses leave ownership records/jobs in place for
+retry. A successful upload that cannot be attached is retained for retry or
+queued for cleanup rather than silently forgotten.
+
+Legacy image IDs created before ownership records were introduced are allowed
+to remain displayed, but cannot be safely removed or deleted automatically.
+The Worker fails closed when it cannot verify the asset-to-target binding.
+Before cleanup of those assets, perform an authorized inventory review and a
+trusted migration that records actual ownership; never bulk-register IDs
+provided by clients or treat a folder prefix as proof.
+
+The previous direct unsigned-upload client flow should be considered retired
+after all deployed app versions are updated. In Cloudinary Console, review
+**Settings → Upload → Upload presets** and disable/delete any old unsigned
+preset only after confirming no supported older client still needs it.
+
+## Product deletion
+
+`POST /seller/products/delete` requires a Firebase ID token. Sellers may delete
+only products whose `createdByUid` is their UID; admins may delete any product.
+The Worker atomically deletes the product documents and queues Cloudinary
+cleanup. If cleanup is incomplete, the response still reports deletion success
+with `cleanupPending: true`; retry with the same product ID or let the scheduled
+trigger retry. Product deletion is not rolled back because Cloudinary is
+temporarily unavailable. Legacy assets without trusted ownership records block
+the deletion rather than risking deletion of unrelated account assets.
+
+Direct client product deletion remains denied by `firestore.rules`.
 
 ## OTP storage
 
