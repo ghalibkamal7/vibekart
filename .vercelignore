@@ -1,0 +1,6 @@
+.env
+.env.*
+!.env.example
+.expo
+dist
+firestore-debug.log
