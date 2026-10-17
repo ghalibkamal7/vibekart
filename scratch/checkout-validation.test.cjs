@@ -60,3 +60,31 @@ test('checkout validates full name, Indian mobile, and delivery address', () => 
     address: 'Enter a complete delivery address with locality or city.',
   });
 });
+
+test('product-request checkout validates each required delivery field and rejects malformed autofill', () => {
+  const valid = {
+    name: 'Sneha Sharma',
+    phone: '+91 98765 43210',
+    address: {
+      houseDetails: 'Flat 12B',
+      roadArea: 'Green Street',
+      pincode: '560001',
+      city: 'Bengaluru',
+      state: 'Karnataka',
+    },
+  };
+  assert.deepEqual(validation.validateProductRequestDetails(valid), {});
+  assert.deepEqual(
+    validation.validateProductRequestDetails({
+      ...valid,
+      name: 'm, ,',
+      address: { ...valid.address, houseDetails: 'm, ,', pincode: '56001', city: '1' },
+    }),
+    {
+      name: 'Enter a valid name using letters only.',
+      houseDetails: 'Enter valid house or building details.',
+      pincode: 'Enter a valid six-digit pincode.',
+      city: 'Enter a valid city.',
+    },
+  );
+});

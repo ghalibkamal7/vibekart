@@ -1,7 +1,7 @@
 # VibeKart Cloudflare Worker
 
-A Cloudflare Worker for trusted manual-UPI order operations, image management,
-and cleanup. Phone OTP is currently disabled and reserved for future use.
+A Cloudflare Worker for customer product requests, retained manual-UPI payment
+operations, image management, and cleanup. Phone OTP is currently disabled and reserved for future use.
 Both `/send-otp` and `/verify-otp` return HTTP 410 with
 `PHONE_OTP_UNAVAILABLE`; these routes do not call MSG91 or create a Firebase
 session.
@@ -14,12 +14,14 @@ without an explicit future product decision.
 
 The Worker securely handles:
 
+* Authenticated customer product-request creation with server-validated details and product snapshots
+* Admin-only Meesho request status changes with atomic audit logging
 * Server-priced payment-attempt creation and UTR submission
 * Trusted manual-UPI order creation from current Firestore product prices and delivery settings
 * Admin-only payment review with version preconditions, unique UTR claims, and an audit record committed atomically with each payment-attempt or legacy-order review
 * Seller/admin-authorized product deletion with server-side Cloudinary cleanup
 
-UPI payment confirmation uses the Worker and does not require a payment gateway,
+Retained UPI payment confirmation uses the Worker and does not require a payment gateway,
 Firebase Cloud Functions, or a billing-plan upgrade.
 
 Manual UPI confirmation and rejection are available only to authenticated users
@@ -78,6 +80,54 @@ Firebase Spark + Cloudflare Worker + Firebase REST APIs + Cloudinary
 
 The Worker currently handles trusted order and image operations; phone OTP and
 MSG91 remain future-only.
+
+## Customer product requests
+
+The active checkout uses these Worker routes:
+
+```text
+POST /requests/create
+POST /admin/requests/status
+```
+
+`/requests/create` requires a signed-in customer ID token. It validates customer
+name, Indian mobile number, house/building details, road/area, six-digit
+pincode, city, state, product IDs, quantities, and an idempotency key. Product
+availability and catalogue prices are re-read from Firestore; client prices
+are ignored. The route writes the customer-visible request and seller-only
+supplier snapshot atomically to `orders/{id}` and `orders/{id}/private/data`.
+The request is created with status `New` and contains no payment method,
+payment status, UTR, payment reference, or paid-order record.
+
+Example creation payload:
+
+```json
+{
+  "customerName": "Sneha Sharma",
+  "customerPhone": "+919876543210",
+  "address": {
+    "houseDetails": "Flat 12B",
+    "roadArea": "Green Street",
+    "pincode": "560001",
+    "city": "Bengaluru",
+    "state": "Karnataka"
+  },
+  "items": [{ "productId": "product-id", "quantity": 2, "option": "Blue" }],
+  "idempotencyKey": "checkout-session-key"
+}
+```
+
+`/admin/requests/status` accepts only active Firestore administrators and
+allows the transitions `New → Ordered on Meesho → Shipped → Delivered`, with
+cancellation allowed before shipping. The status update and audit record are
+committed atomically. The administrator must manually place the corresponding
+order in Meesho; this Worker has no Meesho API integration. Firestore rules are
+unchanged: client order creation and status changes remain denied, and customer
+reads remain scoped to the caller's own `customerUid`.
+
+The manual-UPI routes and payment configuration remain available for legacy
+records/future reactivation, but the current customer checkout and order UI do
+not call or expose those payment flows.
 
 ## Worker requirements
 
@@ -275,10 +325,12 @@ Both routes return HTTP 410 with the same response:
 Neither route sends an SMS, reads/writes OTP state, or creates a Firebase
 session. Do not use production SMS for testing.
 
-## Manual UPI payments
+## Retained manual UPI APIs
 
-All payment endpoints below require `Authorization: Bearer <Firebase ID token>`.
-The Worker validates the token and checks the caller's active Firestore profile.
+These payment endpoints remain in the Worker for historical records or possible
+future reactivation; current customer checkout does not call them. All require
+`Authorization: Bearer <Firebase ID token>`. The Worker validates the token and
+checks the caller's active Firestore profile.
 
 ### Create an attempt
 
@@ -331,14 +383,14 @@ prove a manual UPI credit; the admin must verify the merchant's transaction
 history. Rejected, cancelled, and manually expired attempts never create an
 order.
 
-`POST /create-order` is retired and returns `410 Gone`; clients must use
-`/payment-attempts/create`. The old client-side `/payment/verify` route is not
-available for marking an order paid.
+`POST /create-order` is retired and returns `410 Gone`. The current checkout
+uses `/requests/create`, not `/payment-attempts/create`. The old client-side
+`/payment/verify` route is not available for marking an order paid.
 
 The Expo client can read an attempt only when it belongs to the signed-in user.
 Direct client creates/updates/deletes of payment attempts and direct order
-creation/payment-status updates are denied by `firestore.rules`. Deploy the
-matching rules after review before enabling the updated app.
+creation/payment-status updates are denied by `firestore.rules`. The product
+request workflow does not require a Firestore rules change or deployment.
 
 ## Product images and cleanup
 

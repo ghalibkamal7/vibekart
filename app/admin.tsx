@@ -204,7 +204,7 @@ export default function AdminScreen() {
 
   const filteredOrders = useMemo(() => {
     return orders.filter((o) => {
-      if (o.paymentStatus !== 'Paid') return false;
+      if (o.requestType !== 'meesho_manual' && o.paymentStatus !== 'Paid') return false;
       const matchesSearch =
         !orderSearch.trim() ||
         o.id.toLowerCase().includes(orderSearch.toLowerCase()) ||
@@ -342,7 +342,9 @@ export default function AdminScreen() {
   const handleAdvanceOrderStatus = async (order: Order, nextStatus: OrderStatus) => {
     try {
       await updateOrderStatus(order.id, nextStatus);
-      await logAdminActivity('Update Order Status', `Updated order ${order.id} to ${nextStatus}`, order.id);
+      if (order.requestType !== 'meesho_manual') {
+        await logAdminActivity('Update Order Status', `Updated order ${order.id} to ${nextStatus}`, order.id);
+      }
     } catch (err: any) {
       showPlatformAlert('Transition Error', err?.message || 'Cannot advance order status.');
     }
@@ -350,8 +352,11 @@ export default function AdminScreen() {
 
   // Handle Order Cancel
   const handleAdminCancelOrder = (order: Order) => {
-    if (!canCancelOrder(order.status) && order.status !== 'Processing') {
-      showPlatformAlert('Cannot Cancel', `Orders in "${order.status}" status cannot be cancelled.`);
+    const canCancel = order.requestType === 'meesho_manual'
+      ? ALLOWED_STATUS_TRANSITIONS[order.status]?.includes('Cancelled')
+      : canCancelOrder(order.status) || order.status === 'Processing';
+    if (!canCancel) {
+      showPlatformAlert('Cannot Cancel', `Records in "${order.status}" status cannot be cancelled.`);
       return;
     }
     confirmPlatformAction(
@@ -363,8 +368,15 @@ export default function AdminScreen() {
         setCancellingOrderId(order.id);
         try {
           await cancelOrder(order.id);
-          await logAdminActivity('Cancel Order', `Cancelled order ${order.id}`, order.id);
-          showPlatformAlert('Order cancelled', `Order ${order.id} was cancelled. This action does not issue a refund.`);
+          if (order.requestType !== 'meesho_manual') {
+            await logAdminActivity('Cancel Order', `Cancelled order ${order.id}`, order.id);
+          }
+          showPlatformAlert(
+            order.requestType === 'meesho_manual' ? 'Request cancelled' : 'Order cancelled',
+            order.requestType === 'meesho_manual'
+              ? `Product request ${order.id} was cancelled. No payment was taken.`
+              : `Order ${order.id} was cancelled. This action does not issue a refund.`,
+          );
         } catch (err: any) {
           showPlatformAlert('Error', err?.message || 'Failed to cancel order.');
         } finally {
@@ -592,7 +604,7 @@ export default function AdminScreen() {
               { key: 'dashboard', label: 'Dashboard', icon: 'grid' },
               { key: 'products', label: `Products (${products.length})`, icon: 'package' },
               { key: 'categories', label: `Categories (${categories.length})`, icon: 'tag' },
-              { key: 'orders', label: `Orders (${orders.filter((order) => order.paymentStatus === 'Paid').length})`, icon: 'shopping-bag' },
+              { key: 'orders', label: `Orders & Requests (${orders.filter((order) => order.paymentStatus === 'Paid' || order.requestType === 'meesho_manual').length})`, icon: 'shopping-bag' },
               { key: 'pendingPayments', label: `Pending Payments (${pendingAttempts.length + pendingManualUpiOrders.length})`, icon: 'credit-card' },
               { key: 'users', label: `Users & Sellers (${usersList.length})`, icon: 'users' },
               { key: 'payments', label: 'Payment Settings', icon: 'credit-card' },
@@ -1033,9 +1045,9 @@ export default function AdminScreen() {
         {/* ==================== 4. ORDERS TAB ==================== */}
         {activeTab === 'orders' && (
           <View>
-            <Text style={[styles.sectionHeading, { color: colors.foreground }]}>Order Management</Text>
+            <Text style={[styles.sectionHeading, { color: colors.foreground }]}>Requests & Order Management</Text>
             <Text style={[styles.sectionSub, { color: colors.mutedForeground }]}>
-              Authoritative order tracking, fulfillment and private supplier cost insights.
+              Review customer requests, record manual Meesho fulfillment, and manage historical paid orders.
             </Text>
 
             {/* Search Box */}
@@ -1057,7 +1069,7 @@ export default function AdminScreen() {
 
             {/* Status Filter Chips */}
             <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.filterChipRow}>
-              {(['All', 'Placed', 'Confirmed', 'Processing', 'Shipped', 'Delivered', 'Cancelled'] as const).map(
+              {(['All', 'New', 'Ordered on Meesho', 'Placed', 'Confirmed', 'Processing', 'Shipped', 'Delivered', 'Cancelled'] as const).map(
                 (st) => (
                   <Pressable
                     key={st}
@@ -1087,6 +1099,7 @@ export default function AdminScreen() {
             ) : (
               filteredOrders.map((order) => {
                 const isExpanded = expandedOrderId === order.id;
+                const isProductRequest = order.requestType === 'meesho_manual';
                 const priv = orderPrivates[order.id];
                 const costTotal = priv?.costTotal ?? order.costTotal ?? 0;
                 const profitTotal = priv?.profitTotal ?? order.profitTotal ?? (order.total - costTotal);
@@ -1101,11 +1114,15 @@ export default function AdminScreen() {
                       <View style={{ flex: 1 }}>
                         <Text style={[styles.orderId, { color: colors.foreground }]}>{order.id}</Text>
                         <Text style={[styles.orderCustomer, { color: colors.mutedForeground }]}>
-                          {order.customerName} · {order.customerPhone} · {order.date}
+                          {order.customerName} · {order.customerPhone} · {order.createdAt ? new Date(order.createdAt).toLocaleString() : order.date}
                         </Text>
                       </View>
                       <View style={{ alignItems: 'flex-end', gap: 4 }}>
-                        <Text style={[styles.orderTotal, { color: colors.foreground }]}>{formatPrice(order.total)}</Text>
+                        {isProductRequest ? (
+                          <Text style={[styles.orderCustomer, { color: colors.coral }]}>Product request</Text>
+                        ) : (
+                          <Text style={[styles.orderTotal, { color: colors.foreground }]}>{formatPrice(order.total)}</Text>
+                        )}
                         <View style={[styles.statusTag, { backgroundColor: colors.mossSoft }]}>
                           <Text style={[styles.statusTagText, { color: colors.moss }]}>{order.status}</Text>
                         </View>
@@ -1118,6 +1135,11 @@ export default function AdminScreen() {
                         {/* Address */}
                         <Text style={[styles.detailHeading, { color: colors.foreground }]}>Delivery Address:</Text>
                         <Text style={[styles.detailText, { color: colors.mutedForeground }]}>{order.customerAddress}</Text>
+                        {isProductRequest ? (
+                          <Text style={[styles.detailText, { color: colors.mutedForeground, marginTop: 4 }]}>
+                            Contact: {order.customerPhone} · {order.customerName}
+                          </Text>
+                        ) : null}
                         {order.status === 'Cancelled' && order.cancellationReason ? (
                           <Text style={[styles.detailText, { color: colors.mutedForeground, marginTop: 4 }]}>
                             Cancellation: {order.cancellationReason}
@@ -1135,15 +1157,18 @@ export default function AdminScreen() {
                         ) : null}
 
                         {/* Items */}
-                        <Text style={[styles.detailHeading, { color: colors.foreground, marginTop: 10 }]}>Purchased Items:</Text>
+                        <Text style={[styles.detailHeading, { color: colors.foreground, marginTop: 10 }]}>
+                          {isProductRequest ? 'Requested Items:' : 'Purchased Items:'}
+                        </Text>
                         {order.items.map((item, idx) => (
                           <Text key={idx} style={[styles.itemText, { color: colors.foreground }]}>
-                            • {item.name} {item.option ? `(${item.option})` : ''} × {item.quantity} — {formatPrice(item.unitPrice * item.quantity)}
+                            • {item.name} {item.option ? `(${item.option})` : ''} × {item.quantity}
+                            {!isProductRequest ? ` — ${formatPrice(item.unitPrice * item.quantity)}` : ''}
                           </Text>
                         ))}
 
                         {/* Financial Audit */}
-                        <View style={[styles.financialRow, { backgroundColor: colors.background }]}>
+                        {!isProductRequest ? <View style={[styles.financialRow, { backgroundColor: colors.background }]}>
                           <View>
                             <Text style={[styles.finLabel, { color: colors.mutedForeground }]}>Customer Total</Text>
                             <Text style={[styles.finVal, { color: colors.foreground }]}>{formatPrice(order.total)}</Text>
@@ -1156,10 +1181,14 @@ export default function AdminScreen() {
                             <Text style={[styles.finLabel, { color: colors.mutedForeground }]}>Est. Profit</Text>
                             <Text style={[styles.finVal, { color: colors.moss }]}>{formatPrice(profitTotal)}</Text>
                           </View>
-                        </View>
+                        </View> : (
+                          <Text style={[styles.detailText, { color: colors.mutedForeground, marginTop: 8 }]}>
+                            This request is not paid and has not been placed with Meesho automatically.
+                          </Text>
+                        )}
 
                         {/* Payment Details & Verification Section */}
-                        <View style={[styles.paymentAuditBox, { backgroundColor: colors.background, borderColor: colors.border }]}>
+                        {!isProductRequest ? <View style={[styles.paymentAuditBox, { backgroundColor: colors.background, borderColor: colors.border }]}>
                           <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}>
                             <Text style={[styles.detailHeading, { color: colors.foreground }]}>Payment Verification</Text>
                             <View
@@ -1225,10 +1254,10 @@ export default function AdminScreen() {
                           <Text style={[styles.detailText, { color: colors.moss, marginTop: 10 }]}>
                             Payment verified by an authorized administrator.
                           </Text>
-                        </View>
+                        </View> : null}
 
                         {/* Tracking Input */}
-                        <View style={styles.trackingRow}>
+                        {!isProductRequest ? <View style={styles.trackingRow}>
                           <TextInput
                             value={trackingValue}
                             onChangeText={(t) => setOrderTrackingInputs((prev) => ({ ...prev, [order.id]: t }))}
@@ -1246,7 +1275,7 @@ export default function AdminScreen() {
                           >
                             <Feather name="check" size={14} color="#FFFFFF" />
                           </Pressable>
-                        </View>
+                        </View> : null}
 
                         {/* Status Transition Buttons */}
                         <View style={styles.transitionBtnRow}>

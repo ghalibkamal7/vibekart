@@ -221,6 +221,42 @@ export async function createManualUpiOrderRemote(input: {
   return response.order;
 }
 
+export async function createProductRequestRemote(input: {
+  idempotencyKey: string;
+  customerName: string;
+  customerPhone: string;
+  address: {
+    houseDetails: string;
+    roadArea: string;
+    pincode: string;
+    city: string;
+    state: string;
+  };
+  items: Array<{ productId: string; quantity: number; option?: string }>;
+}): Promise<Order> {
+  const response = await postPaymentWorker<{ success: boolean; order?: Order }>(
+    '/requests/create',
+    input,
+    'Product request',
+  );
+  if (!response.success || !response.order || response.order.requestType !== 'meesho_manual') {
+    throw new Error('The product request could not be confirmed. Please retry.');
+  }
+  return response.order;
+}
+
+export async function updateProductRequestStatusViaWorker(
+  orderId: string,
+  status: Order['status'],
+): Promise<void> {
+  const response = await postPaymentWorker<{ success: boolean }>(
+    '/admin/requests/status',
+    { orderId, status },
+    'Product request',
+  );
+  if (!response.success) throw new Error('The product request status could not be updated.');
+}
+
 export async function submitManualUpiOrderUtrRemote(orderId: string, customerUtr: string): Promise<void> {
   const database = requireDb();
   const reference = customerUtr.trim();
@@ -589,9 +625,9 @@ function getPaymentWorkerUrl(): string {
   return workerUrl;
 }
 
-async function postPaymentWorker<T>(path: string, input: unknown): Promise<T> {
+async function postPaymentWorker<T>(path: string, input: unknown, requestLabel = 'Payment'): Promise<T> {
   const currentUser = auth?.currentUser;
-  if (!currentUser) throw new Error('You must be signed in to use payment features.');
+  if (!currentUser) throw new Error(`You must be signed in to use ${requestLabel.toLowerCase()} features.`);
   const idToken = await currentUser.getIdToken();
   const response = await fetch(`${getPaymentWorkerUrl()}${path}`, {
     method: 'POST',
@@ -604,8 +640,8 @@ async function postPaymentWorker<T>(path: string, input: unknown): Promise<T> {
   const payload = (await response.json().catch(() => null)) as
     | (T & { error?: string })
     | null;
-  if (!response.ok) throw new Error(payload?.error || `Payment request failed (${response.status}).`);
-  if (!payload) throw new Error('Payment service returned an empty response.');
+  if (!response.ok) throw new Error(payload?.error || `${requestLabel} request failed (${response.status}).`);
+  if (!payload) throw new Error(`${requestLabel} service returned an empty response.`);
   return payload;
 }
 

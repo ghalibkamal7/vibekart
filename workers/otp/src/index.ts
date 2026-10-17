@@ -472,6 +472,289 @@ function isValidDeliveryAddress(address: string): boolean {
     address.split(/\s+/).filter(Boolean).length >= 2;
 }
 
+function validRequestAddressText(value: unknown, maxLength = 160): value is string {
+  if (typeof value !== 'string') return false;
+  const text = value.trim();
+  return text.length >= 2 &&
+    text.length <= maxLength &&
+    !/[\u0000-\u001f\u007f]/.test(text) &&
+    text.replace(/[ .,'’()/#-]/g, '').length >= 2 &&
+    /^[\p{L}\p{M}\p{N} .,'’()/#-]+$/u.test(text);
+}
+
+function validRequestPlaceName(value: unknown): value is string {
+  if (typeof value !== 'string') return false;
+  const text = value.trim();
+  return text.length >= 2 &&
+    text.length <= 80 &&
+    [...text].filter((character) => /\p{L}/u.test(character)).length >= 2 &&
+    /^[\p{L}\p{M} .'-]+$/u.test(text);
+}
+
+function normalizeCustomerMobile(value: unknown): string | null {
+  if (typeof value !== 'string' || !/^\+?[\d\s().-]+$/.test(value.trim())) return null;
+  let digits = value.trim().replace(/\D/g, '');
+  if (digits.length === 12 && digits.startsWith('91')) digits = digits.slice(2);
+  else if (digits.length === 11 && digits.startsWith('0')) digits = digits.slice(1);
+  return /^[6-9]\d{9}$/.test(digits) ? `+91${digits}` : null;
+}
+
+async function handleCreateProductRequest(request: Request, env: Env, origin: string | null): Promise<Response> {
+  const caller = await authenticateCaller(request, env, origin);
+  if (!isAuthenticatedCaller(caller)) return caller;
+  if (caller.profile.role !== 'customer') {
+    return jsonResponse({ error: 'Only customer accounts can submit product requests.' }, 403, origin);
+  }
+
+  const body = (await request.json().catch(() => null)) as {
+    items?: Array<{ productId?: string; quantity?: number; option?: string }>;
+    customerName?: string;
+    customerPhone?: string;
+    address?: {
+      houseDetails?: string;
+      roadArea?: string;
+      pincode?: string;
+      city?: string;
+      state?: string;
+    };
+    idempotencyKey?: string;
+  } | null;
+  if (!body || !Array.isArray(body.items) || body.items.length === 0 || body.items.length > 50) {
+    return jsonResponse({ error: 'A product request must contain between 1 and 50 items.' }, 400, origin);
+  }
+
+  const customerName = String(body.customerName || '').trim();
+  const customerPhone = normalizeCustomerMobile(body.customerPhone);
+  const address = body.address;
+  if (!isValidCustomerName(customerName) || !customerPhone) {
+    return jsonResponse({ error: 'Enter a valid full name and Indian mobile number.' }, 400, origin);
+  }
+  if (
+    !address ||
+    !validRequestAddressText(address.houseDetails) ||
+    !validRequestAddressText(address.roadArea) ||
+    typeof address.pincode !== 'string' ||
+    !/^\d{6}$/.test(address.pincode.trim()) ||
+    !validRequestPlaceName(address.city) ||
+    !validRequestPlaceName(address.state)
+  ) {
+    return jsonResponse({ error: 'Enter valid house, road/area, six-digit pincode, city, and state details.' }, 400, origin);
+  }
+
+  const idempotencyKey = typeof body.idempotencyKey === 'string' ? body.idempotencyKey.trim() : '';
+  if (!/^[A-Za-z0-9_-]{8,128}$/.test(idempotencyKey)) {
+    return jsonResponse({ error: 'A valid request idempotency key is required.' }, 400, origin);
+  }
+  const orderId = `req-${(await hashValue(`${caller.uid}:${idempotencyKey}`)).slice(0, 40)}`;
+  const orderPath = `orders/${orderId}`;
+  const existing = await getVersionedDocument(caller.sa, caller.accessToken, orderPath);
+  if (existing.exists) {
+    if (
+      existing.data?.customerUid !== caller.uid ||
+      existing.data?.requestType !== 'meesho_manual' ||
+      existing.data?.requestIdempotencyKey !== idempotencyKey
+    ) {
+      return jsonResponse({ error: 'This request key is already in use.' }, 409, origin);
+    }
+    return jsonResponse({ success: true, order: existing.data }, 200, origin);
+  }
+
+  const items: Array<{ productId: string; name: string; option?: string; quantity: number; unitPrice: number }> = [];
+  const privateItems: Array<{ productId: string; unitCost: number; sourceUrl?: string; sourceCode?: string }> = [];
+  let estimate = 0;
+  for (const item of body.items) {
+    if (typeof item.productId !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(item.productId)) {
+      return jsonResponse({ error: 'A product in this request is invalid.' }, 400, origin);
+    }
+    if (!Number.isSafeInteger(item.quantity) || Number(item.quantity) < 1 || Number(item.quantity) > 50) {
+      return jsonResponse({ error: 'Item quantity must be an integer between 1 and 50.' }, 400, origin);
+    }
+    if (item.option !== undefined && (typeof item.option !== 'string' || item.option.trim().length > 80)) {
+      return jsonResponse({ error: 'A product option is invalid.' }, 400, origin);
+    }
+
+    const product = await getProductDoc(caller.sa, caller.accessToken, item.productId);
+    if (!product.exists || !product.data) {
+      return jsonResponse({ error: 'A requested product is no longer available.' }, 400, origin);
+    }
+    if (product.data.enabled === false || product.data.inStock === false) {
+      return jsonResponse({ error: 'A requested product is no longer available.' }, 400, origin);
+    }
+    const unitPrice = Number(product.data.price);
+    if (!Number.isSafeInteger(unitPrice) || unitPrice < 0) {
+      return jsonResponse({ error: 'A product price is invalid. Please contact the store.' }, 409, origin);
+    }
+    estimate += unitPrice * Number(item.quantity);
+    if (!Number.isSafeInteger(estimate)) {
+      return jsonResponse({ error: 'The request value is outside the supported range.' }, 400, origin);
+    }
+    const publicItem: { productId: string; name: string; option?: string; quantity: number; unitPrice: number } = {
+      productId: item.productId,
+      name: String(product.data.name || 'Product').slice(0, 160),
+      quantity: Number(item.quantity),
+      unitPrice,
+    };
+    if (item.option?.trim()) publicItem.option = item.option.trim();
+    items.push(publicItem);
+
+    const privateProduct = await getProductPrivateDoc(caller.sa, caller.accessToken, item.productId);
+    privateItems.push({
+      productId: item.productId,
+      unitCost: Math.max(0, Math.round(Number(privateProduct.data?.baseCost) || 0)),
+      ...(typeof privateProduct.data?.sourceUrl === 'string' ? { sourceUrl: privateProduct.data.sourceUrl } : {}),
+      ...(typeof privateProduct.data?.sourceCode === 'string' ? { sourceCode: privateProduct.data.sourceCode } : {}),
+    });
+  }
+
+  const now = new Date().toISOString();
+  const customerAddress = [
+    address.houseDetails.trim(),
+    address.roadArea.trim(),
+    address.pincode.trim(),
+    address.city.trim(),
+    address.state.trim(),
+  ].join(', ');
+  const order = {
+    id: orderId,
+    requestType: 'meesho_manual',
+    requestIdempotencyKey: idempotencyKey,
+    customerUid: caller.uid,
+    customerName,
+    customerPhone,
+    customerAddress,
+    customerHouseDetails: address.houseDetails.trim(),
+    customerRoadArea: address.roadArea.trim(),
+    customerPincode: address.pincode.trim(),
+    customerCity: address.city.trim(),
+    customerState: address.state.trim(),
+    items,
+    total: estimate,
+    status: 'New',
+    date: new Date().toLocaleDateString('en-IN', { day: '2-digit', month: 'short' }),
+    createdAt: now,
+  };
+  const privateOrder = { items: privateItems, createdAt: now };
+  try {
+    await commitFirestoreWrites(caller.sa, caller.accessToken, [
+      {
+        update: {
+          name: firestoreDocumentName(caller.sa, orderPath),
+          fields: toFirestoreFields(order),
+        },
+        currentDocument: { exists: false },
+      },
+      {
+        update: {
+          name: firestoreDocumentName(caller.sa, `${orderPath}/private/data`),
+          fields: toFirestoreFields(privateOrder),
+        },
+        currentDocument: { exists: false },
+      },
+    ]);
+    return jsonResponse({ success: true, order }, 201, origin);
+  } catch (error) {
+    try {
+      const retry = await getVersionedDocument(caller.sa, caller.accessToken, orderPath);
+      if (
+        retry.exists &&
+        retry.data?.customerUid === caller.uid &&
+        retry.data?.requestType === 'meesho_manual' &&
+        retry.data?.requestIdempotencyKey === idempotencyKey
+      ) {
+        return jsonResponse({ success: true, order: retry.data }, 200, origin);
+      }
+    } catch (readError) {
+      console.error('[request] Could not verify request after failed write', readError);
+    }
+    console.error('[request] Failed to create product request', error);
+    return jsonResponse({ error: 'Could not submit the product request. Please retry.' }, 500, origin);
+  }
+}
+
+async function handleUpdateProductRequestStatus(request: Request, env: Env, origin: string | null): Promise<Response> {
+  const caller = await authenticateCaller(request, env, origin);
+  if (!isAuthenticatedCaller(caller)) return caller;
+  if (caller.profile.role !== 'admin') {
+    return jsonResponse({ error: 'Only an administrator can update product request status.' }, 403, origin);
+  }
+
+  const body = (await request.json().catch(() => null)) as { orderId?: string; status?: string } | null;
+  const orderId = typeof body?.orderId === 'string' ? body.orderId.trim() : '';
+  const status = body?.status;
+  if (!/^req-[a-f0-9]{40}$/.test(orderId)) {
+    return jsonResponse({ error: 'A valid product request ID is required.' }, 400, origin);
+  }
+  if (!['Ordered on Meesho', 'Shipped', 'Delivered', 'Cancelled'].includes(status || '')) {
+    return jsonResponse({ error: 'The requested product-request status is not allowed.' }, 400, origin);
+  }
+
+  const orderPath = `orders/${orderId}`;
+  const current = await getVersionedDocument(caller.sa, caller.accessToken, orderPath);
+  if (!current.exists || !current.data) return jsonResponse({ error: 'Product request not found.' }, 404, origin);
+  if (current.data.requestType !== 'meesho_manual') {
+    return jsonResponse({ error: 'This order is not a product request.' }, 409, origin);
+  }
+  const allowedTransitions: Record<string, string[]> = {
+    New: ['Ordered on Meesho', 'Cancelled'],
+    'Ordered on Meesho': ['Shipped', 'Cancelled'],
+    Shipped: ['Delivered'],
+    Delivered: [],
+    Cancelled: [],
+  };
+  if (!(allowedTransitions[current.data.status] || []).includes(status as string)) {
+    return jsonResponse({ error: `Cannot transition product request from "${current.data.status}" to "${status}".` }, 409, origin);
+  }
+
+  const now = new Date().toISOString();
+  const patch = {
+    status,
+    updatedAt: now,
+    ...(status === 'Cancelled'
+      ? { cancellationReason: 'Cancelled by store staff', cancelledAt: now }
+      : {}),
+  };
+  const auditId = crypto.randomUUID();
+  const audit = {
+    adminEmail: caller.email || 'admin',
+    adminUid: caller.uid,
+    action: 'Update Meesho Request Status',
+    targetId: orderId,
+    details: `Updated product request ${orderId} to ${status}.`,
+    timestamp: now,
+  };
+  try {
+    await commitFirestoreWrites(caller.sa, caller.accessToken, [
+      {
+        update: {
+          name: firestoreDocumentName(caller.sa, orderPath),
+          fields: toFirestoreFields(patch),
+        },
+        updateMask: { fieldPaths: Object.keys(patch) },
+        currentDocument: { updateTime: current.updateTime },
+      },
+      {
+        update: {
+          name: firestoreDocumentName(caller.sa, `audit_logs/${auditId}`),
+          fields: toFirestoreFields(audit),
+        },
+        currentDocument: { exists: false },
+      },
+    ]);
+  } catch (error) {
+    console.error('[request] Failed to update product request status', error);
+    const failureStatus = firestoreCommitFailureStatus(error);
+    return jsonResponse({
+      error: failureStatus === 409
+        ? 'The product request changed while you were updating it. Refresh and retry.'
+        : failureStatus === 500
+          ? 'Firestore rejected the product request update. Check server configuration and retry.'
+          : 'Firestore is temporarily unavailable. The product request was not changed.',
+      code: firestoreCommitFailureCode(failureStatus),
+    }, failureStatus, origin);
+  }
+  return jsonResponse({ success: true, orderId, status }, 200, origin);
+}
+
 async function handleCreateManualUpiOrder(request: Request, env: Env, origin: string | null): Promise<Response> {
   const caller = await authenticateCaller(request, env, origin);
   if (!isAuthenticatedCaller(caller)) return caller;
@@ -2708,6 +2991,8 @@ export default {
       if (url.pathname === '/admin/payment-settings/qr-image') {
         return handleUpdatePaymentQrImage(request, env, origin);
       }
+      if (url.pathname === '/requests/create') return handleCreateProductRequest(request, env, origin);
+      if (url.pathname === '/admin/requests/status') return handleUpdateProductRequestStatus(request, env, origin);
       if (url.pathname === '/manual-upi/orders/create') return handleCreateManualUpiOrder(request, env, origin);
       if (url.pathname === '/payment-attempts/create') return handleCreatePaymentAttempt(request, env, origin);
       if (url.pathname === '/create-order') {

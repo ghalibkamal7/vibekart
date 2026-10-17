@@ -42,7 +42,7 @@ import { updatePaymentQrViaWorker } from '@/services/cloudinary/upload';
 import {
   createAuditLogRemote,
   createCategoryRemote,
-  createManualUpiOrderRemote,
+  createProductRequestRemote,
   createProduct,
   confirmPaymentAttemptViaWorker,
   editProduct,
@@ -65,6 +65,7 @@ import {
   subscribeToProducts,
   updateCategoryRemote,
   updateOrderStatusRemote,
+  updateProductRequestStatusViaWorker,
   updatePaymentSettingsRemote,
   updateStoreSettingsRemote,
   updateUserRoleRemote,
@@ -135,8 +136,13 @@ type StoreContextValue = {
   placeOrder: (details: {
     customerName: string;
     customerPhone: string;
-    customerAddress: string;
-    paymentMethod: 'UPI' | 'COD';
+    address: {
+      houseDetails: string;
+      roadArea: string;
+      pincode: string;
+      city: string;
+      state: string;
+    };
     idempotencyKey: string;
   }) => Promise<Order>;
   submitManualOrderUtr: (orderId: string, customerUtr: string) => Promise<void>;
@@ -855,14 +861,11 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   }, [orders, isCloudMode]);
 
   const placeOrder: StoreContextValue['placeOrder'] = async (details) => {
-    if (details.paymentMethod !== 'UPI') {
-      throw new Error('Only online payment (UPI) is accepted. Cash on delivery is no longer available.');
-    }
     if (!isCloudMode || !authUser || authUser.isGuest) {
-      throw new Error('Sign in with an account to place a manual UPI order.');
+      throw new Error('Sign in with an account to submit a product request.');
     }
     if (!cart.length) throw new Error('Your cart is empty.');
-    const order = await createManualUpiOrderRemote({
+    const order = await createProductRequestRemote({
       items: cart.map((line) => ({
         productId: line.product.id,
         quantity: line.quantity,
@@ -870,8 +873,8 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       })),
       customerName: details.customerName,
       customerPhone: details.customerPhone,
-      customerAddress: details.customerAddress,
-       idempotencyKey: details.idempotencyKey,
+      address: details.address,
+      idempotencyKey: details.idempotencyKey,
     });
     setCart([]);
     await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
@@ -921,6 +924,16 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   const updateOrderStatus: StoreContextValue['updateOrderStatus'] = async (orderId, status) => {
     const order = orders.find((o) => o.id === orderId);
     if (!order) throw new Error('Order not found.');
+    if (order.requestType === 'meesho_manual') {
+      if (!isAdmin || !isCloudMode) throw new Error('Only an authenticated administrator can update product requests.');
+      if (!canTransitionOrderStatus(order.status, status)) {
+        throw new Error(`Cannot transition from "${order.status}" to "${status}".`);
+      }
+      if (status === 'Cancelled') throw new Error('Use the cancellation action so the cancellation is recorded safely.');
+      await updateProductRequestStatusViaWorker(orderId, status);
+      setAuditLogs(await fetchAuditLogsRemote());
+      return;
+    }
     if (order.paymentStatus !== 'Paid') throw new Error('Only paid orders can enter fulfillment.');
     if (!canTransitionOrderStatus(order.status, status)) {
       throw new Error(`Cannot transition from "${order.status}" to "${status}".`);
@@ -939,6 +952,20 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     if (cancellingOrderIds.current.has(orderId)) throw new Error('This order cancellation is already in progress.');
     const order = orders.find((o) => o.id === orderId);
     if (!order) throw new Error('Order not found.');
+    if (order.requestType === 'meesho_manual') {
+      if (!isAdmin || !isCloudMode) throw new Error('Only an authenticated administrator can cancel product requests.');
+      if (!canTransitionOrderStatus(order.status, 'Cancelled')) {
+        throw new Error(`Requests in "${order.status}" status cannot be cancelled.`);
+      }
+      cancellingOrderIds.current.add(orderId);
+      try {
+        await updateProductRequestStatusViaWorker(orderId, 'Cancelled');
+        setAuditLogs(await fetchAuditLogsRemote());
+      } finally {
+        cancellingOrderIds.current.delete(orderId);
+      }
+      return;
+    }
     if (order.paymentStatus !== 'Paid') throw new Error('Only paid orders can be cancelled as orders.');
     const canSellerCancel = ['seller', 'admin'].includes(authUser && !authUser.isGuest ? authUser.role : '');
     const allowed = canSellerCancel

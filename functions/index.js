@@ -38,7 +38,7 @@ exports.reconcileOrderCost = onDocumentCreated('orders/{orderId}', async (event)
   if (!snapshot) return;
 
   const order = snapshot.data();
-  if (!order || order.costReconciled) return;
+  if (!order || order.costReconciled || order.requestType === 'meesho_manual') return;
 
   let costTotal = 0;
   for (const item of order.items ?? []) {

@@ -135,12 +135,22 @@ export type Product = {
   originalPrice?: number; // optional strike-through price, admin sets manually
 };
 
-export type OrderStatus = 'Placed' | 'Confirmed' | 'Processing' | 'Shipped' | 'Delivered' | 'Cancelled';
+export type OrderStatus =
+  | 'Placed'
+  | 'Confirmed'
+  | 'Processing'
+  | 'New'
+  | 'Ordered on Meesho'
+  | 'Shipped'
+  | 'Delivered'
+  | 'Cancelled';
 
 export const ALLOWED_STATUS_TRANSITIONS: Record<OrderStatus, OrderStatus[]> = {
   Placed: ['Confirmed', 'Processing', 'Cancelled'],
   Confirmed: ['Processing', 'Cancelled'],
   Processing: ['Shipped', 'Cancelled'],
+  New: ['Ordered on Meesho', 'Cancelled'],
+  'Ordered on Meesho': ['Shipped', 'Cancelled'],
   Shipped: ['Delivered'],
   Delivered: [],
   Cancelled: [],
@@ -159,7 +169,7 @@ export type OrderItem = {
   name: string;
   option?: string;
   quantity: number;
-  unitPrice: number; // customer paid this, per unit
+  unitPrice: number; // catalogue snapshot; a product request does not imply payment
   unitCost?: number; // admin-only, supplier cost per unit at order time (stored in orders/{id}/private/data)
   sourceUrl?: string; // admin-only, for manual "place this on Meesho" step
 };
@@ -200,8 +210,9 @@ export type PaymentAttempt = {
 
 export type Order = {
   id: string;
+  requestType?: 'meesho_manual';
   items: OrderItem[];
-  total: number; // revenue collected from customer
+  total: number; // paid-order total; request orders store a catalogue estimate only
   itemSubtotal?: number;
   deliveryCharge?: number;
   deliveryMinDays?: number;
@@ -212,10 +223,17 @@ export type Order = {
   profitTotal?: number; // admin-only: total - costTotal
   status: OrderStatus;
   date: string;
+  createdAt?: string;
+  updatedAt?: string;
   customerName: string;
   customerPhone: string;
   customerAddress: string;
-  paymentMethod: 'UPI' | 'COD';
+  customerHouseDetails?: string;
+  customerRoadArea?: string;
+  customerPincode?: string;
+  customerCity?: string;
+  customerState?: string;
+  paymentMethod?: 'UPI' | 'COD';
   paymentStatus?: 'Selected' | 'Pending' | 'Paid' | 'Failed';
   paymentReference?: string; // UPI transaction reference ID (max 35 chars)
   customerUtr?: string; // 12-digit customer submitted UPI reference / UTR

@@ -127,8 +127,8 @@ service cloud.firestore {
 
     // ---------------- orders ----------------
     match /orders/{orderId} {
-      // The trusted Worker prices and creates manual UPI orders; client writes
-      // cannot establish or alter the authoritative order price.
+      // The trusted Worker creates order and product-request records; client
+      // writes cannot establish or alter authoritative order/request state.
       allow create: if false;
 
       allow read: if isSignedIn() && (

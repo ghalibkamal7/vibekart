@@ -7,11 +7,17 @@ import { useColors } from '@/hooks/useColors';
 import { useStore } from '@/context/StoreContext';
 import { confirmPlatformAction, showPlatformAlert } from '@/utils/platformDialogs';
 
+const LEGACY_PAYMENT_UI_ENABLED = false;
+
 function statusStyle(
   status: OrderStatus,
   colors: ReturnType<typeof useColors>,
 ): { bg: string; fg: string } {
   switch (status) {
+    case 'New':
+      return { bg: colors.coralSoft, fg: colors.coral };
+    case 'Ordered on Meesho':
+      return { bg: '#EEF4FF', fg: '#4A6CF7' };
     case 'Delivered':
       return { bg: colors.mossSoft, fg: colors.moss };
     case 'Shipped':
@@ -36,6 +42,7 @@ export default function OrdersScreen() {
   const [submittingOrderId, setSubmittingOrderId] = useState<string | null>(null);
   const [cancellingOrderId, setCancellingOrderId] = useState<string | null>(null);
   const paidOrders = orders.filter((order) => order.paymentStatus === 'Paid');
+  const requestOrders = orders.filter((order) => order.requestType === 'meesho_manual');
   const pendingManualOrders = orders.filter(
     (order) =>
       order.paymentMethod === 'UPI' &&
@@ -105,7 +112,39 @@ export default function OrdersScreen() {
       <Text style={[styles.kicker, { color: colors.coral }]}>YOUR VIBES, ON THE WAY</Text>
       <Text style={[styles.title, { color: colors.foreground }]}>Orders</Text>
       <Text style={[styles.subtitle, { color: colors.mutedForeground }]}>A calm little place to keep an eye on your deliveries.</Text>
-      {pendingManualOrders.length > 0 ? (
+      {requestOrders.length > 0 ? (
+        <View style={styles.attemptSection}>
+          <Text style={[styles.sectionTitle, { color: colors.foreground }]}>Product requests ({requestOrders.length})</Text>
+          {requestOrders.map((order) => {
+            const sc = statusStyle(order.status, colors);
+            return (
+              <View key={order.id} style={[styles.orderCard, { backgroundColor: colors.card, borderColor: colors.border }]}>
+                <View style={styles.orderTop}>
+                  <View style={{ flex: 1 }}>
+                    <Text style={[styles.orderId, { color: colors.foreground }]}>{order.id}</Text>
+                    <Text style={[styles.orderDate, { color: colors.mutedForeground }]}>
+                      Request submitted {order.createdAt ? new Date(order.createdAt).toLocaleString() : order.date}
+                    </Text>
+                  </View>
+                  <View style={[styles.status, { backgroundColor: sc.bg }]}>
+                    <Text style={[styles.statusText, { color: sc.fg }]}>{order.status}</Text>
+                  </View>
+                </View>
+                <Text style={[styles.orderProduct, { color: colors.foreground }]}>
+                  {order.items.map((item) => `${item.name} × ${item.quantity}`).join(' · ')}
+                </Text>
+                <Text style={[styles.attemptHelp, { color: colors.mutedForeground, marginTop: 8 }]}>
+                  Delivery to: {order.customerAddress}
+                </Text>
+                <Text style={[styles.attemptHelp, { color: colors.mutedForeground }]}>
+                  This is a request only. It has not been ordered on Meesho and no payment has been taken.
+                </Text>
+              </View>
+            );
+          })}
+        </View>
+      ) : null}
+      {LEGACY_PAYMENT_UI_ENABLED && pendingManualOrders.length > 0 ? (
         <View style={styles.attemptSection}>
           <Text style={[styles.sectionTitle, { color: colors.foreground }]}>Pending UPI Orders ({pendingManualOrders.length})</Text>
           <Text style={[styles.attemptHelp, { color: colors.mutedForeground }]}>
@@ -155,7 +194,7 @@ export default function OrdersScreen() {
           })}
         </View>
       ) : null}
-      {unresolvedAttempts.length > 0 ? (
+      {LEGACY_PAYMENT_UI_ENABLED && unresolvedAttempts.length > 0 ? (
         <View style={styles.attemptSection}>
           <Text style={[styles.sectionTitle, { color: colors.foreground }]}>Pending Payments ({unresolvedAttempts.length})</Text>
           <Text style={[styles.attemptHelp, { color: colors.mutedForeground }]}>
@@ -236,13 +275,13 @@ export default function OrdersScreen() {
           })}
         </View>
       ) : null}
-      {!paidOrders.length && !pendingManualOrders.length && !unresolvedAttempts.length ? (
+      {!requestOrders.length && !paidOrders.length ? (
         <View style={[styles.empty, { backgroundColor: colors.card, borderColor: colors.border }]}>
           <View style={[styles.emptyIcon, { backgroundColor: colors.mossSoft }]}>
             <Feather name="package" size={25} color={colors.moss} />
           </View>
-          <Text style={[styles.emptyTitle, { color: colors.foreground }]}>No orders yet</Text>
-          <Text style={[styles.emptyBody, { color: colors.mutedForeground }]}>Manual UPI orders appear here while payment is awaiting administrator verification.</Text>
+          <Text style={[styles.emptyTitle, { color: colors.foreground }]}>No requests or orders yet</Text>
+          <Text style={[styles.emptyBody, { color: colors.mutedForeground }]}>Product requests you submit will appear here with their current status.</Text>
         </View>
       ) : (
         paidOrders.map((order) => {

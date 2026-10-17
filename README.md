@@ -41,11 +41,11 @@ useful for UI work without a Firebase project set up yet.
 6. Configure and deploy the **Cloudflare Worker** — see `workers/otp/README.md`
    for the full walkthrough (Cloudflare account, KV namespace, secrets, deploy).
    Copy the Worker's URL into `.env` as `EXPO_PUBLIC_OTP_WORKER_URL`. The
-   Worker is required for product deletion and trusted
-   manual-UPI order creation. The Worker re-reads product prices and delivery
-   settings and is the only client-facing order-creation path; optional
-   payment-attempt APIs remain available for future integrations and historical
-   attempts.
+   Worker is required for product deletion and customer product requests. The
+   Worker authenticates customers, validates delivery details and quantities,
+   re-reads product availability and catalogue prices, and creates requests
+   without payment fields. It also restricts request-status changes to active
+   administrators.
 7. Review and deploy the Firestore rules (works on Spark, no Blaze needed):
 ```bash
    npm install -g firebase-tools     # once
@@ -53,19 +53,17 @@ useful for UI work without a Firebase project set up yet.
    firebase use --add                # pick your project
    firebase deploy --only firestore:rules
 ```
-   The current rules deny all client-side order creation, allow customers to
-   submit a UTR without changing payment status, and reserve payment
-   confirmation/rejection for active administrators. The authenticated Worker
-   creates pending orders with server-priced snapshots. Deploy the matching rules
-   before enabling the updated app; this repository change does not apply rules
-   to any live Firebase project.
+   The current rules deny all client-side order creation and restrict customer
+   order reads to that customer's own records. The authenticated Worker creates
+   requests and administers request status transitions; no rule changes are
+   required. Payment review rules remain in place for historical/retained
+   payment flows. Deploying rules is not part of this repository change.
 8. **Important — this project intentionally stays on Firebase's free Spark
    plan.** Cloud Functions of any kind (secrets or not) require the Blaze
    (pay-as-you-go) plan to deploy at all. `functions/index.js` now contains
-   only `reconcileOrderCost` (automatic order profit calculation). Manual UPI
-   checkout refreshes product prices and delivery settings through the
-   authenticated Cloudflare Worker; cost/profit snapshots are written by that
-   trusted process.
+   only `reconcileOrderCost` (automatic order profit calculation). Current
+   product requests do not represent sales or revenue and are not included in
+   paid-order analytics.
    Unless you enable Blaze, skip `firebase deploy --only functions` entirely.
 9. **Create your first seller account.** Sign up once from the app (email
    creates a normal `customer`-role account), then in the Firebase
@@ -75,20 +73,27 @@ useful for UI work without a Firebase project set up yet.
    `firestore.rules`), so nobody can just grant themselves seller access from the
    app.
 
-## Manual UPI payment lifecycle
+## Customer product-request workflow
 
-Checkout sends product IDs, quantities, and a persisted request ID to the
-authenticated Worker. The Worker confirms manual UPI is enabled, reads current
-product prices/availability and delivery settings, creates the pending order and private cost snapshot, and
-returns the order on retry without accepting client-submitted prices or totals.
-The customer can scan the merchant's amount-specific QR and submit a
-trimmed UTR/reference; that update changes only the submitted reference and
-never marks the payment as paid. An active administrator must independently
-verify the actual merchant-account credit before confirming or rejecting the
-order. Confirmation reserves the transaction reference to prevent another
-order from reusing it. The previous Worker payment-attempt endpoints and
-admin UI for historical attempts remain available as an optional/future flow;
-the active manual checkout does not call them.
+Checkout collects the customer's name, Indian mobile number, house/building,
+road/area/colony, six-digit pincode, city, state, and requested products and
+quantities. The authenticated Worker validates the request, checks each product
+against current Firestore availability, snapshots the catalogue price, and
+stores it in the existing `orders` collection with status `New`. Requests have
+no payment method, payment status, UTR, or payment-reference fields; the
+catalogue value is informational and is not an amount charged or paid.
+
+An active administrator manually places any corresponding order in the Meesho
+app, then records progress as `Ordered on Meesho`, `Shipped`, `Delivered`, or
+`Cancelled` in the admin panel. VibeKart does not call a Meesho API and does not
+place orders automatically. Customers can read only their own requests. The
+Worker writes status changes and their audit records atomically.
+
+The previous UPI checkout, QR, payment-attempt, and payment-review
+implementations remain in the repository for possible future reactivation, but
+the current customer shopping/checkout/order UI does not expose payment
+choices, QR codes, payment instructions, or UTR submission. Historical payment
+records and payment verification protections are preserved.
 
 The Firestore rule tests run against the local emulator (no production
 credentials or data):
@@ -99,13 +104,11 @@ npx firebase-tools emulators:exec --only firestore \
   'npm run test:rules'
 ```
 
-## Delivery and order changes
+## Legacy delivery and order changes
 
-Administrators configure the delivery charge, free-delivery threshold, and
-estimated delivery window in the store settings. Cart and checkout show an
-estimate; manual order creation re-reads the current settings in the trusted
-Worker and snapshots the charge and delivery window into the pending order.
-Legacy orders without a delivery snapshot are left unchanged.
+Customer product requests start in `New` and are advanced by an administrator
+after the corresponding manual Meesho step is completed. Existing paid orders
+retain their historical delivery and cancellation behavior.
 
 Customers can request cancellation while a paid order is Placed or Confirmed.
 Authorized staff can cancel a paid order before it is shipped. Cancellation
@@ -230,25 +233,24 @@ The same reasoning applies to order profit: a customer's client can never read
 `baseCost`, so it can't compute a trustworthy `costTotal`/`profitTotal`. The
 optional `reconcileOrderCost` Cloud Function can read private costs and write
 them to the seller-only order fields. Without that function or another trusted
-reconciliation process, newly created manual UPI orders have no cost/profit
-snapshot; checkout and payment verification still work.
+reconciliation process, historical paid orders may not have a cost/profit
+snapshot. Product requests are deliberately excluded from paid-order
+reconciliation and analytics.
 
 ## Project structure
 
 ## Known limitations / follow-ups
 
 - **`reconcileOrderCost` needs the Blaze plan to deploy at all.** Without it or
-  another trusted reconciliation process, manual UPI orders do not receive
-  supplier-cost/profit snapshots. This does not block checkout or payment review.
-- **Manual UPI orders are priced by the trusted Worker.** It reads current
-  product prices and delivery settings from Firestore; the client cannot create
-  an order or set its totals. Payment review also goes through the Worker, which
-  authenticates the caller against the Firestore admin profile, rereads the
-  pending order, validates its stored price snapshot, atomically records the
-  transition/reference claim/reviewer audit, and rejects concurrent changes.
-  Customer-submitted UTRs are unverified data, not proof of payment; an admin
-  must match the reference and amount to the actual merchant-account credit.
-  Firestore rules deny direct client payment-status and reference-claim writes.
+  another trusted reconciliation process, some historical paid orders may not
+  receive supplier-cost/profit snapshots. Customer requests are excluded from
+  reconciliation and paid-order analytics.
+- **Payment flows are retained but not customer-facing.** Historical manual-UPI
+  payment review still uses the Worker, which validates stored price snapshots
+  and atomically records payment transitions, reference claims, and reviewer
+  audits. Customer-submitted UTRs are not proof of payment; actual
+  merchant-account credit must be verified by an administrator. Firestore
+  rules continue to deny direct client payment-status and reference-claim writes.
 - **The Worker is a separate deployable** from the Firebase project — it has
   its own `wrangler deploy` and secrets (`workers/otp/README.md`). Phone OTP
   is currently disabled; MSG91 code and configuration are future-only.

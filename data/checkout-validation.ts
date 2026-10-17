@@ -5,6 +5,14 @@ export type CheckoutDetails = {
 };
 
 export type CheckoutValidationErrors = Partial<Record<keyof CheckoutDetails, string>>;
+export type ProductRequestAddress = {
+  houseDetails: string;
+  roadArea: string;
+  pincode: string;
+  city: string;
+  state: string;
+};
+export type ProductRequestValidationErrors = Partial<Record<keyof ProductRequestAddress | 'name' | 'phone', string>>;
 
 export function validateCheckoutName(value: string): string | null {
   const name = value.trim();
@@ -55,6 +63,48 @@ export function validateCheckoutDetails(details: CheckoutDetails): CheckoutValid
   if (nameError) errors.name = nameError;
   if (phoneError) errors.phone = phoneError;
   if (addressError) errors.address = addressError;
+  return errors;
+}
+
+function validateAddressText(value: string, minLength: number, maxLength: number): boolean {
+  const text = value.trim();
+  return text.length >= minLength &&
+    text.length <= maxLength &&
+    !/[\u0000-\u001f\u007f]/.test(text) &&
+    /[\p{L}\p{N}]/u.test(text) &&
+    text.replace(/[ .,'’()/#-]/g, '').length >= 2 &&
+    /^[\p{L}\p{M}\p{N} .,'’()/#-]+$/u.test(text);
+}
+
+function validatePlaceName(value: string): boolean {
+  const text = value.trim();
+  return text.length >= 2 &&
+    text.length <= 80 &&
+    [...text].filter((character) => /\p{L}/u.test(character)).length >= 2 &&
+    /^[\p{L}\p{M} .'-]+$/u.test(text);
+}
+
+export function validateProductRequestDetails(input: {
+  name: string;
+  phone: string;
+  address: ProductRequestAddress;
+}): ProductRequestValidationErrors {
+  const errors: ProductRequestValidationErrors = {};
+  const nameError = validateCheckoutName(input.name);
+  const phoneError = validateCheckoutPhone(input.phone);
+  if (nameError) errors.name = nameError;
+  if (phoneError) errors.phone = phoneError;
+  if (!validateAddressText(input.address.houseDetails, 2, 160)) {
+    errors.houseDetails = 'Enter valid house or building details.';
+  }
+  if (!validateAddressText(input.address.roadArea, 2, 160)) {
+    errors.roadArea = 'Enter a valid road, area, or colony.';
+  }
+  if (!/^\d{6}$/.test(input.address.pincode.trim())) {
+    errors.pincode = 'Enter a valid six-digit pincode.';
+  }
+  if (!validatePlaceName(input.address.city)) errors.city = 'Enter a valid city.';
+  if (!validatePlaceName(input.address.state)) errors.state = 'Enter a valid state.';
   return errors;
 }
 

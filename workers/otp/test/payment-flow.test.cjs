@@ -384,6 +384,23 @@ function manualOrderRequest(idempotencyKey, overrides = {}) {
   };
 }
 
+function productRequestBody(idempotencyKey, overrides = {}) {
+  return {
+    items: [{ productId: 'product-1', quantity: 2, option: 'Sand' }],
+    customerName: 'Buyer Example',
+    customerPhone: '+919876543210',
+    address: {
+      houseDetails: 'Flat 12B',
+      roadArea: 'Green Street',
+      pincode: '560001',
+      city: 'Bengaluru',
+      state: 'Karnataka',
+    },
+    idempotencyKey,
+    ...overrides,
+  };
+}
+
 function seedManualOrder(orderId, overrides = {}) {
   seed(`orders/${orderId}`, {
     id: orderId,
@@ -666,6 +683,128 @@ test('manual UPI order creation fails closed when payment is disabled or merchan
   );
   assert.equal(missingVpa.status, 409);
   assert.equal([...records.keys()].filter((key) => key.startsWith('orders/')).length, 0);
+});
+
+test('product request creation is authenticated, server-priced, idempotent, and contains no payment state', async () => {
+  records.delete('settings/payment');
+  const first = await call('/requests/create', 'customer-token', productRequestBody('request-key-0001'));
+  const retry = await call('/requests/create', 'customer-token', productRequestBody('request-key-0001', {
+    items: [{ productId: 'missing-product', quantity: 1 }],
+  }));
+  assert.equal(first.status, 201);
+  assert.equal(first.body.order.requestType, 'meesho_manual');
+  assert.equal(first.body.order.status, 'New');
+  assert.equal(first.body.order.customerPhone, '+919876543210');
+  assert.equal(first.body.order.customerAddress, 'Flat 12B, Green Street, 560001, Bengaluru, Karnataka');
+  assert.equal(first.body.order.items[0].unitPrice, 1250);
+  assert.equal(first.body.order.total, 2500);
+  assert.equal(Object.hasOwn(first.body.order, 'paymentMethod'), false);
+  assert.equal(Object.hasOwn(first.body.order, 'paymentStatus'), false);
+  assert.equal(Object.hasOwn(first.body.order, 'paymentReference'), false);
+  assert.equal(Object.hasOwn(first.body.order, 'customerUtr'), false);
+  assert.equal(Object.hasOwn(records.get(`orders/${first.body.order.id}`).data, 'paymentStatus'), false);
+  assert.equal(retry.status, 200);
+  assert.equal(retry.body.order.id, first.body.order.id);
+  assert.equal(records.get(`orders/${first.body.order.id}/private/data`).data.items[0].sourceUrl, 'https://supplier.invalid/item');
+  assert.equal(msg91Calls, 0);
+});
+
+test('product request creation rejects missing authentication and malformed customer/address/item values', async () => {
+  const missingAuth = await call('/requests/create', '', productRequestBody('request-key-0002'));
+  assert.equal(missingAuth.status, 401);
+  const nonCustomer = await call('/requests/create', 'seller-token', productRequestBody('request-key-0002'));
+  assert.equal(nonCustomer.status, 403);
+
+  const invalidCases = [
+    { customerName: 'm, ,' },
+    { customerPhone: '1234567890' },
+    { address: { ...productRequestBody('request-key-0003').address, houseDetails: 'm, ,' } },
+    { address: { ...productRequestBody('request-key-0004').address, roadArea: 'm, ,' } },
+    { address: { ...productRequestBody('request-key-0005').address, pincode: '56001' } },
+    { address: { ...productRequestBody('request-key-0006').address, city: '1' } },
+    { address: { ...productRequestBody('request-key-0007').address, state: '1' } },
+    { items: [{ productId: '../products/product-1', quantity: 1 }] },
+    { items: [{ productId: 'product-1', quantity: 0 }] },
+    { items: [{ productId: 'missing-product', quantity: 1 }] },
+  ];
+  for (const [index, invalid] of invalidCases.entries()) {
+    const result = await call(
+      '/requests/create',
+      'customer-token',
+      productRequestBody(`invalid-request-${index}`, invalid),
+    );
+    assert.equal(result.status, 400);
+  }
+  assert.equal([...records.keys()].filter((key) => key.startsWith('orders/')).length, 0);
+});
+
+test('failed product request writes return an error and do not create a success-shaped order', async () => {
+  failNextCommitStatus = 503;
+  const result = await call('/requests/create', 'customer-token', productRequestBody('request-key-0011'));
+  assert.equal(result.status, 500);
+  assert.equal(result.body.success, undefined);
+  assert.equal(result.body.order, undefined);
+  assert.equal([...records.keys()].filter((key) => key.startsWith('orders/')).length, 0);
+});
+
+test('only active admins can advance product request status and the status/audit writes are atomic', async () => {
+  const created = await call('/requests/create', 'customer-token', productRequestBody('request-key-0008'));
+  const orderId = created.body.order.id;
+  const customerUpdate = await call('/admin/requests/status', 'customer-token', {
+    orderId,
+    status: 'Ordered on Meesho',
+  });
+  assert.equal(customerUpdate.status, 403);
+
+  const adminUpdate = await call('/admin/requests/status', 'admin-token', {
+    orderId,
+    status: 'Ordered on Meesho',
+  });
+  assert.equal(adminUpdate.status, 200);
+  assert.equal(records.get(`orders/${orderId}`).data.status, 'Ordered on Meesho');
+  assert.equal(records.get(`orders/${orderId}`).data.requestType, 'meesho_manual');
+  assert.equal(records.get(`orders/${orderId}`).data.customerName, 'Buyer Example');
+  assert.equal([...records.keys()].filter((key) => key.startsWith('audit_logs/')).length, 1);
+
+  const invalidTransition = await call('/admin/requests/status', 'admin-token', {
+    orderId,
+    status: 'Delivered',
+  });
+  assert.equal(invalidTransition.status, 409);
+  assert.equal(records.get(`orders/${orderId}`).data.status, 'Ordered on Meesho');
+
+  const shipped = await call('/admin/requests/status', 'admin-token', {
+    orderId,
+    status: 'Shipped',
+  });
+  const delivered = await call('/admin/requests/status', 'admin-token', {
+    orderId,
+    status: 'Delivered',
+  });
+  assert.equal(shipped.status, 200, JSON.stringify(shipped.body));
+  assert.equal(delivered.status, 200, JSON.stringify(delivered.body));
+  assert.equal(records.get(`orders/${orderId}`).data.status, 'Delivered');
+
+  const cancellable = await call('/requests/create', 'customer-token', productRequestBody('request-key-0010'));
+  const cancelled = await call('/admin/requests/status', 'admin-token', {
+    orderId: cancellable.body.order.id,
+    status: 'Cancelled',
+  });
+  assert.equal(cancelled.status, 200);
+  assert.equal(records.get(`orders/${cancellable.body.order.id}`).data.status, 'Cancelled');
+});
+
+test('failed product request status commit leaves request and audit log unchanged', async () => {
+  const created = await call('/requests/create', 'customer-token', productRequestBody('request-key-0009'));
+  const orderId = created.body.order.id;
+  failNextCommitStatus = 503;
+  const failed = await call('/admin/requests/status', 'admin-token', {
+    orderId,
+    status: 'Ordered on Meesho',
+  });
+  assert.equal(failed.status, 503);
+  assert.equal(records.get(`orders/${orderId}`).data.status, 'New');
+  assert.equal([...records.keys()].filter((key) => key.startsWith('audit_logs/')).length, 0);
 });
 
 test('product deletion requires an authorized owner and queues verified images for cleanup', async () => {
