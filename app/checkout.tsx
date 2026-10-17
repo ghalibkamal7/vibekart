@@ -1,11 +1,9 @@
 import { Feather } from '@expo/vector-icons';
 import { router } from 'expo-router';
-import React, { useRef, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import {
   ActivityIndicator,
-  Image,
-  Linking,
   Platform,
   Pressable,
   ScrollView,
@@ -15,7 +13,14 @@ import {
   View,
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
-import { buildUpiQrUrl, calculateDeliveryCharge, formatPrice } from '@/data/store';
+import QRCode from 'react-native-qrcode-svg';
+import {
+  buildUpiPaymentUri,
+  normalizeIndianMobile,
+  validateCheckoutDetails,
+  validateCheckoutName,
+} from '@/data/checkout-validation';
+import { calculateDeliveryCharge, formatPrice } from '@/data/store';
 import { showPlatformAlert } from '@/utils/platformDialogs';
 import { useColors } from '@/hooks/useColors';
 import { useStore } from '@/context/StoreContext';
@@ -32,6 +37,7 @@ export default function CheckoutScreen() {
     placeOrder,
     submitManualOrderUtr,
     authUser,
+    authLoaded,
     isCloudMode,
     paymentSettings,
     storeSettings,
@@ -44,10 +50,11 @@ export default function CheckoutScreen() {
   const [pendingOrder, setPendingOrder] = useState<Order | null>(null);
   const [detailsSubmitted, setDetailsSubmitted] = useState(false);
   const [copiedVpa, setCopiedVpa] = useState(false);
+  const [showValidation, setShowValidation] = useState(false);
   const orderIdempotencyKey = useRef<{ uid: string; key: string } | null>(null);
   const hasItems = cart.length > 0;
   const allInStock = cart.every((line) => line.product.inStock && (line.product.enabled ?? true));
-  const fieldsOk = name.trim() && address.trim() && phone.trim();
+  const validationErrors = validateCheckoutDetails({ name, phone, address });
 
   // Self-service manual UPI readiness from Admin Panel
   const manualUpiReady = Boolean(paymentSettings.enabled && paymentSettings.merchantVpa?.trim());
@@ -55,7 +62,7 @@ export default function CheckoutScreen() {
   const paymentReady = manualUpiReady;
   const canPlace =
     !pendingOrder && !placing && isCloudMode && !!authUser && !authUser.isGuest &&
-    hasItems && allInStock && !!fieldsOk && paymentReady;
+    hasItems && allInStock && paymentReady;
   const canSubmitDetails =
     !!pendingOrder && pendingOrder.paymentStatus === 'Pending' &&
     !detailsSubmitted && !placing && !!customerUtr.trim();
@@ -65,9 +72,13 @@ export default function CheckoutScreen() {
   const estimatedDeliveryCharge = calculateDeliveryCharge(cartTotal, storeSettings);
   const estimatedTotal = cartTotal + estimatedDeliveryCharge;
   const payableAmount = pendingOrder?.total ?? estimatedTotal;
-  const qrDisplayUrl = paymentSettings.autoGenerateQr && activeMerchantVpa
-    ? buildUpiQrUrl(activeMerchantVpa, activeMerchantName, payableAmount)
-    : paymentSettings.qrImageUrl || '';
+  const qrPaymentUri = buildUpiPaymentUri(activeMerchantVpa, activeMerchantName, payableAmount);
+
+  useEffect(() => {
+    if (!authLoaded || !authUser || authUser.isGuest) return;
+    setName((current) => current || (validateCheckoutName(authUser.name) ? '' : authUser.name.trim()));
+    setPhone((current) => current || (normalizeIndianMobile(authUser.phone ?? '') ?? ''));
+  }, [authLoaded, authUser]);
 
   const handlePlaceOrder = async () => {
     if (!paymentReady) {
@@ -96,6 +107,11 @@ export default function CheckoutScreen() {
       );
       return;
     }
+    setShowValidation(true);
+    const errors = validateCheckoutDetails({ name, phone, address });
+    if (Object.keys(errors).length > 0) return;
+    const normalizedPhone = normalizeIndianMobile(phone);
+    if (!normalizedPhone) return;
     setPlacing(true);
     try {
       const idempotencyStorageKey = `vibekart:checkout-idempotency:${authUser.uid}`;
@@ -109,7 +125,7 @@ export default function CheckoutScreen() {
       orderIdempotencyKey.current = { uid: authUser.uid, key: idempotencyKey };
       const order = await placeOrder({
         customerName: name.trim(),
-        customerPhone: phone.trim(),
+        customerPhone: normalizedPhone,
         customerAddress: address.trim(),
         paymentMethod: 'UPI',
         idempotencyKey,
@@ -194,11 +210,56 @@ export default function CheckoutScreen() {
 
         <View style={styles.form}>
           <Text style={[styles.label, { color: colors.foreground }]}>Full name</Text>
-          <TextInput value={name} onChangeText={setName} placeholder="Aarav Sharma" placeholderTextColor={colors.mutedForeground} style={[styles.input, { backgroundColor: colors.card, borderColor: colors.border, color: colors.foreground }]} />
+          <TextInput
+            value={name}
+            onChangeText={setName}
+            autoComplete="name"
+            textContentType="name"
+            autoCapitalize="words"
+            placeholder="Aarav Sharma"
+            placeholderTextColor={colors.mutedForeground}
+            accessibilityLabel="Full name"
+            testID="checkout-name"
+            style={[styles.input, { backgroundColor: colors.card, borderColor: colors.border, color: colors.foreground }]}
+          />
+          {showValidation && validationErrors.name ? (
+            <Text accessibilityRole="alert" style={[styles.validationError, { color: colors.coral }]}>{validationErrors.name}</Text>
+          ) : null}
           <Text style={[styles.label, { color: colors.foreground }]}>Phone number</Text>
-          <TextInput value={phone} onChangeText={setPhone} keyboardType="phone-pad" placeholder="+91 98765 43210" placeholderTextColor={colors.mutedForeground} style={[styles.input, { backgroundColor: colors.card, borderColor: colors.border, color: colors.foreground }]} />
+          <TextInput
+            value={phone}
+            onChangeText={setPhone}
+            autoComplete="tel"
+            textContentType="telephoneNumber"
+            keyboardType="phone-pad"
+            autoCorrect={false}
+            maxLength={20}
+            placeholder="+91 98765 43210"
+            placeholderTextColor={colors.mutedForeground}
+            accessibilityLabel="Indian mobile number"
+            testID="checkout-phone"
+            style={[styles.input, { backgroundColor: colors.card, borderColor: colors.border, color: colors.foreground }]}
+          />
+          {showValidation && validationErrors.phone ? (
+            <Text accessibilityRole="alert" style={[styles.validationError, { color: colors.coral }]}>{validationErrors.phone}</Text>
+          ) : null}
           <Text style={[styles.label, { color: colors.foreground }]}>Delivery address</Text>
-          <TextInput value={address} onChangeText={setAddress} multiline placeholder="Flat, building, street, city, pincode" placeholderTextColor={colors.mutedForeground} style={[styles.input, styles.addressInput, { backgroundColor: colors.card, borderColor: colors.border, color: colors.foreground }]} />
+          <TextInput
+            value={address}
+            onChangeText={setAddress}
+            autoComplete="street-address"
+            textContentType="fullStreetAddress"
+            multiline
+            maxLength={300}
+            placeholder="Flat, building, street, city, pincode"
+            placeholderTextColor={colors.mutedForeground}
+            accessibilityLabel="Delivery address"
+            testID="checkout-address"
+            style={[styles.input, styles.addressInput, { backgroundColor: colors.card, borderColor: colors.border, color: colors.foreground }]}
+          />
+          {showValidation && validationErrors.address ? (
+            <Text accessibilityRole="alert" style={[styles.validationError, { color: colors.coral }]}>{validationErrors.address}</Text>
+          ) : null}
 
           <Text style={[styles.label, { color: colors.foreground, marginTop: 23 }]}>Payment Method</Text>
 
@@ -243,6 +304,27 @@ export default function CheckoutScreen() {
                 ) : null}
               </View>
 
+              {qrPaymentUri ? (
+                <View style={styles.qrContainer} testID="checkout-upi-qr">
+                  <QRCode
+                    value={qrPaymentUri}
+                    size={200}
+                    ecl="M"
+                    quietZone={10}
+                    backgroundColor="#FFFFFF"
+                    color="#111111"
+                  />
+                  <Text style={[styles.qrScanText, { color: colors.foreground }]}>
+                    {pendingOrder ? `Scan to pay exactly ${formatPrice(pendingOrder.total)}` : `QR amount: estimated ${formatPrice(estimatedTotal)}`}
+                  </Text>
+                  <Text style={[styles.qrScanText, { color: colors.mutedForeground }]}>
+                    {pendingOrder
+                      ? 'Scan using any UPI app. Payment remains pending until an administrator verifies the actual merchant-account credit.'
+                      : 'Create your pending order before paying. The server will confirm the final amount.'}
+                  </Text>
+                </View>
+              ) : null}
+
               {pendingOrder ? (
                 <>
                   <View style={[styles.instructionBox, { backgroundColor: colors.background, borderColor: colors.border }]}>
@@ -253,14 +335,6 @@ export default function CheckoutScreen() {
                       Complete the UPI payment first. Your order remains pending while payment is reviewed. Submitting a UTR does not confirm payment; an administrator must verify the actual merchant-account credit.
                     </Text>
                   </View>
-                  {pendingOrder && qrDisplayUrl ? (
-                    <View style={styles.qrContainer}>
-                      <Image source={{ uri: qrDisplayUrl }} style={styles.checkoutQrImage} resizeMode="contain" />
-                      <Text style={[styles.qrScanText, { color: colors.mutedForeground }]}>
-                        Scan using Google Pay, PhonePe, Paytm, or any UPI app
-                      </Text>
-                    </View>
-                  ) : null}
                   {paymentSettings.instructions ? (
                     <Text style={[styles.instructionText, { color: colors.mutedForeground, marginTop: 8 }]}>
                       {paymentSettings.instructions}
@@ -391,6 +465,7 @@ const styles = StyleSheet.create({
   form: { paddingHorizontal: 20, marginTop: 25 },
   label: { fontSize: 12, fontFamily: 'Inter_700Bold', marginBottom: 8, marginTop: 15 },
   input: { minHeight: 49, borderWidth: 1, borderRadius: 15, paddingHorizontal: 14, fontSize: 13, fontFamily: 'Inter_400Regular' },
+  validationError: { fontSize: 11, fontFamily: 'Inter_500Medium', marginTop: 5 },
   addressInput: { minHeight: 86, paddingTop: 14, textAlignVertical: 'top' },
   paymentOption: { minHeight: 52, borderWidth: 1, borderRadius: 15, flexDirection: 'row', alignItems: 'center', paddingHorizontal: 14, gap: 10 },
   paymentText: { flex: 1, fontSize: 12, fontFamily: 'Inter_600SemiBold' },
@@ -411,7 +486,6 @@ const styles = StyleSheet.create({
   copyBtn: { flexDirection: 'row', alignItems: 'center', gap: 5, paddingHorizontal: 10, paddingVertical: 6, borderRadius: 8, borderWidth: 1 },
   copyBtnText: { fontSize: 11, fontFamily: 'Inter_700Bold' },
   qrContainer: { alignItems: 'center', paddingVertical: 14, borderTopWidth: 1, borderTopColor: '#EEEEEE', marginTop: 12 },
-  checkoutQrImage: { width: 180, height: 180, borderRadius: 12 },
   qrScanText: { fontSize: 11, fontFamily: 'Inter_500Medium', marginTop: 8, textAlign: 'center' },
   instructionBox: { padding: 12, borderRadius: 12, borderWidth: 1, marginTop: 10 },
   instructionTitle: { fontSize: 11, fontFamily: 'Inter_700Bold' },

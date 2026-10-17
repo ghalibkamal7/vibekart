@@ -29,3 +29,26 @@ test('audit log sanitization omits undefined targetId and preserves valid target
   assert.equal(withTarget.targetId, 'manual-order-42');
   assert.equal(Object.prototype.hasOwnProperty.call(withTarget, 'targetId'), true);
 });
+
+test('audit log sanitization removes undefined values at every object depth', () => {
+  const { sanitizeAuditLogPayload } = require('../services/firebase/audit.js');
+  const sanitized = sanitizeAuditLogPayload({
+    action: 'Review payment',
+    targetId: undefined,
+    metadata: {
+      orderId: 'order-1',
+      optional: undefined,
+      details: { reason: undefined, source: 'admin-panel' },
+    },
+    changes: [undefined, { previousValue: undefined, nextValue: 'Paid' }],
+  });
+
+  assert.deepEqual(sanitized, {
+    action: 'Review payment',
+    metadata: {
+      orderId: 'order-1',
+      details: { source: 'admin-panel' },
+    },
+    changes: [null, { nextValue: 'Paid' }],
+  });
+});

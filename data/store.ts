@@ -1,4 +1,5 @@
 import { ImageSourcePropType } from 'react-native';
+import { buildUpiPaymentUri } from './checkout-validation';
 
 export type Category = 'All' | 'Home' | 'Style' | 'Beauty' | 'Wellness' | (string & {});
 
@@ -532,14 +533,7 @@ export const defaultPaymentSettings: PaymentSettings = {
 };
 
 export function buildUpiUri(vpa: string, merchantName: string, amount?: number): string {
-  const cleanVpa = vpa.trim();
-  if (!cleanVpa) return '';
-  const cleanName = merchantName.trim() || 'Merchant';
-  let uri = `upi://pay?pa=${encodeURIComponent(cleanVpa)}&pn=${encodeURIComponent(cleanName)}&cu=INR`;
-  if (amount && Number.isFinite(amount) && amount > 0) {
-    uri += `&am=${amount.toFixed(2)}`;
-  }
-  return uri;
+  return buildUpiPaymentUri(vpa, merchantName.trim() || 'Merchant', amount);
 }
 
 export function buildUpiQrUrl(vpa: string, merchantName: string, amount?: number): string {

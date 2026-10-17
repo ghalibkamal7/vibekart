@@ -23,11 +23,16 @@ export type ServiceAccount = {
 };
 
 export function parseServiceAccount(json: string): ServiceAccount {
-  const parsed = JSON.parse(json);
-  if (!parsed.project_id || !parsed.client_email || !parsed.private_key) {
+  const parsed = JSON.parse(json) as Partial<ServiceAccount> | null;
+  if (
+    !parsed ||
+    typeof parsed.project_id !== 'string' || !parsed.project_id.trim() ||
+    typeof parsed.client_email !== 'string' || !parsed.client_email.trim() ||
+    typeof parsed.private_key !== 'string' || !parsed.private_key.trim()
+  ) {
     throw new Error('Service account JSON is missing project_id/client_email/private_key.');
   }
-  return parsed;
+  return parsed as ServiceAccount;
 }
 
 function base64UrlEncode(input: ArrayBuffer | string): string {
@@ -181,7 +186,10 @@ export async function verifyFirebaseIdToken(
       body: JSON.stringify({ idToken }),
     },
   );
-  if (!response.ok) return null;
+  if (response.status === 400 || response.status === 401) return null;
+  if (!response.ok) {
+    throw new Error(`Identity Toolkit ID token verification failed: ${response.status}`);
+  }
   const data = (await response.json()) as { users?: Array<{ localId: string; email?: string }> };
   if (!data.users || !data.users.length) return null;
   return { uid: data.users[0].localId, email: data.users[0].email };

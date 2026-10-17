@@ -13,6 +13,8 @@ let worker;
 let originalFetch;
 let updateCounter = 0;
 let failNextCommitStatus = null;
+let failGoogleTokenExchangeStatus = null;
+let failProfileReadStatus = null;
 let failCommitAfterCloudinaryUpload = false;
 let mutateProductBeforeNextImageCommit = false;
 let failCloudinaryUploadRequest = false;
@@ -112,6 +114,8 @@ function resetStore() {
   records.clear();
   updateCounter = 0;
   failNextCommitStatus = null;
+  failGoogleTokenExchangeStatus = null;
+  failProfileReadStatus = null;
   failCommitAfterCloudinaryUpload = false;
   mutateProductBeforeNextImageCommit = false;
   failCloudinaryUploadRequest = false;
@@ -198,6 +202,11 @@ async function mockedFetch(input, init = {}) {
     return response({ deleted });
   }
   if (url.hostname === 'oauth2.googleapis.com') {
+    if (failGoogleTokenExchangeStatus) {
+      const status = failGoogleTokenExchangeStatus;
+      failGoogleTokenExchangeStatus = null;
+      return response({ error: 'simulated OAuth dependency failure' }, status);
+    }
     return response({ access_token: 'test-access-token' });
   }
   if (url.hostname === 'identitytoolkit.googleapis.com') {
@@ -266,6 +275,12 @@ async function mockedFetch(input, init = {}) {
     .split('/')
     .map(decodeURIComponent)
     .join('/');
+
+  if (relativePath.startsWith('users/') && failProfileReadStatus) {
+    const status = failProfileReadStatus;
+    failProfileReadStatus = null;
+    return response({ error: 'simulated Firestore profile read failure' }, status);
+  }
 
   if (
     init.method !== 'POST' &&
@@ -344,7 +359,7 @@ function attemptRequest(idempotencyKey, options = {}) {
   return {
     items: [{ productId: 'product-1', quantity: 2, option: 'Sand' }],
     customerName: 'Buyer',
-    customerPhone: '+911234567890',
+    customerPhone: '+919876543210',
     customerAddress: 'Test address',
     paymentMethod: 'UPI',
     idempotencyKey,
@@ -360,7 +375,7 @@ function manualOrderRequest(idempotencyKey, overrides = {}) {
   return {
     items: [{ productId: 'product-1', quantity: 2, option: 'Sand', unitPrice: 1 }],
     customerName: 'Buyer',
-    customerPhone: '+911234567890',
+    customerPhone: '+919876543210',
     customerAddress: 'Test address',
     idempotencyKey,
     total: 2,
@@ -410,6 +425,19 @@ test('CORS allows the configured Vercel origin and rejects lookalike origins', (
   assert.equal(isAllowedOrigin(null), false);
 });
 
+test('Firestore payload serialization omits undefined fields and rejects undefined array entries', () => {
+  const { toFirestoreFields } = require(path.join(buildDir, 'firestore.js'));
+  assert.deepEqual(toFirestoreFields({
+    targetId: undefined,
+    nested: { optional: undefined, present: 'value' },
+    rows: [{ optional: undefined, id: 'row-1' }],
+  }), {
+    nested: { mapValue: { fields: { present: { stringValue: 'value' } } } },
+    rows: { arrayValue: { values: [{ mapValue: { fields: { id: { stringValue: 'row-1' } } } }] } },
+  });
+  assert.throws(() => toFirestoreFields({ values: ['valid', undefined] }), /cannot be undefined/i);
+});
+
 test('phone OTP endpoints are unavailable and never call MSG91', async () => {
   for (const pathname of ['/send-otp', '/verify-otp']) {
     const result = await worker.fetch(new Request(`https://worker.test${pathname}`, {
@@ -427,6 +455,50 @@ test('phone OTP endpoints are unavailable and never call MSG91', async () => {
 
   assert.equal(msg91Calls, 0);
   assert.equal(kvValues.size, 0);
+});
+
+test('shared Firebase authentication distinguishes dependency outages from configuration failures', async () => {
+  seedManualOrder('auth-failure-confirm');
+  seedManualOrder('auth-failure-reject');
+
+  const cases = [
+    ['/seller/products/delete', 'seller-token', { productId: 'product-1' }],
+    ['/admin/manual-upi/orders/confirm-payment', 'admin-token', {
+      orderId: 'auth-failure-confirm',
+      customerUtr: 'merchant-credit-ref',
+    }],
+    ['/admin/manual-upi/orders/reject-payment', 'admin-token', {
+      orderId: 'auth-failure-reject',
+      reason: 'No matching merchant credit.',
+    }],
+  ];
+
+  for (const [pathname, token, body] of cases) {
+    failProfileReadStatus = 503;
+    const result = await call(pathname, token, body);
+    assert.equal(result.status, 503);
+    assert.equal(result.body.code, 'FIRESTORE_PROFILE_READ_FAILED');
+  }
+
+  failGoogleTokenExchangeStatus = 503;
+  const tokenFailure = await call('/seller/products/delete', 'seller-token', { productId: 'product-1' });
+  assert.equal(tokenFailure.status, 503);
+  assert.equal(tokenFailure.body.code, 'FIREBASE_TOKEN_EXCHANGE_FAILED');
+
+  failGoogleTokenExchangeStatus = 403;
+  const rejectedServiceAccount = await call('/seller/products/delete', 'seller-token', { productId: 'product-1' });
+  assert.equal(rejectedServiceAccount.status, 500);
+  assert.equal(rejectedServiceAccount.body.code, 'FIREBASE_SERVICE_ACCOUNT_REJECTED');
+
+  failProfileReadStatus = 403;
+  const rejectedProfileRead = await call('/seller/products/delete', 'seller-token', { productId: 'product-1' });
+  assert.equal(rejectedProfileRead.status, 500);
+  assert.equal(rejectedProfileRead.body.code, 'FIRESTORE_PROFILE_ACCESS_CONFIG');
+
+  assert.equal(records.has('products/product-1'), true);
+  assert.equal(records.get('orders/auth-failure-confirm').data.paymentStatus, 'Pending');
+  assert.equal(records.get('orders/auth-failure-reject').data.paymentStatus, 'Pending');
+  assert.equal([...records.keys()].filter((key) => key.startsWith('audit_logs/')).length, 0);
 });
 
 beforeEach(() => {
@@ -531,6 +603,26 @@ test('manual UPI order creation rejects unavailable products and invalid quantit
     manualOrderRequest('manual-order-request-003'),
   );
   assert.equal(unavailable.status, 409);
+  assert.equal([...records.keys()].filter((key) => key.startsWith('orders/')).length, 0);
+});
+
+test('manual UPI order creation rejects malformed customer details before writing', async () => {
+  const invalidCases = [
+    { customerName: '12345' },
+    { customerPhone: '1234567890' },
+    { customerPhone: '+911234567890' },
+    { customerAddress: 'buyer@example.com' },
+  ];
+
+  for (const [index, overrides] of invalidCases.entries()) {
+    const result = await call(
+      '/manual-upi/orders/create',
+      'customer-token',
+      manualOrderRequest(`invalid-details-${index}-key`, overrides),
+    );
+    assert.equal(result.status, 400);
+    assert.equal(result.body.code, 'INVALID_CUSTOMER_DETAILS');
+  }
   assert.equal([...records.keys()].filter((key) => key.startsWith('orders/')).length, 0);
 });
 
@@ -958,6 +1050,27 @@ test('failed atomic product deletion does not delete or queue the referenced ima
   assert.equal(records.has('products/product-1'), false);
 });
 
+test('product deletion reports a Firestore outage without deleting the product or its image', async () => {
+  failNextCommitStatus = 503;
+  const result = await call('/seller/products/delete', 'seller-token', { productId: 'product-1' });
+
+  assert.equal(result.status, 503);
+  assert.equal(result.body.code, 'FIRESTORE_WRITE_UNAVAILABLE');
+  assert.equal(records.has('products/product-1'), true);
+  assert.equal(records.has('products/product-1/private/data'), true);
+  assert.equal(cloudinaryAssets.has('vibekart/products/product-1/test-image'), true);
+});
+
+test('product deletion reports a rejected Firestore write as a configuration failure', async () => {
+  failNextCommitStatus = 403;
+  const result = await call('/seller/products/delete', 'seller-token', { productId: 'product-1' });
+
+  assert.equal(result.status, 500);
+  assert.equal(result.body.code, 'FIRESTORE_WRITE_REJECTED');
+  assert.equal(records.has('products/product-1'), true);
+  assert.equal(cloudinaryAssets.has('vibekart/products/product-1/test-image'), true);
+});
+
 test('whitespace UTR is rejected and a submitted UTR does not create an order', async () => {
   const created = await createAttempt('checkout-request-002');
   const attemptId = created.body.attempt.id;
@@ -1222,6 +1335,37 @@ test('an active admin confirms a pending UPI order atomically with claims and re
   assert.equal(audits.length, 1);
   assert.equal(audits[0][1].data.adminUid, 'admin-1');
   assert.equal(audits[0][1].data.targetId, 'manual-confirm-1');
+});
+
+test('manual UPI confirmation reports Firestore outages without changing payment state', async () => {
+  seedManualOrder('manual-confirm-firestore-outage');
+  failNextCommitStatus = 503;
+
+  const result = await call('/admin/manual-upi/orders/confirm-payment', 'admin-token', {
+    orderId: 'manual-confirm-firestore-outage',
+    customerUtr: 'merchant-credit-ref',
+  });
+
+  assert.equal(result.status, 503);
+  assert.equal(result.body.code, 'FIRESTORE_WRITE_UNAVAILABLE');
+  assert.equal(records.get('orders/manual-confirm-firestore-outage').data.paymentStatus, 'Pending');
+  assert.equal([...records.keys()].some((key) => key.startsWith('payment_reference_claims/')), false);
+  assert.equal([...records.keys()].filter((key) => key.startsWith('audit_logs/')).length, 0);
+});
+
+test('manual UPI rejection reports Firestore outages without changing payment state', async () => {
+  seedManualOrder('manual-reject-firestore-outage');
+  failNextCommitStatus = 503;
+
+  const result = await call('/admin/manual-upi/orders/reject-payment', 'admin-token', {
+    orderId: 'manual-reject-firestore-outage',
+    reason: 'No matching merchant credit.',
+  });
+
+  assert.equal(result.status, 503);
+  assert.equal(result.body.code, 'FIRESTORE_WRITE_UNAVAILABLE');
+  assert.equal(records.get('orders/manual-reject-firestore-outage').data.paymentStatus, 'Pending');
+  assert.equal([...records.keys()].filter((key) => key.startsWith('audit_logs/')).length, 0);
 });
 
 test('only an active admin may reject a pending UPI order and the rejection is audited', async () => {

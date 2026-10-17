@@ -443,6 +443,27 @@ async function handleCreateOrder(request: Request, env: Env, origin: string | nu
   return jsonResponse({ success: true, order: publicOrderDoc }, 201, origin);
 }
 
+function isValidCustomerName(name: string): boolean {
+  return name.length <= 120 &&
+    /^[\p{L}\p{M}]+(?:[ .'’-][\p{L}\p{M}]+)*$/u.test(name) &&
+    [...name].filter((character) => /\p{L}/u.test(character)).length >= 2;
+}
+
+function isValidIndianMobile(phone: string): boolean {
+  if (!/^\+?[\d\s().-]+$/.test(phone)) return false;
+  let digits = phone.replace(/\D/g, '');
+  if (digits.length === 12 && digits.startsWith('91')) digits = digits.slice(2);
+  else if (digits.length === 11 && digits.startsWith('0')) digits = digits.slice(1);
+  return /^[6-9]\d{9}$/.test(digits);
+}
+
+function isValidDeliveryAddress(address: string): boolean {
+  return address.length >= 10 &&
+    address.length <= 300 &&
+    !/[\u0000-\u001f\u007f]/.test(address) &&
+    address.split(/\s+/).filter(Boolean).length >= 2;
+}
+
 async function handleCreateManualUpiOrder(request: Request, env: Env, origin: string | null): Promise<Response> {
   const caller = await authenticateCaller(request, env, origin);
   if (!isAuthenticatedCaller(caller)) return caller;
@@ -463,11 +484,14 @@ async function handleCreateManualUpiOrder(request: Request, env: Env, origin: st
   const customerAddress = String(body.customerAddress ?? '').trim();
   const idempotencyKey = String(body.idempotencyKey ?? '').trim();
   if (
-    !customerName || customerName.length > 120 ||
-    !customerPhone || customerPhone.length > 40 ||
-    !customerAddress || customerAddress.length > 1000
+    !isValidCustomerName(customerName) ||
+    !isValidIndianMobile(customerPhone) ||
+    !isValidDeliveryAddress(customerAddress)
   ) {
-    return jsonResponse({ error: 'Enter a valid name, phone number, and delivery address.' }, 400, origin);
+    return jsonResponse({
+      error: 'Enter a valid full name, 10-digit Indian mobile number, and complete delivery address.',
+      code: 'INVALID_CUSTOMER_DETAILS',
+    }, 400, origin);
   }
   if (idempotencyKey.length < 8 || idempotencyKey.length > 200) {
     return jsonResponse({ error: 'A valid order idempotency key is required.' }, 400, origin);
@@ -800,6 +824,41 @@ type AuthenticatedCaller = {
   profile: Record<string, any>;
 };
 
+function logFirebaseAuthenticationFailure(operation: string, error: unknown): void {
+  const message = error instanceof Error ? error.message : '';
+  const status = message.match(/\b([45]\d{2})\b/)?.[1];
+  console.error('[auth] Firebase dependency request failed', {
+    operation,
+    errorType: error instanceof Error ? error.name : typeof error,
+    ...(status ? { httpStatus: Number(status) } : {}),
+  });
+}
+
+function firebaseDependencyFailure(error: unknown): {
+  status: 500 | 503;
+  code: 'FIREBASE_CONFIGURATION_ERROR' | 'FIREBASE_DEPENDENCY_UNAVAILABLE';
+} {
+  const message = error instanceof Error ? error.message : '';
+  const remoteStatus = Number(message.match(/\b([45]\d{2})\b/)?.[1]);
+  const isConfigurationFailure =
+    remoteStatus >= 400 && remoteStatus < 500 && remoteStatus !== 429;
+  return isConfigurationFailure
+    ? { status: 500, code: 'FIREBASE_CONFIGURATION_ERROR' }
+    : { status: 503, code: 'FIREBASE_DEPENDENCY_UNAVAILABLE' };
+}
+
+function firestoreCommitFailureStatus(error: unknown): 409 | 500 | 503 {
+  const message = error instanceof Error ? error.message : '';
+  const status = Number(message.match(/Firestore atomic commit failed:\s*(\d{3})/)?.[1]);
+  if (status === 409) return 409;
+  return status >= 400 && status < 500 && status !== 429 ? 500 : 503;
+}
+
+function firestoreCommitFailureCode(status: 409 | 500 | 503): string {
+  if (status === 409) return 'ORDER_CHANGED';
+  return status === 500 ? 'FIRESTORE_WRITE_REJECTED' : 'FIRESTORE_WRITE_UNAVAILABLE';
+}
+
 async function authenticateCaller(
   request: Request,
   env: Env,
@@ -813,23 +872,58 @@ async function authenticateCaller(
   try {
     sa = parseServiceAccount(env.FIREBASE_SERVICE_ACCOUNT_JSON);
   } catch {
-    return jsonResponse({ error: 'Firebase Worker authentication is not configured correctly.' }, 503, origin);
+    return jsonResponse({
+      error: 'Firebase Worker authentication is not configured correctly.',
+      code: 'FIREBASE_SERVICE_ACCOUNT_CONFIG',
+    }, 500, origin);
   }
 
+  let accessToken: string;
   try {
-    const accessToken = await getGoogleAccessToken(sa);
-    const user = await verifyFirebaseIdToken(sa, accessToken, idToken);
-    if (!user) return jsonResponse({ error: 'Invalid or expired authentication token.' }, 401, origin);
-
-    const profile = await getVersionedDocument(sa, accessToken, `users/${user.uid}`);
-    if (!profile.exists || !profile.data || profile.data.status === 'suspended') {
-      return jsonResponse({ error: 'This account is not authorized to use payment features.' }, 403, origin);
-    }
-    return { sa, accessToken, uid: user.uid, email: user.email, profile: profile.data };
+    accessToken = await getGoogleAccessToken(sa);
   } catch (error) {
-    console.error('[auth] Firebase caller authentication failed', error);
-    return jsonResponse({ error: 'Firebase caller authentication is temporarily unavailable.' }, 503, origin);
+    logFirebaseAuthenticationFailure('service-account-token-exchange', error);
+    const failure = firebaseDependencyFailure(error);
+    return jsonResponse({
+      error: failure.status === 500
+        ? 'Firebase rejected the Worker service-account credentials or configuration.'
+        : 'Firebase authentication service is temporarily unavailable.',
+      code: failure.status === 500 ? 'FIREBASE_SERVICE_ACCOUNT_REJECTED' : 'FIREBASE_TOKEN_EXCHANGE_FAILED',
+    }, failure.status, origin);
   }
+
+  let user: { uid: string; email?: string } | null;
+  try {
+    user = await verifyFirebaseIdToken(sa, accessToken, idToken);
+  } catch (error) {
+    logFirebaseAuthenticationFailure('id-token-verification', error);
+    const failure = firebaseDependencyFailure(error);
+    return jsonResponse({
+      error: failure.status === 500
+        ? 'Firebase rejected the Identity Toolkit request configuration.'
+        : 'Firebase authentication service is temporarily unavailable.',
+      code: failure.status === 500 ? 'FIREBASE_ID_TOKEN_VERIFICATION_CONFIG' : 'FIREBASE_ID_TOKEN_VERIFICATION_UNAVAILABLE',
+    }, failure.status, origin);
+  }
+  if (!user) return jsonResponse({ error: 'Invalid or expired authentication token.' }, 401, origin);
+
+  let profile: Awaited<ReturnType<typeof getVersionedDocument>>;
+  try {
+    profile = await getVersionedDocument(sa, accessToken, `users/${user.uid}`);
+  } catch (error) {
+    logFirebaseAuthenticationFailure('firestore-profile-read', error);
+    const failure = firebaseDependencyFailure(error);
+    return jsonResponse({
+      error: failure.status === 500
+        ? 'Firestore rejected the Worker service-account access to the user profile.'
+        : 'Firebase account authorization is temporarily unavailable.',
+      code: failure.status === 500 ? 'FIRESTORE_PROFILE_ACCESS_CONFIG' : 'FIRESTORE_PROFILE_READ_FAILED',
+    }, failure.status, origin);
+  }
+  if (!profile.exists || !profile.data || profile.data.status === 'suspended') {
+    return jsonResponse({ error: 'This account is not authorized to use payment features.' }, 403, origin);
+  }
+  return { sa, accessToken, uid: user.uid, email: user.email, profile: profile.data };
 }
 
 function isAuthenticatedCaller(value: AuthenticatedCaller | Response): value is AuthenticatedCaller {
@@ -1717,8 +1811,19 @@ async function handleDeleteProduct(request: Request, env: Env, origin: string | 
   try {
     await commitFirestoreWrites(caller.sa, caller.accessToken, writes);
   } catch (error) {
-    console.error('[product] Product documents could not be deleted atomically', error);
-    return jsonResponse({ error: 'Product record changed before it could be removed. Refresh and retry.' }, 409, origin);
+    const status = firestoreCommitFailureStatus(error);
+    console.error('[product] Product documents could not be deleted atomically', {
+      status,
+      errorType: error instanceof Error ? error.name : typeof error,
+    });
+    return jsonResponse({
+      error: status === 409
+        ? 'Product record changed before it could be removed. Refresh and retry.'
+        : status === 500
+          ? 'Firestore rejected the product deletion request. No product data was deleted.'
+          : 'Firestore is temporarily unavailable. The product was not deleted; retry later.',
+      code: status === 409 ? 'PRODUCT_CHANGED' : firestoreCommitFailureCode(status),
+    }, status, origin);
   }
   const cleanup = await runCloudinaryCleanup(env, caller.sa, caller.accessToken, 'product', productId);
   return jsonResponse({
@@ -2046,7 +2151,17 @@ async function handleSubmitPaymentDetails(request: Request, env: Env, origin: st
       currentDocument: { updateTime: attempt.updateTime },
     }]);
   } catch (error) {
-    const retry = await getVersionedDocument(caller.sa, caller.accessToken, path);
+    let retry: Awaited<ReturnType<typeof getVersionedDocument>>;
+    try {
+      retry = await getVersionedDocument(caller.sa, caller.accessToken, path);
+    } catch (retryError) {
+      logFirebaseAuthenticationFailure('firestore-payment-details-retry-read', retryError);
+      const failure = firebaseDependencyFailure(retryError);
+      return jsonResponse({
+        error: 'Payment details could not be confirmed as submitted. Refresh the attempt before retrying.',
+        code: failure.status === 500 ? 'FIRESTORE_READ_CONFIGURATION_ERROR' : 'FIRESTORE_READ_UNAVAILABLE',
+      }, failure.status, origin);
+    }
     if (retry.data?.customerUid === caller.uid && retry.data.status === 'Submitted' && retry.data.customerUtr === customerUtr) {
       return jsonResponse({ success: true, status: 'Submitted', message: 'Payment details were already submitted.' }, 200, origin);
     }
@@ -2296,7 +2411,17 @@ async function handlePaymentAttemptAction(
       ),
     ]);
   } catch (error) {
-    const retry = await getVersionedDocument(caller.sa, caller.accessToken, path);
+    let retry: Awaited<ReturnType<typeof getVersionedDocument>>;
+    try {
+      retry = await getVersionedDocument(caller.sa, caller.accessToken, path);
+    } catch (retryError) {
+      logFirebaseAuthenticationFailure('firestore-payment-attempt-status-retry-read', retryError);
+      const failure = firebaseDependencyFailure(retryError);
+      return jsonResponse({
+        error: 'Payment attempt status could not be confirmed. Refresh before retrying.',
+        code: failure.status === 500 ? 'FIRESTORE_READ_CONFIGURATION_ERROR' : 'FIRESTORE_READ_UNAVAILABLE',
+      }, failure.status, origin);
+    }
     if (retry.data?.status === status) return jsonResponse({ success: true, status }, 200, origin);
     console.error('[payment] Failed to update payment attempt status', error);
     return jsonResponse({ error: 'Could not update payment attempt. Please refresh and retry.' }, 409, origin);
@@ -2399,13 +2524,34 @@ async function handleConfirmManualUpiOrderPayment(request: Request, env: Env, or
   try {
     await commitFirestoreWrites(caller.sa, caller.accessToken, writes);
   } catch (error) {
-    const retry = await getVersionedDocument(caller.sa, caller.accessToken, orderPath);
+    let retry: Awaited<ReturnType<typeof getVersionedDocument>>;
+    try {
+      retry = await getVersionedDocument(caller.sa, caller.accessToken, orderPath);
+    } catch (retryError) {
+      logFirebaseAuthenticationFailure('firestore-payment-confirmation-retry-read', retryError);
+      const failure = firebaseDependencyFailure(retryError);
+      return jsonResponse({
+        error: 'Payment review could not be confirmed. Refresh the order before retrying.',
+        code: failure.status === 500 ? 'FIRESTORE_READ_CONFIGURATION_ERROR' : 'FIRESTORE_READ_UNAVAILABLE',
+      }, failure.status, origin);
+    }
     if (
       retry.data?.paymentStatus === 'Paid' &&
       String(retry.data.paymentReference ?? '').trim().toLocaleUpperCase('en-US') === reference.toLocaleUpperCase('en-US')
     ) return jsonResponse({ success: true, orderId, status: 'Paid' }, 200, origin);
-    console.error('[payment] Failed to verify manual UPI order payment', error);
-    return jsonResponse({ error: 'Could not confirm UPI order payment. Please refresh and retry.' }, 409, origin);
+    const status = firestoreCommitFailureStatus(error);
+    console.error('[payment] Failed to verify manual UPI order payment', {
+      status,
+      errorType: error instanceof Error ? error.name : typeof error,
+    });
+    return jsonResponse({
+      error: status === 409
+        ? 'Could not confirm UPI order payment because the order changed. Refresh and retry.'
+        : status === 500
+          ? 'Firestore rejected the payment review. Payment status was not changed.'
+          : 'Firestore is temporarily unavailable. Payment status was not changed; refresh before retrying.',
+      code: firestoreCommitFailureCode(status),
+    }, status, origin);
   }
   return jsonResponse({ success: true, orderId, status: 'Paid' }, 200, origin);
 }
@@ -2484,7 +2630,17 @@ async function handleRejectManualUpiOrderPayment(request: Request, env: Env, ori
       ),
     ]);
   } catch (error) {
-    const retry = await getVersionedDocument(caller.sa, caller.accessToken, path);
+    let retry: Awaited<ReturnType<typeof getVersionedDocument>>;
+    try {
+      retry = await getVersionedDocument(caller.sa, caller.accessToken, path);
+    } catch (retryError) {
+      logFirebaseAuthenticationFailure('firestore-payment-rejection-retry-read', retryError);
+      const failure = firebaseDependencyFailure(retryError);
+      return jsonResponse({
+        error: 'Payment review could not be confirmed. Refresh the order before retrying.',
+        code: failure.status === 500 ? 'FIRESTORE_READ_CONFIGURATION_ERROR' : 'FIRESTORE_READ_UNAVAILABLE',
+      }, failure.status, origin);
+    }
     if (
       retry.data?.paymentStatus === 'Failed' &&
       retry.data.status === 'Cancelled' &&
@@ -2492,8 +2648,19 @@ async function handleRejectManualUpiOrderPayment(request: Request, env: Env, ori
     ) {
       return jsonResponse({ success: true, orderId, status: 'Rejected' }, 200, origin);
     }
-    console.error('[payment] Failed to reject manual UPI order payment', error);
-    return jsonResponse({ error: 'Could not reject UPI order payment. Please refresh and retry.' }, 409, origin);
+    const status = firestoreCommitFailureStatus(error);
+    console.error('[payment] Failed to reject manual UPI order payment', {
+      status,
+      errorType: error instanceof Error ? error.name : typeof error,
+    });
+    return jsonResponse({
+      error: status === 409
+        ? 'Could not reject UPI order payment because the order changed. Refresh and retry.'
+        : status === 500
+          ? 'Firestore rejected the payment review. Payment status was not changed.'
+          : 'Firestore is temporarily unavailable. Payment status was not changed; refresh before retrying.',
+      code: firestoreCommitFailureCode(status),
+    }, status, origin);
   }
   return jsonResponse({ success: true, orderId, status: 'Rejected' }, 200, origin);
 }

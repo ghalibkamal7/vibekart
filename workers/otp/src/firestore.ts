@@ -57,6 +57,9 @@ export function toFirestoreFields(obj: Record<string, any>): Record<string, any>
 }
 
 function toFirestoreValue(val: any): any {
+  if (val === undefined) {
+    throw new TypeError('Firestore array values cannot be undefined.');
+  }
   if (val === null) return { nullValue: null };
   if (typeof val === 'boolean') return { booleanValue: val };
   if (typeof val === 'number') {
