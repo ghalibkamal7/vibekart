@@ -310,7 +310,7 @@ async function mockedFetch(input, init = {}) {
   return response({ fields: encodeFields(record.data), updateTime: record.updateTime });
 }
 
-async function call(pathname, token, body) {
+async function call(pathname, token, body, testEnv = env) {
   const result = await worker.fetch(new Request(`https://worker.test${pathname}`, {
     method: 'POST',
     headers: {
@@ -318,7 +318,7 @@ async function call(pathname, token, body) {
       'Content-Type': 'application/json',
     },
     body: JSON.stringify(body),
-  }), env);
+  }), testEnv);
   return { status: result.status, body: await result.json() };
 }
 
@@ -501,6 +501,28 @@ test('shared Firebase authentication distinguishes dependency outages from confi
   assert.equal([...records.keys()].filter((key) => key.startsWith('audit_logs/')).length, 0);
 });
 
+test('product deletion reports precise Firebase service-account configuration errors without exposing values', async () => {
+  const cases = [
+    [undefined, 'FIREBASE_SERVICE_ACCOUNT_MISSING', /FIREBASE_SERVICE_ACCOUNT_JSON.*missing or empty/i],
+    ['not-json-secret-content', 'FIREBASE_SERVICE_ACCOUNT_INVALID_JSON', /must contain valid service-account JSON/i],
+    ['{"project_id":"vibekart-test"}', 'FIREBASE_SERVICE_ACCOUNT_FIELDS_MISSING', /project_id, client_email, and private_key/i],
+  ];
+
+  for (const [configuration, code, expectedMessage] of cases) {
+    const result = await call(
+      '/seller/products/delete',
+      'seller-token',
+      { productId: 'product-1' },
+      { ...env, FIREBASE_SERVICE_ACCOUNT_JSON: configuration },
+    );
+    assert.equal(result.status, 500);
+    assert.equal(result.body.code, code);
+    assert.match(result.body.error, expectedMessage);
+    assert.doesNotMatch(result.body.error, /not-json-secret-content/);
+    assert.equal(records.has('products/product-1'), true);
+  }
+});
+
 beforeEach(() => {
   resetStore();
   global.fetch = mockedFetch;
@@ -660,6 +682,33 @@ test('product deletion requires an authorized owner and queues verified images f
   assert.equal(deleted.body.cleanupPending, false);
   assert.equal(cloudinaryAssets.has('vibekart/products/product-1/test-image'), false);
   assert.equal(records.has('cloudinary_cleanup_jobs/product-product-1'), false);
+});
+
+test('product deletion rejects missing and invalid tokens before reading product data', async () => {
+  const missingToken = await worker.fetch(new Request('https://worker.test/seller/products/delete', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ productId: 'product-1' }),
+  }), env);
+  assert.equal(missingToken.status, 401);
+
+  const invalidToken = await call('/seller/products/delete', 'not-a-firebase-id-token', {
+    productId: 'product-1',
+  });
+  assert.equal(invalidToken.status, 401);
+  assert.equal(records.has('products/product-1'), true);
+});
+
+test('product deletion validates product IDs and returns 404 when the product does not exist', async () => {
+  const missingId = await call('/seller/products/delete', 'seller-token', {});
+  assert.equal(missingId.status, 400);
+
+  const nonexistent = await call('/seller/products/delete', 'seller-token', {
+    productId: 'product-does-not-exist',
+  });
+  assert.equal(nonexistent.status, 404);
+  assert.equal(records.has('products/product-1'), true);
+  assert.equal(records.has('cloudinary_cleanup_jobs/product-product-does-not-exist'), false);
 });
 
 test('an administrator can delete a legacy product without an owner UID', async () => {

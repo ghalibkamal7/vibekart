@@ -12,7 +12,15 @@ import {
   updateOrderPaymentDoc,
   userProfileExists,
 } from './firestore';
-import { createFirebaseCustomToken, createUserWithPhone, findUserByPhone, getGoogleAccessToken, parseServiceAccount, verifyFirebaseIdToken } from './google';
+import {
+  createFirebaseCustomToken,
+  createUserWithPhone,
+  findUserByPhone,
+  getGoogleAccessToken,
+  parseServiceAccount,
+  ServiceAccountConfigError,
+  verifyFirebaseIdToken,
+} from './google';
 import { sendOtpSms } from './msg91';
 import {
   checkIpRateLimit,
@@ -35,7 +43,7 @@ export interface Env {
   MSG91_AUTH_KEY?: string;
   /** Cloudflare Worker secret — the full Firebase service-account JSON, as
    * one string. Set with `wrangler secret put FIREBASE_SERVICE_ACCOUNT_JSON`. */
-  FIREBASE_SERVICE_ACCOUNT_JSON: string;
+  FIREBASE_SERVICE_ACCOUNT_JSON?: string;
 
   // Direct Google Pay India UPI & Acquiring Bank Configuration (optional until onboarding)
   MERCHANT_NAME?: string;
@@ -871,10 +879,14 @@ async function authenticateCaller(
   let sa: ReturnType<typeof parseServiceAccount>;
   try {
     sa = parseServiceAccount(env.FIREBASE_SERVICE_ACCOUNT_JSON);
-  } catch {
+  } catch (error) {
+    if (!(error instanceof ServiceAccountConfigError)) throw error;
+    console.error('[auth] Worker Firebase service-account configuration is invalid', {
+      code: error.code,
+    });
     return jsonResponse({
-      error: 'Firebase Worker authentication is not configured correctly.',
-      code: 'FIREBASE_SERVICE_ACCOUNT_CONFIG',
+      error: error.message,
+      code: error.code,
     }, 500, origin);
   }
 

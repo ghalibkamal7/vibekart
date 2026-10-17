@@ -22,15 +22,51 @@ export type ServiceAccount = {
   private_key: string;
 };
 
-export function parseServiceAccount(json: string): ServiceAccount {
-  const parsed = JSON.parse(json) as Partial<ServiceAccount> | null;
+export type ServiceAccountConfigErrorCode =
+  | 'FIREBASE_SERVICE_ACCOUNT_MISSING'
+  | 'FIREBASE_SERVICE_ACCOUNT_INVALID_JSON'
+  | 'FIREBASE_SERVICE_ACCOUNT_FIELDS_MISSING';
+
+export class ServiceAccountConfigError extends Error {
+  constructor(
+    readonly code: ServiceAccountConfigErrorCode,
+    message: string,
+  ) {
+    super(message);
+    this.name = 'ServiceAccountConfigError';
+  }
+}
+
+export function parseServiceAccount(json: unknown): ServiceAccount {
+  if (typeof json !== 'string' || !json.trim()) {
+    throw new ServiceAccountConfigError(
+      'FIREBASE_SERVICE_ACCOUNT_MISSING',
+      'Worker secret FIREBASE_SERVICE_ACCOUNT_JSON is missing or empty.',
+    );
+  }
+
+  let parsed: Partial<ServiceAccount> | null;
+  try {
+    parsed = JSON.parse(json.replace(/^\uFEFF/, '').trim()) as Partial<ServiceAccount> | null;
+  } catch {
+    throw new ServiceAccountConfigError(
+      'FIREBASE_SERVICE_ACCOUNT_INVALID_JSON',
+      'Worker secret FIREBASE_SERVICE_ACCOUNT_JSON must contain valid service-account JSON.',
+    );
+  }
+
   if (
     !parsed ||
+    typeof parsed !== 'object' ||
+    Array.isArray(parsed) ||
     typeof parsed.project_id !== 'string' || !parsed.project_id.trim() ||
     typeof parsed.client_email !== 'string' || !parsed.client_email.trim() ||
     typeof parsed.private_key !== 'string' || !parsed.private_key.trim()
   ) {
-    throw new Error('Service account JSON is missing project_id/client_email/private_key.');
+    throw new ServiceAccountConfigError(
+      'FIREBASE_SERVICE_ACCOUNT_FIELDS_MISSING',
+      'Worker secret FIREBASE_SERVICE_ACCOUNT_JSON must include non-empty project_id, client_email, and private_key fields.',
+    );
   }
   return parsed as ServiceAccount;
 }
