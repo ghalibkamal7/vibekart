@@ -3,6 +3,10 @@ import React, { useState } from 'react';
 import { ActivityIndicator, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { canCancelOrder, formatPrice, OrderStatus } from '@/data/store';
+import {
+  getCustomerOrderStatusLabel,
+  PRODUCT_REQUEST_STATUS_DESCRIPTION,
+} from '@/data/customer-order-presentation';
 import { useColors } from '@/hooks/useColors';
 import { useStore } from '@/context/StoreContext';
 import { confirmPlatformAction, showPlatformAlert } from '@/utils/platformDialogs';
@@ -127,7 +131,7 @@ export default function OrdersScreen() {
                     </Text>
                   </View>
                   <View style={[styles.status, { backgroundColor: sc.bg }]}>
-                    <Text style={[styles.statusText, { color: sc.fg }]}>{order.status}</Text>
+                    <Text style={[styles.statusText, { color: sc.fg }]}>{getCustomerOrderStatusLabel(order.status)}</Text>
                   </View>
                 </View>
                 <Text style={[styles.orderProduct, { color: colors.foreground }]}>
@@ -137,7 +141,7 @@ export default function OrdersScreen() {
                   Delivery to: {order.customerAddress}
                 </Text>
                 <Text style={[styles.attemptHelp, { color: colors.mutedForeground }]}>
-                  This is a request only. It has not been ordered on Meesho and no payment has been taken.
+                  {PRODUCT_REQUEST_STATUS_DESCRIPTION}
                 </Text>
               </View>
             );
@@ -295,7 +299,7 @@ export default function OrdersScreen() {
                   <Text style={[styles.orderDate, { color: colors.mutedForeground }]}>{order.date} · {order.items.length} item{order.items.length > 1 ? 's' : ''}</Text>
                 </View>
                 <View style={[styles.status, { backgroundColor: sc.bg }]}>
-                  <Text style={[styles.statusText, { color: sc.fg }]}>{order.status}</Text>
+                  <Text style={[styles.statusText, { color: sc.fg }]}>{getCustomerOrderStatusLabel(order.status)}</Text>
                 </View>
               </View>
               <Text style={[styles.orderProduct, { color: colors.foreground }]} numberOfLines={1}>{order.items.map((item) => item.name).join(' · ')}</Text>

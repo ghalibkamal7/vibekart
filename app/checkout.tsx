@@ -17,6 +17,10 @@ import {
   validateProductRequestDetails,
   validateCheckoutName,
 } from '@/data/checkout-validation';
+import {
+  PRODUCT_REQUEST_RECEIVED_MESSAGE,
+  PRODUCT_REQUEST_RECEIVED_TITLE,
+} from '@/data/customer-order-presentation';
 import { showPlatformAlert } from '@/utils/platformDialogs';
 import { useColors } from '@/hooks/useColors';
 import { useStore } from '@/context/StoreContext';
@@ -104,10 +108,7 @@ export default function CheckoutScreen() {
       if (order) {
         await AsyncStorage.removeItem(idempotencyStorageKey);
         orderIdempotencyKey.current = null;
-        showPlatformAlert(
-          'Request received',
-          `Your product request was saved with status “${order.status}”. We will contact you using the mobile number provided. No order has been placed with Meesho yet.`,
-        );
+        showPlatformAlert(PRODUCT_REQUEST_RECEIVED_TITLE, PRODUCT_REQUEST_RECEIVED_MESSAGE);
         router.replace('/(tabs)/orders');
       } else {
         showPlatformAlert('Request failed', 'Something went wrong. Please try again.');
